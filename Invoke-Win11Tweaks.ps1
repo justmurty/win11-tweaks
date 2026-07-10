@@ -62,7 +62,7 @@ $script:LogFile = Join-Path $LogDir ("win11-tweaks_{0}.log" -f (Get-Date -Format
 try { Start-Transcript -Path $script:LogFile -Append -ErrorAction Stop | Out-Null } catch { }
 
 # --------------------------------------------------------------------------------------
-#  Logging + primitive helpers (all DryRun-aware) — mirror WinUtil's apply engine
+#  Logging + primitive helpers (all DryRun-aware) - mirror WinUtil's apply engine
 # --------------------------------------------------------------------------------------
 function Write-Log {
     param(
@@ -201,7 +201,7 @@ function Enable-Feature {
 # --------------------------------------------------------------------------------------
 $script:Tweaks = @(
 
-  # 1 — Restore Point (MUST be first) --------------------------------------------------
+  # 1 - Restore Point (MUST be first) --------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksRestorePoint'; Content='Restore Point - Create'; Category='Essential'; Apply={
       $id='WPFTweaksRestorePoint'
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore' -Name 'SystemRestorePointCreationFrequency' -Type DWord -Value '0'
@@ -213,7 +213,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # 2 — Activity History ---------------------------------------------------------------
+  # 2 - Activity History ---------------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksActivity'; Content='Activity History - Disable'; Category='Essential'; Apply={
       $id='WPFTweaksActivity'; $p='HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
       Set-Reg -Id $id -Path $p -Name 'EnableActivityFeed'    -Type DWord -Value '0'
@@ -221,17 +221,17 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path $p -Name 'UploadUserActivities'  -Type DWord -Value '0'
   }}
 
-  # 3 — ConsumerFeatures ---------------------------------------------------------------
+  # 3 - ConsumerFeatures ---------------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksConsumerFeatures'; Content='ConsumerFeatures - Disable'; Category='Essential'; Apply={
       Set-Reg -Id 'WPFTweaksConsumerFeatures' -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableWindowsConsumerFeatures' -Type DWord -Value '1'
   }}
 
-  # 4 — Delivery Optimization ----------------------------------------------------------
+  # 4 - Delivery Optimization ----------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksDeliveryOptimization'; Content='Delivery Optimization - Disable'; Category='Essential'; Apply={
       Set-Reg -Id 'WPFTweaksDeliveryOptimization' -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' -Name 'DODownloadMode' -Type DWord -Value '0'
   }}
 
-  # 5 — Disk Cleanup -------------------------------------------------------------------
+  # 5 - Disk Cleanup -------------------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksDiskCleanup'; Content='Disk Cleanup - Run'; Category='Essential'; Apply={
       Invoke-Step -Id 'WPFTweaksDiskCleanup' -Description 'run Disk Cleanup + component cleanup' -Action {
           cleanmgr.exe /d C: /VERYLOWDISK
@@ -239,12 +239,12 @@ $script:Tweaks = @(
       }
   }}
 
-  # 6 — End Task With Right Click ------------------------------------------------------
+  # 6 - End Task With Right Click ------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksEndTaskOnTaskbar'; Content='End Task With Right Click - Enable'; Category='Essential'; Apply={
       Set-Reg -Id 'WPFTweaksEndTaskOnTaskbar' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings' -Name 'TaskbarEndTask' -Type DWord -Value '1'
   }}
 
-  # 7 — File Explorer Automatic Folder Discovery --------------------------------------
+  # 7 - File Explorer Automatic Folder Discovery --------------------------------------
   [pscustomobject]@{ Id='WPFTweaksDisableExplorerAutoDiscovery'; Content='File Explorer Automatic Folder Discovery - Disable'; Category='Essential'; Apply={
       Invoke-Step -Id 'WPFTweaksDisableExplorerAutoDiscovery' -Description 'reset Explorer folder-type database' -Action {
           $bags   = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\Bags'
@@ -257,7 +257,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # 8 — Location Tracking --------------------------------------------------------------
+  # 8 - Location Tracking --------------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksLocation'; Content='Location Tracking - Disable'; Category='Essential'; Apply={
       $id='WPFTweaksLocation'
       Set-Svc -Id $id -Name 'lfsvc' -StartupType 'Disable' -OriginalType 'Manual'
@@ -266,7 +266,7 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path 'HKLM:\SYSTEM\Maps' -Name 'AutoUpdateEnabled' -Type DWord -Value '0'
   }}
 
-  # 9 — Services - Set to Manual -------------------------------------------------------
+  # 9 - Services - Set to Manual -------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksServices'; Content='Services - Set to Manual'; Category='Essential'; Apply={
       $id='WPFTweaksServices'
       Set-Svc -Id $id -Name 'CscService'   -StartupType 'Disabled' -OriginalType 'Manual'
@@ -280,7 +280,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # 10 — Telemetry ---------------------------------------------------------------------
+  # 10 - Telemetry ---------------------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksTelemetry'; Content='Telemetry - Disable'; Category='Essential'; Apply={
       $id='WPFTweaksTelemetry'
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo' -Name 'Enabled' -Type DWord -Value '0'
@@ -304,7 +304,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # 11 — Temporary Files ---------------------------------------------------------------
+  # 11 - Temporary Files ---------------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksDeleteTempFiles'; Content='Temporary Files - Remove'; Category='Essential'; Apply={
       Invoke-Step -Id 'WPFTweaksDeleteTempFiles' -Description 'erase TEMP folders' -Action {
           Remove-Item -Path "$Env:Temp\*"            -Recurse -Force -ErrorAction SilentlyContinue
@@ -312,7 +312,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # 12 — Unwanted Pre-Installed Apps ---------------------------------------------------
+  # 12 - Unwanted Pre-Installed Apps ---------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksDeBloat'; Content='Unwanted Pre-Installed Apps - Remove'; Category='Essential'; Apply={
       $id='WPFTweaksDeBloat'
       $apps = @(
@@ -333,12 +333,12 @@ $script:Tweaks = @(
       }
   }}
 
-  # 13 — WPBT --------------------------------------------------------------------------
+  # 13 - WPBT --------------------------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksWPBT'; Content='Windows Platform Binary Table (WPBT) - Disable'; Category='Essential'; Apply={
       Set-Reg -Id 'WPFTweaksWPBT' -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'DisableWpbtExecution' -Type DWord -Value '1'
   }}
 
-  # 14 — Microsoft Edge - Debloat ------------------------------------------------------
+  # 14 - Microsoft Edge - Debloat ------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksEdgeDebloat'; Content='Microsoft Edge - Debloat'; Category='Advanced'; Apply={
       $id='WPFTweaksEdgeDebloat'; $e='HKLM:\SOFTWARE\Policies\Microsoft\Edge'
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate' -Name 'CreateDesktopShortcutDefault' -Type DWord -Value '0'
@@ -360,7 +360,7 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path $e -Name 'DefaultBrowserSettingsCampaignEnabled' -Type DWord -Value '0'
   }}
 
-  # 15 — Microsoft OneDrive - Remove ---------------------------------------------------
+  # 15 - Microsoft OneDrive - Remove ---------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksRemoveOneDrive'; Content='Microsoft OneDrive - Remove'; Category='Advanced'; Apply={
       $id='WPFTweaksRemoveOneDrive'
       Invoke-Step -Id $id -Description 'uninstall OneDrive + clean up' -Action {
@@ -379,7 +379,7 @@ $script:Tweaks = @(
       $script:NeedExplorerRestart = $true
   }}
 
-  # 16 — Right-Click Menu Previous Layout ----------------------------------------------
+  # 16 - Right-Click Menu Previous Layout ----------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksRightClickMenu'; Content='Right-Click Menu Previous Layout - Enable'; Category='Advanced'; Apply={
       Invoke-Step -Id 'WPFTweaksRightClickMenu' -Description 'restore classic context menu' -Action {
           New-Item -Path 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}' -Name 'InprocServer32' -Value '' -Force | Out-Null
@@ -387,7 +387,7 @@ $script:Tweaks = @(
       $script:NeedExplorerRestart = $true
   }}
 
-  # 17 — Windows AI - Disable And Remove -----------------------------------------------
+  # 17 - Windows AI - Disable And Remove -----------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksWindowsAI'; Content='Windows AI - Disable And Remove'; Category='Advanced'; Apply={
       $id='WPFTweaksWindowsAI'
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name 'SettingsPageVisibility' -Type String -Value 'hide:aicomponents'
@@ -406,7 +406,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # 18 — Dark Theme (toggle ON) --------------------------------------------------------
+  # 18 - Dark Theme (toggle ON) --------------------------------------------------------
   [pscustomobject]@{ Id='WPFToggleDarkMode'; Content='Dark Theme for Windows'; Category='Toggle'; Apply={
       $id='WPFToggleDarkMode'; $p='HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize'
       Set-Reg -Id $id -Path $p -Name 'AppsUseLightTheme'   -Type DWord -Value '0'
@@ -414,42 +414,42 @@ $script:Tweaks = @(
       Update-Explorer -Action refresh
   }}
 
-  # 19 — File Explorer File Extensions (toggle ON) -------------------------------------
+  # 19 - File Explorer File Extensions (toggle ON) -------------------------------------
   [pscustomobject]@{ Id='WPFToggleShowExt'; Content='File Explorer File Extensions'; Category='Toggle'; Apply={
       Set-Reg -Id 'WPFToggleShowExt' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'HideFileExt' -Type DWord -Value '0'
       $script:NeedExplorerRestart = $true
   }}
 
-  # 20 — Game Mode (toggle ON) ---------------------------------------------------------
+  # 20 - Game Mode (toggle ON) ---------------------------------------------------------
   [pscustomobject]@{ Id='WPFToggleGameMode'; Content='Game Mode'; Category='Toggle'; Apply={
       $id='WPFToggleGameMode'; $p='HKCU:\Software\Microsoft\GameBar'
       Set-Reg -Id $id -Path $p -Name 'AllowAutoGameMode'   -Type DWord -Value '1'
       Set-Reg -Id $id -Path $p -Name 'AutoGameModeEnabled' -Type DWord -Value '1'
   }}
 
-  # 21 — Logon Screen Acrylic Blur (toggle ON) ----------------------------------------
+  # 21 - Logon Screen Acrylic Blur (toggle ON) ----------------------------------------
   [pscustomobject]@{ Id='WPFToggleLoginBlur'; Content='Logon Screen Acrylic Blur'; Category='Toggle'; Apply={
       Set-Reg -Id 'WPFToggleLoginBlur' -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name 'DisableAcrylicBackgroundOnLogon' -Type DWord -Value '0'
   }}
 
-  # 22 — Num Lock on Startup (toggle ON) -----------------------------------------------
+  # 22 - Num Lock on Startup (toggle ON) -----------------------------------------------
   [pscustomobject]@{ Id='WPFToggleNumLock'; Content='Num Lock on Startup'; Category='Toggle'; Apply={
       $id='WPFToggleNumLock'
       Set-Reg -Id $id -Path 'HKU:\.Default\Control Panel\Keyboard' -Name 'InitialKeyboardIndicators' -Type String -Value '2'
       Set-Reg -Id $id -Path 'HKCU:\Control Panel\Keyboard'         -Name 'InitialKeyboardIndicators' -Type String -Value '2'
   }}
 
-  # 23 — S0 Sleep Network Connectivity (toggle ON) ------------------------------------
+  # 23 - S0 Sleep Network Connectivity (toggle ON) ------------------------------------
   [pscustomobject]@{ Id='WPFToggleStandbyFix'; Content='S0 Sleep Network Connectivity'; Category='Toggle'; Apply={
       Set-Reg -Id 'WPFToggleStandbyFix' -Path 'HKCU:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\f15576e8-98b7-4186-b944-eafa664402d9' -Name 'ACSettingIndex' -Type DWord -Value '1'
   }}
 
-  # 24 — Settings Home Page (toggle ON) ------------------------------------------------
+  # 24 - Settings Home Page (toggle ON) ------------------------------------------------
   [pscustomobject]@{ Id='WPFToggleHideSettingsHome'; Content='Settings Home Page'; Category='Toggle'; Apply={
       Set-Reg -Id 'WPFToggleHideSettingsHome' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name 'SettingsPageVisibility' -Type String -Value 'show:home'
   }}
 
-  # 25 — Start Menu Recommendations (toggle ON) ---------------------------------------
+  # 25 - Start Menu Recommendations (toggle ON) ---------------------------------------
   [pscustomobject]@{ Id='WPFToggleStartMenuRecommendations'; Content='Start Menu Recommendations'; Category='Toggle'; Apply={
       $id='WPFToggleStartMenuRecommendations'
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Start'     -Name 'HideRecommendedSection'  -Type DWord -Value '0'
@@ -458,12 +458,12 @@ $script:Tweaks = @(
       $script:NeedExplorerRestart = $true
   }}
 
-  # 26 — System Tray Battery Percentage (toggle ON) -----------------------------------
+  # 26 - System Tray Battery Percentage (toggle ON) -----------------------------------
   [pscustomobject]@{ Id='WPFToggleBatteryPercentage'; Content='System Tray Battery Percentage'; Category='Toggle'; Apply={
       Set-Reg -Id 'WPFToggleBatteryPercentage' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'IsBatteryPercentageEnabled' -Type DWord -Value '1'
   }}
 
-  # 27 — Taskbar Centered Icons (toggle ON) -------------------------------------------
+  # 27 - Taskbar Centered Icons (toggle ON) -------------------------------------------
   [pscustomobject]@{ Id='WPFToggleTaskbarAlignment'; Content='Taskbar Centered Icons'; Category='Toggle'; Apply={
       Set-Reg -Id 'WPFToggleTaskbarAlignment' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'TaskbarAl' -Type DWord -Value '1'
       $script:NeedExplorerRestart = $true
@@ -560,7 +560,7 @@ function Invoke-InstallPhase {
         }
     }
 
-    Write-Log WARN "NVIDIA App: SKIPPED (not on winget; install manually — can be added later)."
+    Write-Log WARN "NVIDIA App: SKIPPED (not on winget; install manually - can be added later)."
     $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NVIDIA.App'; Content='NVIDIA App'; Status='SKIPPED'; Detail='not on winget' })
 }
 
@@ -570,7 +570,7 @@ function Write-Summary {
         Write-Log INFO ("{0,-8}: {1}" -f $g.Name, $g.Count)
     }
     foreach ($r in ($script:Results | Where-Object { $_.Status -eq 'FAILED' })) {
-        Write-Log ERROR ("FAILED  [{0}] {1} — {2}" -f $r.Phase, $r.Content, $r.Detail)
+        Write-Log ERROR ("FAILED  [{0}] {1} - {2}" -f $r.Phase, $r.Content, $r.Detail)
     }
     Write-Log INFO ("full log: {0}" -f $script:LogFile)
     Write-Log WARN "A reboot / sign-out is recommended to fully apply the changes."
@@ -581,7 +581,7 @@ function Write-Summary {
 # --------------------------------------------------------------------------------------
 try {
     Write-Banner
-    if ($script:DryRun) { Write-Log WARN "DRY RUN — no changes will be made." }
+    if ($script:DryRun) { Write-Log WARN "DRY RUN - no changes will be made." }
     Invoke-Tweaks
     Invoke-InstallPhase
     if ($script:NeedExplorerRestart -and -not $script:DryRun) { Update-Explorer -Action restart }

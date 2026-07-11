@@ -185,22 +185,34 @@ function Install-App {
 }
 
 function Enable-Feature {
-    # Time-bounded: NetFx3 (.NET 3.5) downloads from Windows Update when its payload is
-    # missing, which can be very slow or hang. Run it as a job and give up after TimeoutSec
-    # so it never blocks the whole run.
-    param([string]$Name, [int]$TimeoutSec = 300)
-    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would enable Windows feature $Name"; return 'DRYRUN' }
-    Write-Log INFO "enable Windows feature $Name (max ${TimeoutSec}s; pulls from Windows Update if payload missing)"
+    # Windows Update source (the only no-media way to get .NET 3.5). Time-bounded WITH a live
+    # heartbeat: the payload downloads from WU (slow, or stalls if WU is blocked). Run it as a
+    # job, print progress every ~10s (so it never looks frozen), give up after TimeoutSec.
+    # 300s is generous so it still succeeds on slow connections; on a WU-blocked box it just
+    # times out and moves on. On a normal machine with internet, NetFx3 installs fine here.
+    param([string]$Name, [string]$Display, [int]$TimeoutSec = 300)
+    if (-not $Display) { $Display = $Name }
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $Display"; return 'DRYRUN' }
+    Write-Log INFO "install $Display  (Windows feature via Windows Update, max ${TimeoutSec}s)"
     $status = 'FAILED'
     $job = Start-Job -ScriptBlock {
         param($n)
         Enable-WindowsOptionalFeature -Online -FeatureName $n -All -NoRestart -ErrorAction Stop | Out-Null
     } -ArgumentList $Name
-    if (Wait-Job $job -Timeout $TimeoutSec) {
-        try { Receive-Job $job -ErrorAction Stop | Out-Null; Write-Log OK "feature $Name enabled"; $status = 'OK' }
-        catch { Write-Log WARN "feature $Name failed: $($_.Exception.Message)"; $status = 'FAILED' }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastBeat = 0
+    while ($job.State -eq 'Running' -and $sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        Start-Sleep -Seconds 2
+        if (($sw.Elapsed.TotalSeconds - $lastBeat) -ge 10) {
+            $lastBeat = [int]$sw.Elapsed.TotalSeconds
+            Write-Log DEBUG ("...installing $Display  ({0}s / {1}s)" -f [int]$sw.Elapsed.TotalSeconds, $TimeoutSec) $Display
+        }
+    }
+    if ($job.State -eq 'Completed' -or $job.State -eq 'Failed') {
+        try { Receive-Job $job -ErrorAction Stop | Out-Null; Write-Log OK "$Display installed"; $status = 'OK' }
+        catch { Write-Log WARN "$Display failed: $($_.Exception.Message)"; $status = 'FAILED' }
     } else {
-        Write-Log WARN "feature $Name did not finish in ${TimeoutSec}s (Windows Update slow/unavailable) - moving on. Enable later with install media: Enable-WindowsOptionalFeature -Online -FeatureName $Name -All -Source <ISO>\sources\sxs -LimitAccess"
+        Write-Log WARN "$Display install timed out (${TimeoutSec}s; Windows Update unavailable) - skipped. Works on a normal machine with internet."
         Stop-Job $job -ErrorAction SilentlyContinue
         $status = 'TIMEOUT'
     }
@@ -516,7 +528,10 @@ $script:AppLocations = @{
 # .NET Framework via Windows features (not winget): only 3.5 and 4.
 #   NetFx3        = .NET 3.5 (inherently bundles 2.0/3.0); off by default, may need WU/source.
 #   NetFx4-AdvSrvs = .NET 4.x; already enabled by default on Win11 (enabling is a no-op).
-$script:DotNetFeatures = @('NetFx3','NetFx4-AdvSrvs')
+$script:DotNetFeatures = @(
+    @{ Name = 'NetFx3';         Display = '.NET 3.5' },
+    @{ Name = 'NetFx4-AdvSrvs'; Display = '.NET 4' }
+)
 
 # Visual C++ Redistributables - every version, x86 + x64 (32-bit apps/games need x86 too).
 # "2015+" is the combined 2015/2017/2019/2022 (14.x, backward-compatible).
@@ -601,8 +616,8 @@ function Invoke-InstallPhase {
     # .NET features LAST + time-bounded (NetFx3 can be slow via Windows Update), so a slow
     # .NET download never delays the winget installs above.
     foreach ($f in $script:DotNetFeatures) {
-        $st = Enable-Feature -Name $f
-        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$f; Content=".NET feature $f"; Status=$st; Detail='' })
+        $st = Enable-Feature -Name $f.Name -Display $f.Display
+        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$f.Name; Content=$f.Display; Status=$st; Detail='' })
     }
 }
 

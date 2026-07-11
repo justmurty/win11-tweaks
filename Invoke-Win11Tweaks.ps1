@@ -649,17 +649,8 @@ function Invoke-InstallPhase {
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='winget'; Content='winget missing'; Status='SKIPPED'; Detail='no winget' })
     }
 
-    # WinRAR license - place rarreg.key into the WinRAR install dir(s).
-    # Source order: -RarKey -> rarreg.key next to the script -> download from the repo
-    # (so it works via 'irm ... | iex' too, where there is no local file).
+    # WinRAR license - place rarreg.key (shipped next to the script) into the WinRAR dir(s)
     $rk = if ($RarKey) { $RarKey } elseif ($PSScriptRoot) { Join-Path $PSScriptRoot 'rarreg.key' } else { $null }
-    if ((-not ($rk -and (Test-Path $rk))) -and (-not $script:DryRun)) {
-        try {
-            $tmpKey = Join-Path $env:TEMP 'rarreg.key'
-            Invoke-RestMethod -Uri 'https://gitlab.msuhost.com/msuhost/win11-tweaks/-/raw/main/rarreg.key' -OutFile $tmpKey -ErrorAction Stop
-            if (Test-Path $tmpKey) { $rk = $tmpKey }
-        } catch { }
-    }
     if ($rk -and (Test-Path $rk)) {
         $placed = $false
         foreach ($dir in @("$env:ProgramFiles\WinRAR", "${env:ProgramFiles(x86)}\WinRAR")) {

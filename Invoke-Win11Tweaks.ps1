@@ -169,13 +169,14 @@ public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint M
 }
 
 function Install-App {
-    param([string]$Id, [string]$Name)
+    param([string]$Id, [string]$Name, [string]$Location)
     $label = if ($Name) { "$Name ($Id)" } else { $Id }
-    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would winget install $Id"; return $true }
+    $wingetArgs = "install $Id --accept-package-agreements --accept-source-agreements --source winget --silent"
+    if ($Location) { $wingetArgs += " --location `"$Location`"" }   # e.g. Battle.net requires an install location
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would winget $wingetArgs"; return $true }
     Write-Log INFO "winget install $label"
     try {
-        $p = Start-Process -FilePath 'winget' -NoNewWindow -Wait -PassThru -ArgumentList `
-            "install $Id --accept-package-agreements --accept-source-agreements --source winget --silent"
+        $p = Start-Process -FilePath 'winget' -NoNewWindow -Wait -PassThru -ArgumentList $wingetArgs
         if ($p.ExitCode -eq 0) { Write-Log OK "installed $label"; return $true }
         Write-Log WARN "winget exit code $($p.ExitCode) for $label"; return $false
     } catch {
@@ -184,15 +185,27 @@ function Install-App {
 }
 
 function Enable-Feature {
-    param([string]$Name)
-    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would enable Windows feature $Name"; return }
-    Write-Log INFO "enable Windows feature $Name"
-    try {
-        Enable-WindowsOptionalFeature -Online -FeatureName $Name -All -NoRestart -ErrorAction Stop | Out-Null
-        Write-Log OK "feature $Name enabled"
-    } catch {
-        Write-Log WARN "feature $Name failed: $($_.Exception.Message)"
+    # Time-bounded: NetFx3 (.NET 3.5) downloads from Windows Update when its payload is
+    # missing, which can be very slow or hang. Run it as a job and give up after TimeoutSec
+    # so it never blocks the whole run.
+    param([string]$Name, [int]$TimeoutSec = 300)
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would enable Windows feature $Name"; return 'DRYRUN' }
+    Write-Log INFO "enable Windows feature $Name (max ${TimeoutSec}s; pulls from Windows Update if payload missing)"
+    $status = 'FAILED'
+    $job = Start-Job -ScriptBlock {
+        param($n)
+        Enable-WindowsOptionalFeature -Online -FeatureName $n -All -NoRestart -ErrorAction Stop | Out-Null
+    } -ArgumentList $Name
+    if (Wait-Job $job -Timeout $TimeoutSec) {
+        try { Receive-Job $job -ErrorAction Stop | Out-Null; Write-Log OK "feature $Name enabled"; $status = 'OK' }
+        catch { Write-Log WARN "feature $Name failed: $($_.Exception.Message)"; $status = 'FAILED' }
+    } else {
+        Write-Log WARN "feature $Name did not finish in ${TimeoutSec}s (Windows Update slow/unavailable) - moving on. Enable later with install media: Enable-WindowsOptionalFeature -Online -FeatureName $Name -All -Source <ISO>\sources\sxs -LimitAccess"
+        Stop-Job $job -ErrorAction SilentlyContinue
+        $status = 'TIMEOUT'
     }
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    return $status
 }
 
 # --------------------------------------------------------------------------------------
@@ -201,19 +214,9 @@ function Enable-Feature {
 # --------------------------------------------------------------------------------------
 $script:Tweaks = @(
 
-  # 1 - Restore Point (MUST be first) --------------------------------------------------
-  [pscustomobject]@{ Id='WPFTweaksRestorePoint'; Content='Restore Point - Create'; Category='Essential'; Apply={
-      $id='WPFTweaksRestorePoint'
-      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore' -Name 'SystemRestorePointCreationFrequency' -Type DWord -Value '0'
-      Invoke-Step -Id $id -Description 'create System Restore Point' -Action {
-          if (-not (Get-ComputerRestorePoint -ErrorAction SilentlyContinue)) {
-              Enable-ComputerRestore -Drive $Env:SystemDrive -ErrorAction SilentlyContinue
-          }
-          Checkpoint-Computer -Description 'System Restore Point created by WinUtil' -RestorePointType MODIFY_SETTINGS
-      }
-  }}
+  # (Restore Point - REMOVED per user request; re-add from git history if needed)
 
-  # 2 - Activity History ---------------------------------------------------------------
+  # Activity History --------------------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksActivity'; Content='Activity History - Disable'; Category='Essential'; Apply={
       $id='WPFTweaksActivity'; $p='HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
       Set-Reg -Id $id -Path $p -Name 'EnableActivityFeed'    -Type DWord -Value '0'
@@ -231,15 +234,9 @@ $script:Tweaks = @(
       Set-Reg -Id 'WPFTweaksDeliveryOptimization' -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' -Name 'DODownloadMode' -Type DWord -Value '0'
   }}
 
-  # 5 - Disk Cleanup -------------------------------------------------------------------
-  [pscustomobject]@{ Id='WPFTweaksDiskCleanup'; Content='Disk Cleanup - Run'; Category='Essential'; Apply={
-      Invoke-Step -Id 'WPFTweaksDiskCleanup' -Description 'run Disk Cleanup + component cleanup' -Action {
-          cleanmgr.exe /d C: /VERYLOWDISK
-          Dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase
-      }
-  }}
+  # (Disk Cleanup - REMOVED per user request; re-add from git history if needed)
 
-  # 6 - End Task With Right Click ------------------------------------------------------
+  # End Task With Right Click -----------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksEndTaskOnTaskbar'; Content='End Task With Right Click - Enable'; Category='Essential'; Apply={
       Set-Reg -Id 'WPFTweaksEndTaskOnTaskbar' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings' -Name 'TaskbarEndTask' -Type DWord -Value '1'
   }}
@@ -468,6 +465,25 @@ $script:Tweaks = @(
       Set-Reg -Id 'WPFToggleTaskbarAlignment' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'TaskbarAl' -Type DWord -Value '1'
       $script:NeedExplorerRestart = $true
   }}
+
+  # Windows Spotlight - turn off rotating desktop pictures + set the default Win11 wallpaper
+  [pscustomobject]@{ Id='CustomSpotlightOff'; Content='Windows Spotlight - Disable + default wallpaper'; Category='Custom'; Apply={
+      $id='CustomSpotlightOff'
+      $wall = 'C:\Windows\Web\Wallpaper\Windows\img0.jpg'
+      # desktop background type: 3 = Spotlight -> 0 = Picture
+      Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Wallpapers' -Name 'BackgroundType' -Type DWord -Value '0'
+      # the wallpaper image + Fill style
+      Set-Reg -Id $id -Path 'HKCU:\Control Panel\Desktop' -Name 'WallPaper'      -Type String -Value $wall
+      Set-Reg -Id $id -Path 'HKCU:\Control Panel\Desktop' -Name 'WallpaperStyle' -Type String -Value '10'
+      Set-Reg -Id $id -Path 'HKCU:\Control Panel\Desktop' -Name 'TileWallpaper'  -Type String -Value '0'
+      Invoke-Step -Id $id -Description 'remove Spotlight desktop icon + apply wallpaper' -Action {
+          Remove-Item 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{2cc5ca98-6485-489a-920e-b3e88a6ccce3}' -Recurse -Force -ErrorAction SilentlyContinue
+          if (-not ([System.Management.Automation.PSTypeName]'Native.Wp').Type) {
+              Add-Type -Namespace Native -Name Wp -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)] public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);'
+          }
+          [Native.Wp]::SystemParametersInfo(20, 0, 'C:\Windows\Web\Wallpaper\Windows\img0.jpg', 3) | Out-Null
+      }
+  }}
 )
 
 # --------------------------------------------------------------------------------------
@@ -492,8 +508,26 @@ $script:AppsToPrompt = @(
     @{ Id='AnyDesk.AnyDesk';          Name='AnyDesk' },
     @{ Id='HPInc.HPSupportAssistant'; Name='HP Support Assistant' }
 )
-# .NET Framework 2/3/4 is a Windows feature, not a winget app (same as WinUtil).
+# Per-app install location for packages whose winget manifest REQUIRES one (otherwise
+# winget prompts "Specify the install root:" and blocks the run). Add IDs here as needed.
+$script:AppLocations = @{
+    'Blizzard.BattleNet' = 'C:\Program Files (x86)\Battle.net'
+}
+# .NET Framework via Windows features (not winget): only 3.5 and 4.
+#   NetFx3        = .NET 3.5 (inherently bundles 2.0/3.0); off by default, may need WU/source.
+#   NetFx4-AdvSrvs = .NET 4.x; already enabled by default on Win11 (enabling is a no-op).
 $script:DotNetFeatures = @('NetFx3','NetFx4-AdvSrvs')
+
+# Visual C++ Redistributables - every version, x86 + x64 (32-bit apps/games need x86 too).
+# "2015+" is the combined 2015/2017/2019/2022 (14.x, backward-compatible).
+$script:VCRedists = @(
+    'Microsoft.VCRedist.2005.x86', 'Microsoft.VCRedist.2005.x64',
+    'Microsoft.VCRedist.2008.x86', 'Microsoft.VCRedist.2008.x64',
+    'Microsoft.VCRedist.2010.x86', 'Microsoft.VCRedist.2010.x64',
+    'Microsoft.VCRedist.2012.x86', 'Microsoft.VCRedist.2012.x64',
+    'Microsoft.VCRedist.2013.x86', 'Microsoft.VCRedist.2013.x64',
+    'Microsoft.VCRedist.2015+.x86', 'Microsoft.VCRedist.2015+.x64'
+)
 
 # --------------------------------------------------------------------------------------
 #  Runner + install phase + summary
@@ -523,45 +557,53 @@ function Invoke-Tweaks {
 function Invoke-InstallPhase {
     Write-Log INFO "=========== install phase ==========="
 
-    foreach ($f in $script:DotNetFeatures) {
-        Enable-Feature -Name $f
-        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$f; Content=".NET feature $f"; Status='DONE'; Detail='' })
-    }
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        # Visual C++ Redistributables first (apps/games depend on them)
+        $vn = $script:VCRedists.Count; $vi = 0
+        foreach ($id in $script:VCRedists) {
+            $vi++
+            Write-Log INFO ("|> vcredist [{0}/{1}] install {2}" -f $vi, $vn, $id)
+            $ok = Install-App -Id $id
+            $script:Results.Add([pscustomobject]@{ Phase='VCRedist'; Id=$id; Content=$id; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
+        }
 
-    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-        Write-Log ERROR "winget not found; skipping app installs. Install 'App Installer' (Microsoft.DesktopAppInstaller) and re-run."
-        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='winget'; Content='winget missing'; Status='SKIPPED'; Detail='no winget' })
-        Write-Log WARN "NVIDIA App: SKIPPED (not on winget; install manually)."
+        $n = $script:AppsToInstall.Count; $i = 0
+        foreach ($id in $script:AppsToInstall) {
+            $i++
+            Write-Log INFO ("|> [{0}/{1}] install {2}" -f $i, $n, $id)
+            $ok = Install-App -Id $id -Location $script:AppLocations[$id]
+            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
+        }
+
+        foreach ($a in $script:AppsToPrompt) {
+            if ($script:DryRun -or -not [Environment]::UserInteractive) {
+                Write-Log INFO "prompt-app $($a.Name): skipped (dryrun/non-interactive)"
+                $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail='prompt' })
+                continue
+            }
+            $ans = Read-Host "Install $($a.Name)? (y/N)"
+            if ($ans -match '^(y|yes)$') {
+                $ok = Install-App -Id $a.Id -Name $a.Name
+                $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
+            } else {
+                Write-Log INFO "$($a.Name): declined by user"
+                $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail='declined' })
+            }
+        }
+
+        Write-Log WARN "NVIDIA App: SKIPPED (not on winget; install manually - can be added later)."
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NVIDIA.App'; Content='NVIDIA App'; Status='SKIPPED'; Detail='not on winget' })
-        return
+    } else {
+        Write-Log ERROR "winget not found; skipping VC++/app installs. Install 'App Installer' (Microsoft.DesktopAppInstaller) and re-run."
+        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='winget'; Content='winget missing'; Status='SKIPPED'; Detail='no winget' })
     }
 
-    $n = $script:AppsToInstall.Count; $i = 0
-    foreach ($id in $script:AppsToInstall) {
-        $i++
-        Write-Log INFO ("|> [{0}/{1}] install {2}" -f $i, $n, $id)
-        $ok = Install-App -Id $id
-        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
+    # .NET features LAST + time-bounded (NetFx3 can be slow via Windows Update), so a slow
+    # .NET download never delays the winget installs above.
+    foreach ($f in $script:DotNetFeatures) {
+        $st = Enable-Feature -Name $f
+        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$f; Content=".NET feature $f"; Status=$st; Detail='' })
     }
-
-    foreach ($a in $script:AppsToPrompt) {
-        if ($script:DryRun -or -not [Environment]::UserInteractive) {
-            Write-Log INFO "prompt-app $($a.Name): skipped (dryrun/non-interactive)"
-            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail='prompt' })
-            continue
-        }
-        $ans = Read-Host "Install $($a.Name)? (y/N)"
-        if ($ans -match '^(y|yes)$') {
-            $ok = Install-App -Id $a.Id -Name $a.Name
-            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
-        } else {
-            Write-Log INFO "$($a.Name): declined by user"
-            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail='declined' })
-        }
-    }
-
-    Write-Log WARN "NVIDIA App: SKIPPED (not on winget; install manually - can be added later)."
-    $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NVIDIA.App'; Content='NVIDIA App'; Status='SKIPPED'; Detail='not on winget' })
 }
 
 function Write-Summary {

@@ -649,8 +649,17 @@ function Invoke-InstallPhase {
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='winget'; Content='winget missing'; Status='SKIPPED'; Detail='no winget' })
     }
 
-    # WinRAR license - drop rarreg.key into the WinRAR install dir(s) if the key file is present
+    # WinRAR license - place rarreg.key into the WinRAR install dir(s).
+    # Source order: -RarKey -> rarreg.key next to the script -> download from the repo
+    # (so it works via 'irm ... | iex' too, where there is no local file).
     $rk = if ($RarKey) { $RarKey } elseif ($PSScriptRoot) { Join-Path $PSScriptRoot 'rarreg.key' } else { $null }
+    if ((-not ($rk -and (Test-Path $rk))) -and (-not $script:DryRun)) {
+        try {
+            $tmpKey = Join-Path $env:TEMP 'rarreg.key'
+            Invoke-RestMethod -Uri 'https://gitlab.msuhost.com/msuhost/win11-tweaks/-/raw/main/rarreg.key' -OutFile $tmpKey -ErrorAction Stop
+            if (Test-Path $tmpKey) { $rk = $tmpKey }
+        } catch { }
+    }
     if ($rk -and (Test-Path $rk)) {
         $placed = $false
         foreach ($dir in @("$env:ProgramFiles\WinRAR", "${env:ProgramFiles(x86)}\WinRAR")) {
@@ -662,9 +671,9 @@ function Invoke-InstallPhase {
         }
         if (-not $placed) { Write-Log WARN "WinRAR install dir not found; license not placed" }
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status=($(if ($placed) {'OK'} else {'SKIPPED'})); Detail='' })
-    } elseif ($rk) {
-        Write-Log INFO "WinRAR license: no rarreg.key at '$rk' - skipping (put rarreg.key next to the script or pass -RarKey)"
-        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status='SKIPPED'; Detail='no key file' })
+    } else {
+        Write-Log INFO "WinRAR license: rarreg.key not available - skipping"
+        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status='SKIPPED'; Detail='no key' })
     }
 
     # .NET features LAST + time-bounded (NetFx3 can be slow via Windows Update), so a slow
@@ -709,12 +718,13 @@ function Show-Intro {
     Write-Host ""
     Write-Host $art -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "  Please install ALL available Windows Updates BEFORE running this script." -ForegroundColor Yellow
+    Write-Host "  Applies Windows 11 tweaks (privacy, debloat, UI, performance) and installs" -ForegroundColor Gray
+    Write-Host "  a set of apps + Visual C++ / .NET runtimes.  Full log saved next to the script." -ForegroundColor Gray
     Write-Host ""
     if ([Environment]::UserInteractive) {
-        $ans = Read-Host "  Have you installed all Windows Updates? (Y/n)"
+        $ans = Read-Host "  Continue? (Y/n)"
         if ($ans -match '^\s*(n|no)\s*$') {
-            Write-Host "  Aborted - run Windows Update first, then start this again." -ForegroundColor Red
+            Write-Host "  Cancelled - nothing was changed." -ForegroundColor Red
             try { Stop-Transcript | Out-Null } catch { }
             exit 0
         }

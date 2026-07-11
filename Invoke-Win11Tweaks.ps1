@@ -28,7 +28,8 @@
 param(
     [switch]$DryRun,
     [switch]$Reboot,
-    [string]$LogDir
+    [string]$LogDir,
+    [string]$RarKey   # path to rarreg.key (WinRAR license); default: rarreg.key next to the script
 )
 
 $ErrorActionPreference = 'Continue'
@@ -646,6 +647,24 @@ function Invoke-InstallPhase {
     } else {
         Write-Log ERROR "winget not found; skipping VC++/app installs. Install 'App Installer' (Microsoft.DesktopAppInstaller) and re-run."
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='winget'; Content='winget missing'; Status='SKIPPED'; Detail='no winget' })
+    }
+
+    # WinRAR license - drop rarreg.key into the WinRAR install dir(s) if the key file is present
+    $rk = if ($RarKey) { $RarKey } elseif ($PSScriptRoot) { Join-Path $PSScriptRoot 'rarreg.key' } else { $null }
+    if ($rk -and (Test-Path $rk)) {
+        $placed = $false
+        foreach ($dir in @("$env:ProgramFiles\WinRAR", "${env:ProgramFiles(x86)}\WinRAR")) {
+            if (Test-Path $dir) {
+                if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would copy rarreg.key -> $dir" }
+                else { Copy-Item -LiteralPath $rk -Destination (Join-Path $dir 'rarreg.key') -Force -ErrorAction SilentlyContinue; Write-Log OK "WinRAR license placed in $dir" }
+                $placed = $true
+            }
+        }
+        if (-not $placed) { Write-Log WARN "WinRAR install dir not found; license not placed" }
+        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status=($(if ($placed) {'OK'} else {'SKIPPED'})); Detail='' })
+    } elseif ($rk) {
+        Write-Log INFO "WinRAR license: no rarreg.key at '$rk' - skipping (put rarreg.key next to the script or pass -RarKey)"
+        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status='SKIPPED'; Detail='no key file' })
     }
 
     # .NET features LAST + time-bounded (NetFx3 can be slow via Windows Update), so a slow

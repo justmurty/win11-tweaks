@@ -27,6 +27,7 @@
 [CmdletBinding()]
 param(
     [switch]$DryRun,
+    [switch]$Reboot,
     [string]$LogDir
 )
 
@@ -496,6 +497,39 @@ $script:Tweaks = @(
           [Native.Wp]::SystemParametersInfo(20, 0, 'C:\Windows\Web\Wallpaper\Windows\img0.jpg', 3) | Out-Null
       }
   }}
+
+  # Ultimate Performance power plan (NOT for laptops) - max performance
+  [pscustomobject]@{ Id='CustomUltimatePerf'; Content='Ultimate Performance - power plan'; Category='Custom'; Apply={
+      Invoke-Step -Id 'CustomUltimatePerf' -Description 'enable Ultimate Performance power plan' -Action {
+          powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 | Out-Null
+          powercfg -setactive e9a42b02-d5df-448d-aa00-03f14749eb61
+      }
+  }}
+
+  # DNS -> Cloudflare (1.1.1.1) on active physical adapters
+  [pscustomobject]@{ Id='CustomDnsCloudflare'; Content='DNS - Cloudflare (1.1.1.1)'; Category='Custom'; Apply={
+      Invoke-Step -Id 'CustomDnsCloudflare' -Description 'set DNS to Cloudflare on active adapters' -Action {
+          $dns = @('1.1.1.1','1.0.0.1','2606:4700:4700::1111','2606:4700:4700::1001')
+          Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
+              Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ServerAddresses $dns -ErrorAction SilentlyContinue
+          }
+          Clear-DnsClientCache -ErrorAction SilentlyContinue
+      }
+  }}
+
+  # File Explorer opens "This PC" instead of Home / Quick Access
+  [pscustomobject]@{ Id='CustomExplorerThisPC'; Content='Explorer - open This PC'; Category='Custom'; Apply={
+      Set-Reg -Id 'CustomExplorerThisPC' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'LaunchTo' -Type DWord -Value '1'
+      $script:NeedExplorerRestart = $true
+  }}
+
+  # Taskbar cleanup - hide Widgets + Chat buttons
+  [pscustomobject]@{ Id='CustomTaskbarCleanup'; Content='Taskbar - hide Widgets + Chat'; Category='Custom'; Apply={
+      $id='CustomTaskbarCleanup'; $p='HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+      Set-Reg -Id $id -Path $p -Name 'TaskbarDa' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $p -Name 'TaskbarMn' -Type DWord -Value '0'
+      $script:NeedExplorerRestart = $true
+  }}
 )
 
 # --------------------------------------------------------------------------------------
@@ -514,7 +548,8 @@ $script:AppsToInstall = @(
     'Blizzard.BattleNet',
     'Ubisoft.Connect',
     'CPUID.HWMonitor',
-    'NZXT.CAM'
+    'NZXT.CAM',
+    'RARLab.WinRAR'
 )
 $script:AppsToPrompt = @(
     @{ Id='AnyDesk.AnyDesk';          Name='AnyDesk' },
@@ -630,6 +665,16 @@ function Write-Summary {
         Write-Log ERROR ("FAILED  [{0}] {1} - {2}" -f $r.Phase, $r.Content, $r.Detail)
     }
     Write-Log INFO ("full log: {0}" -f $script:LogFile)
+    # Compact results file next to the log (quick OK/FAILED overview)
+    try {
+        $resultsFile = $script:LogFile -replace '\.log$', '_results.txt'
+        $lines = @("win11-tweaks results  -  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  -  $(if ($script:DryRun) {'DRYRUN'} else {'APPLY'})", '')
+        $lines += ($script:Results | Group-Object Status | Sort-Object Name | ForEach-Object { "{0,-8}: {1}" -f $_.Name, $_.Count })
+        $lines += ''
+        $lines += ($script:Results | ForEach-Object { "{0,-8} [{1,-8}] {2}" -f $_.Status, $_.Phase, $_.Content })
+        $lines | Out-File -FilePath $resultsFile -Encoding UTF8 -Force
+        Write-Log INFO ("results summary: {0}" -f $resultsFile)
+    } catch { Write-Log WARN "could not write results file: $($_.Exception.Message)" }
     Write-Log WARN "A reboot / sign-out is recommended to fully apply the changes."
 }
 
@@ -644,6 +689,11 @@ try {
     if ($script:NeedExplorerRestart -and -not $script:DryRun) { Update-Explorer -Action restart }
     Write-Summary
     Write-Log INFO "=========== win11-tweaks done ==========="
+    if ($Reboot -and -not $script:DryRun) {
+        Write-Log WARN "Rebooting in 15s (-Reboot given). Press Ctrl+C to cancel."
+        Start-Sleep -Seconds 15
+        Restart-Computer -Force
+    }
 }
 finally {
     try { Stop-Transcript | Out-Null } catch { }

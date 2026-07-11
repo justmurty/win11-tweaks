@@ -41,6 +41,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Invoke-Win11Tweaks.ps1
 > Отвори PowerShell/Terminal **като администратор**, `cd` до папката със скрипта, и
 > пусни командата. На PowerShell 7 ползвай `pwsh` вместо `powershell`.
 
+### По-лесно: launcher `.bat`
+
+Вместо командата горе, може просто да **двойно-цъкнеш `Run-Win11Tweaks.bat`** —
+самоелевира се (UAC), пуска скрипта във видим прозорец и го оставя отворен накрая.
+За preview: `Run-Win11Tweaks.bat -DryRun`.
+
 ## Логът / The log
 
 Логът се записва **в същата папка, където е скриптът**, с име:

@@ -1,6 +1,3 @@
 # Local run logs (the script writes win11-tweaks_<timestamp>.log next to itself)
 *.log
 logs/
-
-# WinRAR license key - NEVER commit (kept alongside the script at runtime only)
-rarreg.key

@@ -697,10 +697,35 @@ function Write-Summary {
     Write-Log WARN "A reboot / sign-out is recommended to fully apply the changes."
 }
 
+function Show-Intro {
+    $art = @'
+ __  __  _____ _    _ _    _           _
+|  \/  |/ ____| |  | | |  | |         | |
+| \  / | (___ | |  | | |__| | ___  ___| |_
+| |\/| |\___ \| |  | |  __  |/ _ \/ __| __|
+| |  | |____) | |__| | |  | | (_) \__ \ |_
+|_|  |_|_____/ \____/|_|  |_|\___/|___/\__|
+'@
+    Write-Host ""
+    Write-Host $art -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Please install ALL available Windows Updates BEFORE running this script." -ForegroundColor Yellow
+    Write-Host ""
+    if ([Environment]::UserInteractive) {
+        $ans = Read-Host "  Have you installed all Windows Updates? (Y/n)"
+        if ($ans -match '^\s*(n|no)\s*$') {
+            Write-Host "  Aborted - run Windows Update first, then start this again." -ForegroundColor Red
+            try { Stop-Transcript | Out-Null } catch { }
+            exit 0
+        }
+    }
+}
+
 # --------------------------------------------------------------------------------------
 #  Main
 # --------------------------------------------------------------------------------------
 try {
+    Show-Intro
     Write-Banner
     if ($script:DryRun) { Write-Log WARN "DRY RUN - no changes will be made." }
     Invoke-Tweaks

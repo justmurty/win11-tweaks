@@ -48,6 +48,7 @@ $script:NeedExplorerRestart  = $false
 $script:NeedIconCacheClear   = $false
 $script:Cancelled            = $false   # set by Show-Intro if the user answers "n" (avoids `exit`, which kills an iex host)
 $script:MachineType          = ''      # 'PC' or 'Laptop' - resolved in Show-Intro; gates HP Support Assistant / Alienware
+$script:DotNet35Proc         = $null   # background DISM process for .NET 3.5 (started early, finished at the end)
 $script:Results              = [System.Collections.Generic.List[object]]::new()
 
 # --------------------------------------------------------------------------------------
@@ -880,10 +881,8 @@ $script:DesktopShortcutApps = @{
 # .NET Framework via Windows features (not winget): only 3.5 and 4.
 #   NetFx3        = .NET 3.5 (inherently bundles 2.0/3.0); off by default, may need WU/source.
 #   NetFx4-AdvSrvs = .NET 4.x; already enabled by default on Win11 (enabling is a no-op).
-$script:DotNetFeatures = @(
-    @{ Name = 'NetFx3';         Display = '.NET 3.5' },
-    @{ Name = 'NetFx4-AdvSrvs'; Display = '.NET 4' }
-)
+# .NET features: NetFx3 (.NET 3.5) is started EARLY in the background (Start-DotNet35) so its slow
+# Windows-Update download overlaps the install phase; NetFx4-AdvSrvs is already enabled on Win11 (instant).
 
 # Visual C++ Redistributables - every version, x86 + x64 (32-bit apps/games need x86 too).
 # "2015+" is the combined 2015/2017/2019/2022 (14.x, backward-compatible).
@@ -1082,14 +1081,59 @@ function Invoke-InstallPhase {
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail=$a.Machine })
     }
 
-    # (.NET features run LAST of all - see Enable-DotNetFeatures, called from Main after the taskbar
-    #  pins + explorer restart. Desktop icons are created per-app right after each install, above.)
+    # (.NET 3.5 was started in the BACKGROUND before this phase (Start-DotNet35) so it downloads in
+    #  parallel; it's finished after this phase (Enable-DotNetFeatures). Desktop icons are per-app above.)
+}
+
+function Start-DotNet35 {
+    # Kick off the SLOW NetFx3 (.NET 3.5) Windows-Update download in the BACKGROUND, BEFORE the install
+    # phase, so it overlaps the ~15 min of app installs instead of adding ~11 min serially at the end.
+    # Finished by Enable-DotNetFeatures. (Runs after the tweaks' Recall DISM, so no DISM-vs-DISM clash.)
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would start .NET 3.5 (NetFx3) download in the background"; return }
+    if ((Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction SilentlyContinue).State -eq 'Enabled') {
+        Write-Log DEBUG ".NET 3.5 already enabled - nothing to start"; return
+    }
+    $dlog = Join-Path $env:TEMP 'dism_NetFx3.log'
+    Write-Log DEBUG "starting .NET 3.5 (NetFx3) download in the background (shown as Installing/Done at the end)"
+    try {
+        $script:DotNet35Proc = Start-Process -FilePath "$env:SystemRoot\System32\dism.exe" -WindowStyle Hidden -PassThru `
+            -ArgumentList '/Online','/Enable-Feature','/FeatureName:NetFx3','/All','/NoRestart','/Quiet',"/LogPath:$dlog"
+    } catch { Write-Log DEBUG ".NET 3.5 background start failed: $($_.Exception.Message)" }
 }
 
 function Enable-DotNetFeatures {
-    foreach ($f in $script:DotNetFeatures) {
-        $st = Enable-Feature -Name $f.Name -Display $f.Display
-        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$f.Name; Content=$f.Display; Status=$st; Detail='' })
+    # Print a clean "Installing .NET 3.5 / Done!" pair HERE at the end. The download already ran in the
+    # background during the install phase (Start-DotNet35), so this is usually instant. Then .NET 4 (quiet).
+    if ($script:DryRun) {
+        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NetFx3'; Content='.NET 3.5'; Status='DRYRUN'; Detail='' })
+        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NetFx4-AdvSrvs'; Content='.NET 4'; Status='DRYRUN'; Detail='' })
+        return
+    }
+    Write-Log INFO "Installing .NET 3.5"
+    $st3 = 'OK'
+    if ((Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction SilentlyContinue).State -eq 'Enabled') {
+        Write-Log OK "Done!"
+    } elseif ($script:DotNet35Proc) {
+        # background download not finished yet (installs were quick) - wait quietly, then report
+        $sw = [System.Diagnostics.Stopwatch]::StartNew(); $lastBeat = 0
+        while (-not $script:DotNet35Proc.HasExited -and $sw.Elapsed.TotalSeconds -lt 1200) {
+            Start-Sleep -Seconds 5
+            if (($sw.Elapsed.TotalSeconds - $lastBeat) -ge 60) { $lastBeat = [int]$sw.Elapsed.TotalSeconds; Write-Log DEBUG ("...still finishing .NET 3.5 ({0} min)" -f [int]($sw.Elapsed.TotalSeconds / 60)) }
+        }
+        Start-Sleep -Milliseconds 500
+        if ((Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction SilentlyContinue).State -eq 'Enabled') { Write-Log OK "Done!" }
+        else { Write-Log WARN "Not done yet - still finishing in the background (don't reboot until it's done)"; $st3 = 'BACKGROUND' }
+    } else {
+        Write-Log WARN "Failed - .NET 3.5 (was not started)"; $st3 = 'FAILED'
+    }
+    $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NetFx3'; Content='.NET 3.5'; Status=$st3; Detail='' })
+    # .NET 4 is already enabled on Win11 -> record quietly (no console clutter); enable only if somehow off.
+    if ((Get-WindowsOptionalFeature -Online -FeatureName 'NetFx4-AdvSrvs' -ErrorAction SilentlyContinue).State -eq 'Enabled') {
+        Write-Log DEBUG ".NET 4 already enabled"
+        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NetFx4-AdvSrvs'; Content='.NET 4'; Status='OK'; Detail='already enabled' })
+    } else {
+        $st4 = Enable-Feature -Name 'NetFx4-AdvSrvs' -Display '.NET 4'
+        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NetFx4-AdvSrvs'; Content='.NET 4'; Status=$st4; Detail='' })
     }
 }
 
@@ -1206,8 +1250,9 @@ try {
     Invoke-Tweaks
     Invoke-TaskbarPins        # This PC pin + unpin Edge/Store BEFORE installs...
     if ($script:NeedExplorerRestart -and -not $script:DryRun) { Update-Explorer -Action restart }   # ...then restart explorer so the taskbar/desktop is already clean (no Widgets/Search) during the installs
-    Invoke-InstallPhase       # apps + per-app desktop icons
-    Enable-DotNetFeatures     # LAST of all - .NET 3.5 downloads from Windows Update (slow); nothing waits on it
+    Start-DotNet35            # fire the slow .NET 3.5 WU download NOW so it overlaps the install phase (parallel)
+    Invoke-InstallPhase       # apps + per-app desktop icons (.NET 3.5 downloads in the background meanwhile)
+    Enable-DotNetFeatures     # finish .NET 3.5 (usually already done) + .NET 4
     Write-Summary
     Write-Log INFO "=========== win11-tweaks done ==========="
     if ($Reboot -and -not $script:DryRun) {

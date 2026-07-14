@@ -1,14 +1,14 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Applies a fixed set of Chris Titus WinUtil (v26.06.23) tweaks, then installs a
-    defined application set via winget (plus Visual C++ redists and .NET features).
-    No GUI. Logs everything to the console AND a file so the run can be reviewed afterwards.
+    Applies a fixed set of Windows 11 tweaks, then installs a defined application set via
+    winget (plus Visual C++ redists and .NET features). No GUI. Logs everything to the
+    console AND a file so the run can be reviewed afterwards.
 
 .DESCRIPTION
-    The 35 tweaks (25 from WinUtil + 10 custom) and the install list are the items the user
-    selected in WinUtil (see docs/2026-07-11-win11-tweaks-design.md) plus a few custom
-    additions. Only the ON toggles / checked items are applied; nothing else is touched.
+    The 35 tweaks (25 standard + 10 custom) and the install list are a fixed, curated set
+    (see docs/2026-07-11-win11-tweaks-design.md). Only the ON toggles / checked items are
+    applied; nothing else is touched.
     The script makes NO restore point and does NOT reboot unless -Reboot is given.
 
 .PARAMETER DryRun
@@ -57,7 +57,7 @@ $script:Results              = [System.Collections.Generic.List[object]]::new()
 # --------------------------------------------------------------------------------------
 # Self-elevate to Administrator (the script edits HKLM + services). Works BOTH when run from a file
 # (.bat / -File) AND via the `irm <url> | iex` one-liner - in the one-liner case there is no local
-# file to re-run, so the elevated instance re-fetches the script from its known raw URL (like WinUtil).
+# file to re-run, so the elevated instance re-fetches the script from its known raw URL.
 $SelfUrl = 'https://gitlab.msuhost.com/superuser/win11-tweaks/-/raw/main/Invoke-Win11Tweaks.ps1'
 $isAdmin = ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -104,7 +104,7 @@ $script:LogFile = Join-Path $LogDir ("win11-tweaks_{0}.log" -f (Get-Date -Format
 try { "win11-tweaks log  -  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" | Out-File -FilePath $script:LogFile -Encoding UTF8 -Force } catch { }
 
 # --------------------------------------------------------------------------------------
-#  Logging + primitive helpers (all DryRun-aware) - mirror WinUtil's apply engine
+#  Logging + primitive helpers (all DryRun-aware) - the apply engine
 # --------------------------------------------------------------------------------------
 function Write-Log {
     # Full detail (every level) ALWAYS goes to the LOG FILE. The CONSOLE is concise by default:
@@ -155,7 +155,7 @@ function Set-Reg {
 
 function Set-Svc {
     param([string]$Name, [string]$StartupType, [string]$OriginalType, [string]$Id = '')
-    if ($StartupType -eq 'Disable') { $StartupType = 'Disabled' }   # WinUtil ships "Disable" for lfsvc
+    if ($StartupType -eq 'Disable') { $StartupType = 'Disabled' }   # the manifest ships "Disable" for lfsvc
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
     if (-not $svc) { Write-Log WARN "service $Name not found; skipping" $Id; return }
     if ($OriginalType -and ($svc.StartType.ToString() -ne $OriginalType)) {
@@ -373,7 +373,7 @@ function Enable-Feature {
 }
 
 # --------------------------------------------------------------------------------------
-#  The tweaks - 35 total: 25 from WinUtil v26.06.23 (values verbatim) + 10 custom at the
+#  The tweaks - 35 total: 25 standard Win11 tweaks (values verbatim) + 10 custom at the
 #  end. Toggles apply their ON value only. No restore point (removed per user request).
 # --------------------------------------------------------------------------------------
 $script:Tweaks = @(
@@ -1234,10 +1234,19 @@ function Invoke-TaskbarPins {
     $helper = Join-Path $env:TEMP 'Pin-Taskbar.ps1'
     $script:PinHelper = $helper   # kept so Add-ChromeTaskbarPin can reuse it after Chrome installs; deleted there
     try {
-        Write-Log INFO "downloading Pin-Taskbar helper (temporary; deleted after use)"
-        $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Freenitial/Pin-Taskbar/main/Pin-Taskbar.ps1' -OutFile $helper -UseBasicParsing -ErrorAction Stop
-        $ProgressPreference = $pp
+        # Use OUR vendored Pin-Taskbar helper (never the upstream repo, which could disappear). Prefer the
+        # copy shipped next to the script (download/.bat flow -> NO download); else fetch OUR copy from OUR
+        # repo (the `irm|iex` one-liner flow). Either way it lands in TEMP and is deleted after use.
+        $bundled = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'Pin-Taskbar.ps1' } else { $null }
+        if ($bundled -and (Test-Path $bundled)) {
+            Copy-Item -LiteralPath $bundled -Destination $helper -Force
+            Write-Log DEBUG "using the bundled Pin-Taskbar helper (next to the script - no download)"
+        } else {
+            Write-Log INFO "fetching the Pin-Taskbar helper (our copy, from our repo; temporary)"
+            $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -Uri 'https://gitlab.msuhost.com/superuser/win11-tweaks/-/raw/main/Pin-Taskbar.ps1' -OutFile $helper -UseBasicParsing -ErrorAction Stop
+            $ProgressPreference = $pp
+        }
         Unblock-File $helper -ErrorAction SilentlyContinue
 
         # (a) PIN "This PC": create a shortcut (This PC icon) in LocalAppData (out-of-the-way), then pin it

@@ -1,13 +1,13 @@
 # win11-tweaks
 
-A single, no-GUI PowerShell script that applies a fixed set of Chris Titus WinUtil
-(v26.06.23) tweaks on Windows 11, then installs a defined application set (winget +
+A single, no-GUI PowerShell script that applies a fixed set of Windows 11 tweaks,
+then installs a defined application set (winget +
 direct downloads), and finally enables the .NET features. Everything is logged to the
 console **and** a file so the run can be reviewed afterwards.
 
 ## What it does
 
-- **35 tweaks** — 25 from WinUtil (Essential + Advanced + Customize Preferences toggles) + 10
+- **35 tweaks** — 25 standard (Essential + Advanced + Customize Preferences toggles) + 10
   custom (shortcut-arrow off, Spotlight off + default wallpaper, Ultimate Performance,
   **Memory Integrity / VBS off** for gaming, mouse acceleration off, DNS → Cloudflare,
   Explorer → This PC, taskbar cleanup (Search / Task view / Widgets / Chat / Resume off),
@@ -35,7 +35,7 @@ console **and** a file so the run can be reviewed afterwards.
 
 ## How to run
 
-### 1) One-liner (like WinUtil)
+### 1) One-liner
 
 Open **PowerShell as Administrator** and run:
 
@@ -110,4 +110,3 @@ direct-download apps, or `$script:MachineApps` for PC/Laptop-gated apps.
   `0x8A15000F` otherwise).
 - **.NET 3.5** pulls its payload from Windows Update — it succeeds on a machine with internet; on
   a box with WU blocked it keeps trying up to 30 minutes and then moves on.
-- Grounded 1:1 in WinUtil v26.06.23 (`irm christitus.com/win`).

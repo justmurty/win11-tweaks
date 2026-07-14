@@ -46,6 +46,7 @@ $script:DryRun               = [bool]$DryRun
 $script:Detailed             = [bool]$Detailed
 $script:NeedExplorerRestart  = $false
 $script:NeedIconCacheClear   = $false
+$script:Cancelled            = $false   # set by Show-Intro if the user answers "n" (avoids `exit`, which kills an iex host)
 $script:MachineType          = ''      # 'PC' or 'Laptop' - resolved in Show-Intro; gates HP Support Assistant / Alienware
 $script:Results              = [System.Collections.Generic.List[object]]::new()
 
@@ -1142,8 +1143,8 @@ function Show-Intro {
         $ans = Read-Host "  Continue? (Y/n)"
         if ($ans -match '^\s*(n|no)\s*$') {
             Write-Host "  Cancelled - nothing was changed." -ForegroundColor Red
-            try { Stop-Transcript | Out-Null } catch { }
-            exit 0
+            $script:Cancelled = $true   # NOT `exit` - that would close the host window when run via `irm|iex`
+            return
         }
     }
     # Machine type - gates HP Support Assistant (Laptop only) and Alienware Command Center (PC only).
@@ -1164,6 +1165,7 @@ function Show-Intro {
 # --------------------------------------------------------------------------------------
 try {
     Show-Intro
+    if ($script:Cancelled) { return }   # user answered "n" to Continue
     Write-Banner
     if ($script:DryRun) { Write-Log WARN "DRY RUN - no changes will be made." }
     Invoke-Tweaks

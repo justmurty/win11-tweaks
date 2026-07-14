@@ -14,9 +14,9 @@ console **and** a file so the run can be reviewed afterwards.
   **web/Bing search in Start off**, remove the Edge desktop shortcut). Details:
   [`docs/2026-07-11-win11-tweaks-design.md`](docs/2026-07-11-win11-tweaks-design.md).
 - Shows the **MSUHost banner**, asks **`Continue? (Y/n)`** and **`PC or Laptop?`** (`1` PC / `2` Laptop).
-- Then the **install phase**: **12 Visual C++ redists** + **17 winget apps**
-  (incl. Razer Synapse 4, VLC, Lightshot, TurboTop, WinRAR) + **5 direct-download**
-  (**NVIDIA App** only if an NVIDIA GPU is present, **Bitwarden**, **Parsec**,
+- Then the **install phase**: **12 Visual C++ redists** + **16 winget apps**
+  (incl. Razer Synapse 4, VLC, Lightshot, TurboTop, WinRAR) + **6 direct-download**
+  (**Google Chrome**, **NVIDIA App** only if an NVIDIA GPU is present, **Bitwarden**, **Parsec**,
   **Google Play Games**, **FL Studio**) + **machine-specific**: **HP Support Assistant**
   (Laptop only) and **Alienware Command Center** (PC only) — installed automatically per the
   PC/Laptop answer, no prompt. It also applies the **WinRAR license** and enables **.NET 3.5**

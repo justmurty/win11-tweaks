@@ -295,24 +295,28 @@ function Install-DirectDownload {
     if (-not $Url) { Write-Log WARN "Failed - $Name (no download URL found)"; return 'FAILED' }
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $Name (direct download from $Url)"; return 'DRYRUN' }
     Write-Log INFO "Installing $Name"
-    $tmp = Join-Path $env:TEMP ("{0}_{1}.exe" -f ($Name -replace '\W','_'), (Get-Date -Format 'yyyyMMddHHmmss'))
+    $ext = if ($Url -match '\.msi(\?|#|$)') { 'msi' } else { 'exe' }   # MSI installers (e.g. Chrome) need msiexec
+    $tmp = Join-Path $env:TEMP ("{0}_{1}.{2}" -f ($Name -replace '\W','_'), (Get-Date -Format 'yyyyMMddHHmmss'), $ext)
     Write-Log DEBUG "downloading $Name from $Url"
     try {
         $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
         Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -ErrorAction Stop
         $ProgressPreference = $pp
     } catch { Write-Log WARN "Failed - $Name (download failed: $($_.Exception.Message))"; return 'FAILED' }
-    # sanity: make sure we got a real .exe (MZ header), not an HTML landing/redirect page
+    # sanity: make sure we got a real installer (MZ='MZ' = exe, or OLE 'D0 CF 11 E0' = msi), not an HTML page
     try {
-        $fs = [System.IO.File]::OpenRead($tmp); $sig = New-Object byte[] 2; [void]$fs.Read($sig, 0, 2); $fs.Close()
-    } catch { $sig = @(0, 0) }
-    if (-not ($sig[0] -eq 0x4D -and $sig[1] -eq 0x5A)) {
-        Write-Log WARN "Failed - $Name (downloaded file is not an installer; get it manually from $Url)"
+        $fs = [System.IO.File]::OpenRead($tmp); $sig = New-Object byte[] 4; [void]$fs.Read($sig, 0, 4); $fs.Close()
+    } catch { $sig = @(0, 0, 0, 0) }
+    $isExe = ($sig[0] -eq 0x4D -and $sig[1] -eq 0x5A)
+    $isMsi = ($sig[0] -eq 0xD0 -and $sig[1] -eq 0xCF -and $sig[2] -eq 0x11 -and $sig[3] -eq 0xE0)
+    if (-not ($isExe -or $isMsi)) {
+        Write-Log WARN "Failed - $Name (downloaded file is not an exe/msi installer; get it manually from $Url)"
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return 'FAILED'
     }
     try {
-        if ($SilentArgs) { $p = Start-Process -FilePath $tmp -ArgumentList $SilentArgs -Wait -PassThru }
-        else             { $p = Start-Process -FilePath $tmp -Wait -PassThru }
+        if ($isMsi)           { $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList "/i `"$tmp`" $SilentArgs" -Wait -PassThru }
+        elseif ($SilentArgs)  { $p = Start-Process -FilePath $tmp -ArgumentList $SilentArgs -Wait -PassThru }
+        else                  { $p = Start-Process -FilePath $tmp -Wait -PassThru }
         $code = $p.ExitCode
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         Write-Log DEBUG "$Name installer exit code: $code"
@@ -788,7 +792,6 @@ $script:Tweaks = @(
 $script:AppsToInstall = @(
     'Microsoft.DirectX',
     'RevoUninstaller.RevoUninstaller',
-    'Google.Chrome',
     'Nextcloud.NextcloudDesktop',
     'Discord.Discord',
     'Valve.Steam',
@@ -825,6 +828,14 @@ $script:AppDetectNames = @{
 }
 # Non-winget apps: fetch the vendor installer directly and run it silently (see Install-DirectDownload).
 $script:DirectApps = @(
+    @{  # Google Chrome - winget hash mismatch under admin (0x8A150011): Google rotates the enterprise MSI
+        # but the winget manifest hash lags. Direct-download the stable always-latest enterprise MSI (MSI ->
+        # msiexec /i /qn handled by Install-DirectDownload).
+        Name       = 'Google Chrome'
+        Url        = 'https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi'
+        SilentArgs = '/qn /norestart'
+        DetectName = 'Google Chrome*'
+    }
     @{  # NVIDIA App - not on winget (hardware-gated). Scrape the official page for the current
         # NVIDIA_app_vX.exe and install silently. Only runs when an NVIDIA GPU is present.
         Name       = 'NVIDIA App'
@@ -909,7 +920,6 @@ $script:AppNames = @{
     'Microsoft.VCRedist.2015+.x86' = 'Visual C++ 2015-2022 (x86)'; 'Microsoft.VCRedist.2015+.x64' = 'Visual C++ 2015-2022 (x64)'
     'Microsoft.DirectX'                = 'DirectX'
     'RevoUninstaller.RevoUninstaller'  = 'Revo Uninstaller'
-    'Google.Chrome'                    = 'Google Chrome'
     'Nextcloud.NextcloudDesktop'       = 'Nextcloud'
     'Discord.Discord'                  = 'Discord'
     'Valve.Steam'                      = 'Steam'

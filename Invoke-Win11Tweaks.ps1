@@ -765,13 +765,15 @@ $script:Tweaks = @(
   # On Win11 24H2/25H2 (build 26200) the reliable switch is the Explorer policy DisableSearchBoxSuggestions=1
   # (removes web suggestions + the Copilot search button); the Windows Search + Bing keys reinforce it so
   # web results don't come back via the connected-search path.
-  [pscustomobject]@{ Id='CustomDisableWebSearch'; Content='Search - disable web/Bing results in Start'; Category='Custom'; Apply={
+  [pscustomobject]@{ Id='CustomDisableWebSearch'; Content='Search - disable web/Bing + Store results in Start'; Category='Custom'; Apply={
       $id='CustomDisableWebSearch'
       Set-Reg -Id $id -Path 'HKCU:\Software\Policies\Microsoft\Windows\Explorer'         -Name 'DisableSearchBoxSuggestions' -Type DWord -Value '1'
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'   -Name 'DisableWebSearch'            -Type DWord -Value '1'
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'   -Name 'ConnectedSearchUseWeb'       -Type DWord -Value '0'
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search'     -Name 'BingSearchEnabled'           -Type DWord -Value '0'
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search'     -Name 'CortanaConsent'              -Type DWord -Value '0'
+      # no Microsoft Store app suggestions in Start search (Settings > Privacy > Search > Show suggested results > Microsoft Store)
+      Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings' -Name 'IsStoreSuggestionsEnabled' -Type DWord -Value '0'
       $script:NeedExplorerRestart = $true
   }}
 

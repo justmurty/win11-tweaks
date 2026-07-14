@@ -11,7 +11,7 @@ console **and** a file so the run can be reviewed afterwards.
   custom (shortcut-arrow off, Spotlight off + default wallpaper, Ultimate Performance,
   **Memory Integrity / VBS off** for gaming, mouse acceleration off, DNS → Cloudflare,
   Explorer → This PC, taskbar cleanup (Search / Task view / Widgets / Chat / Resume off),
-  **web/Bing search in Start off**, remove the Edge desktop shortcut). Details:
+  **web/Bing + Store search in Start off**, remove the Edge desktop shortcut). Details:
   [`docs/2026-07-11-win11-tweaks-design.md`](docs/2026-07-11-win11-tweaks-design.md).
 - Shows the **MSUHost banner**, asks **`Continue? (Y/n)`** and **`PC or Laptop?`** (`1` PC / `2` Laptop).
 - Then the **install phase**: **12 Visual C++ redists** + **16 winget apps**

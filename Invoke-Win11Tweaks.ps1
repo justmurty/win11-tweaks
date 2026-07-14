@@ -1052,6 +1052,50 @@ function Install-BattleNet {
     Write-Log WARN "Failed - $label"; return $false
 }
 
+function Install-Alienware {
+    # Alienware Command Center. Returns a STATUS ('OK'/'SKIPPED'/'FAILED') so a non-Alienware box shows
+    # SKIPPED, NOT a scary "Failed". We check the ACTUAL hardware (Win32_ComputerSystem model) instead of
+    # relying on the Store's flaky detection: not Alienware/Dell G -> SKIPPED. On Alienware/Dell G -> try
+    # the Microsoft Store first (official/latest); if the Store gating misfires, fall back to Dell's
+    # DIRECT Full Installer EXE (bypasses the Store). Only a genuine install failure -> FAILED.
+    # NOTE: the Dell URL is version-pinned (update when Dell ships newer) + /s is a best-effort silent
+    # switch; can't be tested on the non-Alienware VM.
+    $id = '9PMHP03NJ9QP'; $label = 'Alienware Command Center'
+    $dellUrl = 'https://dl.dell.com/FOLDER12874937M/2/Alienware-Command-Center-6-x-Full-Installer-for_5T498_WIN64_6.7.37.0_A00_01.EXE'
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $label on Alienware/Dell G hardware"; return 'DRYRUN' }
+    if (Test-AppInstalled -NamePattern 'Alienware Command Center*') { Write-Log OK "Already installed - $label"; return 'OK' }
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $hw = "$($cs.Manufacturer) $($cs.Model)"
+    if ($hw -notmatch 'Alienware' -and $hw -notmatch 'Dell\s*G\d') {
+        Write-Log INFO "$label - skipped (not Alienware/Dell hardware)"   # NOT a failure
+        return 'SKIPPED'
+    }
+    Write-Log INFO "Installing $label"
+    # 1) Microsoft Store (official, always-latest)
+    $wo = Join-Path $env:TEMP 'winget_awcc.log'
+    try {
+        $p = Start-Process -FilePath 'winget' -NoNewWindow -Wait -PassThru -RedirectStandardOutput $wo `
+            -ArgumentList "install $id --accept-package-agreements --accept-source-agreements --source msstore --silent"
+        if ($p.ExitCode -eq 0) { Remove-Item $wo -Force -EA SilentlyContinue; Write-Log OK "Done!"; return 'OK' }
+    } catch { }
+    Remove-Item $wo -Force -ErrorAction SilentlyContinue
+    # 2) Dell direct Full Installer fallback (bypasses the Store's hardware gating)
+    Write-Log DEBUG "Store install failed/gated -> trying Dell's direct AWCC installer"
+    $tmp = Join-Path $env:TEMP 'AWCC_dell.exe'
+    try {
+        $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri $dellUrl -OutFile $tmp -UseBasicParsing -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -ErrorAction Stop
+        $ProgressPreference = $pp
+        $dp = Start-Process -FilePath $tmp -ArgumentList '/s' -Wait -PassThru
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        if (Test-AppInstalled -NamePattern 'Alienware Command Center*') { Write-Log OK "Done!"; return 'OK' }
+        Write-Log WARN "Failed - $label (install manually from dell.com/support)"; return 'FAILED'
+    } catch {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        Write-Log WARN "Failed - $label (Dell fallback download failed: $($_.Exception.Message))"; return 'FAILED'
+    }
+}
+
 function Invoke-InstallPhase {
     Write-Log INFO "=========== installing apps ==========="
 
@@ -1089,8 +1133,10 @@ function Invoke-InstallPhase {
             $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail="$($a.Machine)-only" })
             continue
         }
-        $ok = Install-App -Id $a.Id -Name $a.Name -Source $a.Source
-        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail=$a.Machine })
+        # Alienware returns a STATUS (OK/SKIPPED/FAILED) - not-Alienware-hardware is SKIPPED, not FAILED.
+        if ($a.Id -eq '9PMHP03NJ9QP') { $st = Install-Alienware }
+        else { $st = if (Install-App -Id $a.Id -Name $a.Name -Source $a.Source) { 'OK' } else { 'FAILED' } }
+        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=$st; Detail=$a.Machine })
     }
 
     # (.NET 3.5 was started in the BACKGROUND before this phase (Start-DotNet35) so it downloads in

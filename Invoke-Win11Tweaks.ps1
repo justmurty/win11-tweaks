@@ -78,10 +78,11 @@ if (-not $isAdmin) {
             $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-NoExit','-Command',"irm $SelfUrl | iex")
         }
         Start-Process -FilePath $psExe -Verb RunAs -ArgumentList $argList
+        exit   # elevated instance launched -> close THIS original (non-admin) window
     } catch {
         Write-Host "Elevation was cancelled or failed. Please run this in an elevated PowerShell." -ForegroundColor Red
+        return   # keep this window open so the message is visible
     }
-    return
 }
 
 # Some tweaks write under HKEY_USERS (e.g. NumLock -> HKU:\.Default); ensure the drive exists.

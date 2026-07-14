@@ -875,6 +875,10 @@ $script:VCRedists = @(
     'Microsoft.VCRedist.2015+.x86', 'Microsoft.VCRedist.2015+.x64'
 )
 
+# WinRAR license embedded as base64 - so the `irm|iex` one-liner (no file next to the script) still
+# licenses WinRAR. An explicit -RarKey file or a rarreg.key next to the script takes precedence.
+$script:RarKeyB64 = 'UkFSIHJlZ2lzdHJhdGlvbiBkYXRhCldpblJBUgpVbmxpbWl0ZWQgQ29tcGFueSBMaWNlbnNlClVJRD00YjkxNGZiNzcyYzgzNzZiZjU3MQo2NDEyMjEyMjUwZjU3MTFhZDA3MmNmMzUxY2ZhMzllMjg1MTE5MmRhZjhhMzYyNjgxYmJiMWQKY2Q0OGRhMWQxNGQ5OTVmMGJiZjk2MGZjZTZjYjVmZmRlNjI4OTAwNzk4NjFiZTU3NjM4NzE3CjcxMzFjZWQ4MzVlZDY1Y2M3NDNkOTc3N2YyZWE3MWE4ZTMyYzdlNTkzY2Y2Njc5NDM0MzU2NQpiNDFiY2Y1NjkyOTQ4NmI4YmNkYWMzM2Q1MGVjZjc3Mzk5NjA1MjU5OGYxZjU1NmRlZmZmYmQKOTgyZmJlNzFlOTNkZjZiNjM0NmMzN2EzODkwZjNjN2VkYzY1ZDdmNTQ1NTQ3MGQxM2QxMTkwCjZlNmZiODI0YmNmMjVmMTU1NTQ3YjVmYzQxOTAxYWQ1OGMwOTkyZjU3MGJlMWNmNTYwOGJhOQphZWY2OWQ0OGM4NjRiY2Q3MmQxNTE2Mzg5Nzc3M2QzMTQxODdmNmE5YWYzNTA4MDg3MTk3OTY='
+
 # Friendly display names for the "Installing X" log line (falls back to the winget ID if not listed).
 $script:AppNames = @{
     'Microsoft.VCRedist.2005.x86'  = 'Visual C++ 2005 (x86)';      'Microsoft.VCRedist.2005.x64'  = 'Visual C++ 2005 (x64)'
@@ -985,14 +989,21 @@ function Invoke-InstallPhase {
         if ($st -eq 'OK' -and $script:DesktopShortcutApps.ContainsKey($d.Name)) { $sc = $script:DesktopShortcutApps[$d.Name]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
     }
 
-    # WinRAR license - place rarreg.key (shipped next to the script) into the WinRAR dir(s)
+    # WinRAR license - write rarreg.key into the WinRAR dir(s). Bytes come from an explicit -RarKey file,
+    # else a rarreg.key next to the script (download flow), else the EMBEDDED base64 (so the `irm|iex`
+    # one-liner, which has no file next to it, still licenses WinRAR).
+    $rkBytes = $null
     $rk = if ($RarKey) { $RarKey } elseif ($PSScriptRoot) { Join-Path $PSScriptRoot 'rarreg.key' } else { $null }
-    if ($rk -and (Test-Path $rk)) {
+    if ($rk -and (Test-Path $rk)) { try { $rkBytes = [System.IO.File]::ReadAllBytes($rk) } catch { } }
+    if (-not $rkBytes -and $script:RarKeyB64 -and $script:RarKeyB64 -ne 'UkFSIHJlZ2lzdHJhdGlvbiBkYXRhCldpblJBUgpVbmxpbWl0ZWQgQ29tcGFueSBMaWNlbnNlClVJRD00YjkxNGZiNzcyYzgzNzZiZjU3MQo2NDEyMjEyMjUwZjU3MTFhZDA3MmNmMzUxY2ZhMzllMjg1MTE5MmRhZjhhMzYyNjgxYmJiMWQKY2Q0OGRhMWQxNGQ5OTVmMGJiZjk2MGZjZTZjYjVmZmRlNjI4OTAwNzk4NjFiZTU3NjM4NzE3CjcxMzFjZWQ4MzVlZDY1Y2M3NDNkOTc3N2YyZWE3MWE4ZTMyYzdlNTkzY2Y2Njc5NDM0MzU2NQpiNDFiY2Y1NjkyOTQ4NmI4YmNkYWMzM2Q1MGVjZjc3Mzk5NjA1MjU5OGYxZjU1NmRlZmZmYmQKOTgyZmJlNzFlOTNkZjZiNjM0NmMzN2EzODkwZjNjN2VkYzY1ZDdmNTQ1NTQ3MGQxM2QxMTkwCjZlNmZiODI0YmNmMjVmMTU1NTQ3YjVmYzQxOTAxYWQ1OGMwOTkyZjU3MGJlMWNmNTYwOGJhOQphZWY2OWQ0OGM4NjRiY2Q3MmQxNTE2Mzg5Nzc3M2QzMTQxODdmNmE5YWYzNTA4MDg3MTk3OTY=') {
+        try { $rkBytes = [System.Convert]::FromBase64String($script:RarKeyB64) } catch { }
+    }
+    if ($rkBytes) {
         $placed = $false
         foreach ($dir in @("$env:ProgramFiles\WinRAR", "${env:ProgramFiles(x86)}\WinRAR")) {
             if (Test-Path $dir) {
-                if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would copy rarreg.key -> $dir" }
-                else { Copy-Item -LiteralPath $rk -Destination (Join-Path $dir 'rarreg.key') -Force -ErrorAction SilentlyContinue; Write-Log DEBUG "WinRAR license placed in $dir" }
+                if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would place rarreg.key -> $dir" }
+                else { [System.IO.File]::WriteAllBytes((Join-Path $dir 'rarreg.key'), $rkBytes); Write-Log DEBUG "WinRAR license placed in $dir" }
                 $placed = $true
             }
         }
@@ -1000,7 +1011,7 @@ function Invoke-InstallPhase {
         elseif (-not $placed) { Write-Log DEBUG "WinRAR install dir not found; license not placed" }
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status=($(if ($placed) {'OK'} else {'SKIPPED'})); Detail='' })
     } else {
-        Write-Log DEBUG "WinRAR license: rarreg.key not available - skipping"
+        Write-Log DEBUG "WinRAR license: no rarreg.key file and no embedded key - skipping"
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status='SKIPPED'; Detail='no key' })
     }
 

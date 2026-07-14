@@ -37,7 +37,7 @@ param(
     [switch]$DryRun,
     [switch]$Reboot,
     [switch]$Detailed,   # full/debug console output (default: concise, human-friendly; the LOG FILE is always full)
-    [ValidateSet('PC','Laptop')][string]$Machine,   # skip the "PC or Laptop?" prompt; gates HP (Laptop) & Alienware (PC)
+    [string]$Machine,   # 'PC' or 'Laptop' (validated in Show-Intro, NOT via [ValidateSet] - that breaks `irm|iex`)
     [string]$LogDir
 )
 
@@ -1147,8 +1147,8 @@ function Show-Intro {
         }
     }
     # Machine type - gates HP Support Assistant (Laptop only) and Alienware Command Center (PC only).
-    if ($Machine) {
-        $script:MachineType = $Machine
+    if ($Machine -eq 'PC' -or $Machine -eq 'Laptop') {
+        $script:MachineType = if ($Machine -eq 'Laptop') { 'Laptop' } else { 'PC' }
     } elseif ([Environment]::UserInteractive) {
         do { $mt = Read-Host "  Is this a Desktop PC or a Laptop?   [1] PC    [2] Laptop" }
         until ($mt -match '^\s*[12]\s*$')

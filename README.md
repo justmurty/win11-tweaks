@@ -11,12 +11,20 @@ everything to console **and** a file.
 
 ## Какво прави / What it does
 
-- **27 tweaks** (Essential + Advanced + Customize Preferences toggles) — точно каквото
-  е избрано в WinUtil. Подробно: [`docs/2026-07-11-win11-tweaks-design.md`](docs/2026-07-11-win11-tweaks-design.md).
-- Прави **System Restore Point пръв** (за връщане при нужда).
-- После **install фаза** (winget): 13 приложения автоматично + 2 с питане (AnyDesk,
-  HP Support Assistant) + активира .NET Framework 2/3/4 (Windows feature).
-- **Не рестартира** сам. **Не** пипа нищо, което не е избрано.
+- **30 tweaks** — 25 от WinUtil (Essential + Advanced + Customize Preferences toggles) + 5
+  custom (Spotlight off + default тапет, Ultimate Performance, DNS→Cloudflare, Explorer→This PC,
+  taskbar cleanup: Search hide / Task view / Widgets / Chat / Resume off). Подробно:
+  [`docs/2026-07-11-win11-tweaks-design.md`](docs/2026-07-11-win11-tweaks-design.md).
+- Показва **MSUHost банер** и пита **`Continue? (Y/n)`**, преди да пипне нещо.
+- После **install фаза**: **12 Visual C++ redist** + **18 winget приложения** автоматично
+  (вкл. Razer Synapse 4, VLC, Lightshot, Google Play Games, TurboTop) + **3 директно от сайта**
+  (**NVIDIA App** само при NVIDIA GPU, **Bitwarden**, **Parsec**) + **3 с питане** (AnyDesk,
+  HP Support Assistant, Alienware Command Center), поставя **WinRAR лиценз** (`rarreg.key`) и
+  активира **.NET 3.5** (вкл. 2.0/3.0) **и .NET 4** (през DISM, като "Turn Windows features on/off").
+- **Pin-ва "This PC" в taskbar** (с иконата на This PC) чрез временен helper, който се трие след това.
+- Вече инсталирано приложение се **прескача** (проверка през `winget list` + Add/Remove Programs).
+- **Не** прави Restore Point и **не рестартира** сам (освен с `-Reboot`). **Не** пипа нищо,
+  което не е избрано.
 
 ## Изисквания / Requirements
 
@@ -67,7 +75,9 @@ win11-tweaks_YYYYMMDD_HHMMSS.log
 |------|-------|
 | `-DryRun` | Логва какво БИ направил, но **не пипа** системата. Пусни това първо. |
 | (без флаг) | Реално прилага tweaks + инсталира приложенията. |
+| `-Reboot` | Рестартира машината 15s след края (спира се с Ctrl+C). |
 | `-LogDir <път>` | Друга папка за лога (по подразбиране: папката на скрипта). |
+| `-RarKey <път>` | Път до WinRAR лиценза (по подразбиране: `rarreg.key` до скрипта). |
 
 ## Добавяне на приложения / Adding apps
 
@@ -76,7 +86,12 @@ winget ID-та (напр. `'Mozilla.Firefox'`). За приложения „с 
 
 ## Забележки / Notes
 
-- **NVIDIA App** го няма в winget → скриптът го **пропуска** (логва се); инсталирай го
-  ръчно засега.
-- Няма undo режим — за връщане ползвай създадения System Restore Point.
+- **NVIDIA App** го няма в winget → скриптът го тегли **директно от сайта на NVIDIA**
+  (намира текущата версия) и го слага тихо - **само ако има NVIDIA видеокарта**, иначе пропуска.
+- **Няма undo и НЕ се прави Restore Point** — ако искаш връщане назад, направи си сам
+  snapshot/бекъп преди реалния пуск.
+- **winget иска интерактивна сесия** — пускай през `Run-Win11Tweaks.bat` (двойно-цъкане),
+  не през SSH/отдалечено (иначе winget гърми с `0x8A15000F`).
+- **.NET 3.5** тегли payload само от Windows Update/медия — на машина с интернет минава; при
+  блокиран WU гръмва timeout след 300s и продължава.
 - Заземено 1:1 в WinUtil v26.06.23 (`irm christitus.com/win`).

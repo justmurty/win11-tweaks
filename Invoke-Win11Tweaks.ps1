@@ -2,21 +2,27 @@
 <#
 .SYNOPSIS
     Applies a fixed set of Chris Titus WinUtil (v26.06.23) tweaks, then installs a
-    defined application set via winget. No GUI. Logs everything to the console AND a
-    file so the run can be reviewed afterwards.
+    defined application set via winget (plus Visual C++ redists and .NET features).
+    No GUI. Logs everything to the console AND a file so the run can be reviewed afterwards.
 
 .DESCRIPTION
-    The 27 tweaks and the install list are exactly the items selected by the user in
-    WinUtil (see docs/2026-07-11-win11-tweaks-design.md). Only the ON toggles /
-    checked items are applied; nothing else is touched. A System Restore Point is
-    created first. The script never reboots by itself.
+    The 30 tweaks (25 from WinUtil + 5 custom) and the install list are the items the user
+    selected in WinUtil (see docs/2026-07-11-win11-tweaks-design.md) plus a few custom
+    additions. Only the ON toggles / checked items are applied; nothing else is touched.
+    The script makes NO restore point and does NOT reboot unless -Reboot is given.
 
 .PARAMETER DryRun
     Log what WOULD happen and make NO system changes. Recommended for the first run.
 
+.PARAMETER Reboot
+    Reboot 15 seconds after finishing (cancellable with Ctrl+C). Off by default.
+
 .PARAMETER LogDir
     Directory for the log file. Default: the script's own folder (fallback: Desktop
     if the script folder is unknown/unwritable). The log lands right next to the script.
+
+.PARAMETER RarKey
+    Path to the WinRAR license file (rarreg.key). Default: rarreg.key next to the script.
 
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\Invoke-Win11Tweaks.ps1 -DryRun
@@ -28,13 +34,16 @@
 param(
     [switch]$DryRun,
     [switch]$Reboot,
+    [switch]$Detailed,   # full/debug console output (default: concise, human-friendly; the LOG FILE is always full)
     [string]$LogDir,
     [string]$RarKey   # path to rarreg.key (WinRAR license); default: rarreg.key next to the script
 )
 
 $ErrorActionPreference = 'Continue'
 $script:DryRun               = [bool]$DryRun
+$script:Detailed             = [bool]$Detailed
 $script:NeedExplorerRestart  = $false
+$script:NeedIconCacheClear   = $false
 $script:Results              = [System.Collections.Generic.List[object]]::new()
 
 # --------------------------------------------------------------------------------------
@@ -61,12 +70,15 @@ try { New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction Stop | Out-
 catch { $LogDir = [Environment]::GetFolderPath('Desktop') }
 $script:LogFile = Join-Path $LogDir ("win11-tweaks_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 
-try { Start-Transcript -Path $script:LogFile -Append -ErrorAction Stop | Out-Null } catch { }
+# Start the log file (full detail ALWAYS lands here; the console stays concise unless -Detailed).
+try { "win11-tweaks log  -  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" | Out-File -FilePath $script:LogFile -Encoding UTF8 -Force } catch { }
 
 # --------------------------------------------------------------------------------------
 #  Logging + primitive helpers (all DryRun-aware) - mirror WinUtil's apply engine
 # --------------------------------------------------------------------------------------
 function Write-Log {
+    # Full detail (every level) ALWAYS goes to the LOG FILE. The CONSOLE is concise by default:
+    # DEBUG lines (granular reg/service/appx writes, heartbeats) are hidden unless -Detailed was given.
     param(
         [ValidateSet('DEBUG','INFO','OK','WARN','ERROR')][string]$Level = 'INFO',
         [Parameter(Mandatory)][string]$Message,
@@ -74,7 +86,9 @@ function Write-Log {
     )
     $ts  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
     $tag = if ($Id) { "[$Id] " } else { '' }
-    $line = "{0} [{1,-5}] {2}{3}" -f $ts, $Level, $tag, $Message
+    # the LOG FILE gets the full line (incl. the [Id] tag, for diagnostics); the CONSOLE omits the tag
+    try { Add-Content -Path $script:LogFile -Value ("{0} [{1,-5}] {2}{3}" -f $ts, $Level, $tag, $Message) -Encoding UTF8 -ErrorAction SilentlyContinue } catch { }
+    if ($Level -eq 'DEBUG' -and -not $script:Detailed) { return }   # concise console - hide DEBUG unless -Detailed
     $color = switch ($Level) {
         'OK'    { 'Green' }
         'WARN'  { 'Yellow' }
@@ -82,7 +96,7 @@ function Write-Log {
         'DEBUG' { 'DarkGray' }
         default { 'Gray' }
     }
-    Write-Host $line -ForegroundColor $color
+    Write-Host ("{0} [{1,-5}] {2}" -f $ts, $Level, $Message) -ForegroundColor $color
 }
 
 function Set-Reg {
@@ -99,10 +113,10 @@ function Set-Reg {
         }
         if ($Value -ne '<RemoveEntry>') {
             Set-ItemProperty -Path $Path -Name $Name -Type $Type -Value $Value -Force -ErrorAction Stop | Out-Null
-            Write-Log OK "set $Path\$Name = $Value" $Id
+            Write-Log DEBUG "set $Path\$Name = $Value" $Id
         } else {
             Remove-ItemProperty -Path $Path -Name $Name -Force -ErrorAction SilentlyContinue | Out-Null
-            Write-Log OK "removed $Path\$Name" $Id
+            Write-Log DEBUG "removed $Path\$Name" $Id
         }
     } catch {
         Write-Log WARN "reg $Path\$Name failed: $($_.Exception.Message)" $Id
@@ -115,13 +129,13 @@ function Set-Svc {
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
     if (-not $svc) { Write-Log WARN "service $Name not found; skipping" $Id; return }
     if ($OriginalType -and ($svc.StartType.ToString() -ne $OriginalType)) {
-        Write-Log INFO "service $Name already customized (is $($svc.StartType), expected $OriginalType); leaving as-is" $Id
+        Write-Log DEBUG "service $Name already customized (is $($svc.StartType), expected $OriginalType); leaving as-is" $Id
         return
     }
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would set service $Name -> $StartupType" $Id; return }
     try {
         Set-Service -Name $Name -StartupType $StartupType -ErrorAction Stop
-        Write-Log OK "service $Name -> $StartupType" $Id
+        Write-Log DEBUG "service $Name -> $StartupType" $Id
     } catch {
         Write-Log WARN "service $Name failed: $($_.Exception.Message)" $Id
     }
@@ -135,7 +149,7 @@ function Remove-Appx {
         Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
             Where-Object { $_.DisplayName -like $Name } |
             Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Out-Null
-        Write-Log OK "removed appx '$Name'" $Id
+        Write-Log DEBUG "removed appx '$Name'" $Id
     } catch {
         Write-Log WARN "appx '$Name' failed: $($_.Exception.Message)" $Id
     }
@@ -144,8 +158,8 @@ function Remove-Appx {
 function Invoke-Step {
     param([string]$Description, [scriptblock]$Action, [string]$Id = '')
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would run: $Description" $Id; return }
-    Write-Log INFO "run: $Description" $Id
-    try { & $Action; Write-Log OK "done: $Description" $Id }
+    Write-Log DEBUG "run: $Description" $Id
+    try { & $Action; Write-Log DEBUG "done: $Description" $Id }
     catch { Write-Log WARN "step '$Description' failed: $($_.Exception.Message)" $Id }
 }
 
@@ -155,6 +169,14 @@ function Update-Explorer {
     if ($Action -eq 'restart') {
         Write-Log INFO "restarting explorer"
         taskkill.exe /F /IM explorer.exe 2>$null | Out-Null
+        if ($script:NeedIconCacheClear) {
+            # Rebuild the icon cache while explorer is stopped - otherwise a changed overlay (our removed
+            # shortcut arrow) renders as a BLACK BOX from the stale cache (a well-known Windows issue).
+            # Delete IMMEDIATELY (Windows auto-restarts the shell within ~1s and re-locks the cache files).
+            Write-Log DEBUG "clearing icon cache (so the shortcut-arrow removal renders transparent, not a black box)"
+            Remove-Item "$env:LocalAppData\IconCache.db" -Force -ErrorAction SilentlyContinue
+            Remove-Item "$env:LocalAppData\Microsoft\Windows\Explorer\iconcache_*.db" -Force -ErrorAction SilentlyContinue
+        }
         Start-Process explorer.exe
     } else {
         if (-not ([System.Management.Automation.PSTypeName]'Native.Win32Refresh').Type) {
@@ -170,63 +192,188 @@ public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint M
     }
 }
 
+function Test-AppInstalled {
+    # Return $true if the package is already installed, so Install-App can skip it.
+    #  - winget list uses a locale-independent EXIT CODE (0 = found) -> catches winget-tracked installs.
+    #  - the Add/Remove Programs DisplayName scan catches installs made OUTSIDE winget
+    #    (e.g. Razer Synapse bundled with Razer hardware), which 'winget list' won't see.
+    param([string]$Id, [string]$NamePattern)
+    if ($Id) {
+        try {
+            & winget list --id $Id --exact --accept-source-agreements *>$null
+            if ($LASTEXITCODE -eq 0) { return $true }
+        } catch { }
+    }
+    if ($NamePattern) {
+        $keys = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        )
+        foreach ($k in $keys) {
+            if (Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like $NamePattern }) { return $true }
+        }
+    }
+    return $false
+}
+
 function Install-App {
-    param([string]$Id, [string]$Name, [string]$Location)
-    $label = if ($Name) { "$Name ($Id)" } else { $Id }
-    $wingetArgs = "install $Id --accept-package-agreements --accept-source-agreements --source winget --silent"
+    # Clean console output: just "Installing <name>" then "Done!" (or "Failed"). winget's own chatter
+    # (Found / Downloading / Successfully installed) is redirected to a temp file - shown only in the
+    # log file on failure, never on the console.
+    param([string]$Id, [string]$Name, [string]$Location, [string]$DetectName, [string]$Source)
+    $label = if ($Name) { $Name } elseif ($script:AppNames.ContainsKey($Id)) { $script:AppNames[$Id] } else { $Id }
+    $src = if ($Source) { $Source } else { 'winget' }   # 'msstore' for Store-only apps (e.g. Alienware Command Center)
+    $wingetArgs = "install $Id --accept-package-agreements --accept-source-agreements --source $src --silent"
     if ($Location) { $wingetArgs += " --location `"$Location`"" }   # e.g. Battle.net requires an install location
-    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would winget $wingetArgs"; return $true }
-    Write-Log INFO "winget install $label"
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $label"; return $true }
+    if (Test-AppInstalled -Id $Id -NamePattern $DetectName) { Write-Log OK "Already installed - $label"; return $true }
+    Write-Log INFO "Installing $label"
+    $wo = Join-Path $env:TEMP 'winget_out.log'
     try {
-        $p = Start-Process -FilePath 'winget' -NoNewWindow -Wait -PassThru -ArgumentList $wingetArgs
-        if ($p.ExitCode -eq 0) { Write-Log OK "installed $label"; return $true }
-        Write-Log WARN "winget exit code $($p.ExitCode) for $label"; return $false
+        $p = Start-Process -FilePath 'winget' -NoNewWindow -Wait -PassThru -ArgumentList $wingetArgs -RedirectStandardOutput $wo
+        if ($p.ExitCode -eq 0) { Remove-Item $wo -Force -ErrorAction SilentlyContinue; Write-Log OK "Done!"; return $true }
+        Write-Log WARN "Failed - $label"
+        if (Test-Path $wo) { Get-Content $wo -ErrorAction SilentlyContinue | Where-Object { $_.Trim() } | Select-Object -Last 8 | ForEach-Object { Write-Log DEBUG "  winget> $($_.Trim())" }; Remove-Item $wo -Force -ErrorAction SilentlyContinue }
+        return $false
     } catch {
-        Write-Log WARN "winget failed for $label : $($_.Exception.Message)"; return $false
+        Write-Log WARN "Failed - $label : $($_.Exception.Message)"; return $false
+    }
+}
+
+function Install-DirectDownload {
+    # Download a vendor installer straight from a URL (or a scraped URL) and run it silently.
+    # For apps NOT on winget (e.g. NVIDIA App). DryRun-aware. Returns OK/SKIPPED/FAILED/DRYRUN.
+    param(
+        [string]$Name,
+        [string]$Url,                 # direct URL; OR give -UrlScript to compute the current one
+        [scriptblock]$UrlScript,
+        [string]$SilentArgs = '',     # silent-install args for the downloaded installer
+        [string]$DetectName,          # ARP DisplayName -like pattern -> skip if already installed
+        [scriptblock]$Require,        # optional gate; if it returns falsey, skip (e.g. NVIDIA GPU present)
+        [string]$RequireMsg = 'requirement not met'
+    )
+    if ($Require) {
+        $met = $false; try { $met = [bool](& $Require) } catch { }
+        if (-not $met) { Write-Log INFO "${Name}: skipped ($RequireMsg)"; return 'SKIPPED' }
+    }
+    if ($DetectName -and -not $script:DryRun -and (Test-AppInstalled -NamePattern $DetectName)) {
+        Write-Log OK "Already installed - $Name"; return 'OK'
+    }
+    if ($UrlScript) {
+        try { $Url = & $UrlScript } catch { Write-Log WARN "Failed - $Name (could not resolve download URL: $($_.Exception.Message))"; return 'FAILED' }
+    }
+    if (-not $Url) { Write-Log WARN "Failed - $Name (no download URL found)"; return 'FAILED' }
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $Name (direct download from $Url)"; return 'DRYRUN' }
+    Write-Log INFO "Installing $Name"
+    $tmp = Join-Path $env:TEMP ("{0}_{1}.exe" -f ($Name -replace '\W','_'), (Get-Date -Format 'yyyyMMddHHmmss'))
+    Write-Log DEBUG "downloading $Name from $Url"
+    try {
+        $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -ErrorAction Stop
+        $ProgressPreference = $pp
+    } catch { Write-Log WARN "Failed - $Name (download failed: $($_.Exception.Message))"; return 'FAILED' }
+    # sanity: make sure we got a real .exe (MZ header), not an HTML landing/redirect page
+    try {
+        $fs = [System.IO.File]::OpenRead($tmp); $sig = New-Object byte[] 2; [void]$fs.Read($sig, 0, 2); $fs.Close()
+    } catch { $sig = @(0, 0) }
+    if (-not ($sig[0] -eq 0x4D -and $sig[1] -eq 0x5A)) {
+        Write-Log WARN "Failed - $Name (downloaded file is not an installer; get it manually from $Url)"
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return 'FAILED'
+    }
+    try {
+        if ($SilentArgs) { $p = Start-Process -FilePath $tmp -ArgumentList $SilentArgs -Wait -PassThru }
+        else             { $p = Start-Process -FilePath $tmp -Wait -PassThru }
+        $code = $p.ExitCode
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        if ($code -in 0, 3010, 1641) { Write-Log OK "Done!"; return 'OK' }
+        Write-Log WARN "Failed - $Name"; return 'FAILED'
+    } catch {
+        Write-Log WARN "Failed - $Name : $($_.Exception.Message)"
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return 'FAILED'
     }
 }
 
 function Enable-Feature {
-    # Windows Update source (the only no-media way to get .NET 3.5). Time-bounded WITH a live
-    # heartbeat: the payload downloads from WU (slow, or stalls if WU is blocked). Run it as a
-    # job, print progress every ~10s (so it never looks frozen), give up after TimeoutSec.
-    # 300s is generous so it still succeeds on slow connections; on a WU-blocked box it just
-    # times out and moves on. On a normal machine with internet, NetFx3 installs fine here.
-    param([string]$Name, [string]$Display, [int]$TimeoutSec = 300)
+    # Enable a Windows optional feature like "Turn Windows features on/off": DISM /Online /Enable-Feature
+    # downloads any missing payload straight from Windows Update (no /Source, no /LimitAccess). NetFx3's
+    # download is slow (10-15 min seen), so we start DISM and WAIT, checking periodically if it finished,
+    # for up to TimeoutSec (default 30 min). When DISM exits we confirm the feature is Enabled -> OK. If
+    # it is still not done after TimeoutSec we STOP WAITING but do NOT kill DISM (that corrupts CBS) - it
+    # finishes on its own in the background. Runs LAST of everything so nothing waits on it.
+    param([string]$Name, [string]$Display, [int]$TimeoutSec = 1800)
     if (-not $Display) { $Display = $Name }
-    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $Display"; return 'DRYRUN' }
-    Write-Log INFO "install $Display  (Windows feature via Windows Update, max ${TimeoutSec}s)"
-    $status = 'FAILED'
-    $job = Start-Job -ScriptBlock {
-        param($n)
-        Enable-WindowsOptionalFeature -Online -FeatureName $n -All -NoRestart -ErrorAction Stop | Out-Null
-    } -ArgumentList $Name
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $lastBeat = 0
-    while ($job.State -eq 'Running' -and $sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
-        Start-Sleep -Seconds 2
-        if (($sw.Elapsed.TotalSeconds - $lastBeat) -ge 10) {
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would enable feature $Display (DISM /Online /Enable-Feature)"; return 'DRYRUN' }
+    if ((Get-WindowsOptionalFeature -Online -FeatureName $Name -ErrorAction SilentlyContinue).State -eq 'Enabled') {
+        Write-Log OK "$Display already enabled"; return 'OK'
+    }
+    $dlog = Join-Path $env:TEMP ("dism_{0}.log" -f ($Name -replace '\W','_'))
+    Write-Log INFO "installing $Display..."
+    $p = Start-Process -FilePath "$env:SystemRoot\System32\dism.exe" -WindowStyle Hidden -PassThru `
+        -ArgumentList '/Online','/Enable-Feature',"/FeatureName:$Name",'/All','/NoRestart','/Quiet',"/LogPath:$dlog"
+    $sw = [System.Diagnostics.Stopwatch]::StartNew(); $lastBeat = 0
+    while (-not $p.HasExited -and $sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        Start-Sleep -Seconds 5
+        if (($sw.Elapsed.TotalSeconds - $lastBeat) -ge 60) {   # heartbeat to the LOG FILE only (DEBUG - hidden on the console)
             $lastBeat = [int]$sw.Elapsed.TotalSeconds
-            Write-Log DEBUG ("...installing $Display  ({0}s / {1}s)" -f [int]$sw.Elapsed.TotalSeconds, $TimeoutSec) $Display
+            Write-Log DEBUG ("...still installing $Display ({0} min)" -f [int]($sw.Elapsed.TotalSeconds / 60)) $Display
         }
     }
-    if ($job.State -eq 'Completed' -or $job.State -eq 'Failed') {
-        try { Receive-Job $job -ErrorAction Stop | Out-Null; Write-Log OK "$Display installed"; $status = 'OK' }
-        catch { Write-Log WARN "$Display failed: $($_.Exception.Message)"; $status = 'FAILED' }
-    } else {
-        Write-Log WARN "$Display install timed out (${TimeoutSec}s; Windows Update unavailable) - skipped. Works on a normal machine with internet."
-        Stop-Job $job -ErrorAction SilentlyContinue
-        $status = 'TIMEOUT'
+    if ($p.HasExited) {
+        Start-Sleep -Milliseconds 500
+        if ((Get-WindowsOptionalFeature -Online -FeatureName $Name -ErrorAction SilentlyContinue).State -eq 'Enabled') {
+            Write-Log OK "$Display installed"; return 'OK'
+        }
+        Write-Log WARN "$Display NOT installed (see $dlog)"; return 'FAILED'
     }
-    Remove-Job $job -Force -ErrorAction SilentlyContinue
-    return $status
+    # Still installing after TimeoutSec. Do NOT kill DISM (that corrupts CBS) - let it finish on its own.
+    Write-Log WARN ("$Display NOT installed yet - still downloading in the background after {0} min (it finishes on its own; do not reboot until then)." -f [int]($TimeoutSec / 60))
+    return 'BACKGROUND'
 }
 
 # --------------------------------------------------------------------------------------
-#  The 27 selected tweaks (ordered; RestorePoint first). Values verbatim from WinUtil
-#  v26.06.23. Toggles apply their ON value only.
+#  The tweaks - 30 total: 25 from WinUtil v26.06.23 (values verbatim) + 5 custom at the
+#  end. Toggles apply their ON value only. No restore point (removed per user request).
 # --------------------------------------------------------------------------------------
 $script:Tweaks = @(
+
+  # Shortcut-arrow overlay - remove it FIRST so every shortcut created later (incl. app icons) has none.
+  # NOTE: use a PROPER transparent multi-size blank.ico. A malformed one (e.g. Bitmap.GetHicon().Save,
+  # which yields a ~766-byte junk icon) corrupts the shared overlay image list and makes OTHER overlays
+  # - notably the UAC admin shield - render oversized. So we build a valid 16/24/32/48 .ico by hand.
+  [pscustomobject]@{ Id='CustomShortcutArrow'; Content='Icons - remove shortcut-arrow overlay'; Category='Custom'; Apply={
+      $id='CustomShortcutArrow'
+      $blank = Join-Path $env:SystemRoot 'blank.ico'
+      Invoke-Step -Id $id -Description 'write a proper transparent blank.ico + point Shell Icons\29 at it' -Action {
+          # 24x24 ONLY (the canonical overlay size). Including larger sizes (32/48) makes Windows size the
+          # shared overlay cell to that size, which renders OTHER overlays (the UAC shield) oversized.
+          $sizes = @(24)
+          $imgData = @()
+          foreach ($w in $sizes) {
+              $andRow = [int]([math]::Ceiling($w / 32) * 4)
+              $ms = New-Object System.IO.MemoryStream; $bw = New-Object System.IO.BinaryWriter($ms)
+              $bw.Write([int32]40); $bw.Write([int32]$w); $bw.Write([int32]($w * 2))          # BITMAPINFOHEADER
+              $bw.Write([int16]1); $bw.Write([int16]32); $bw.Write([int32]0)
+              $bw.Write([int32]0); $bw.Write([int32]0); $bw.Write([int32]0); $bw.Write([int32]0); $bw.Write([int32]0)
+              $bw.Write((New-Object 'byte[]' ($w * $w * 4)))                                   # XOR bitmap: all zero = alpha 0
+              $andBytes = New-Object 'byte[]' ($andRow * $w); for ($j = 0; $j -lt $andBytes.Length; $j++) { $andBytes[$j] = 0xFF }
+              $bw.Write($andBytes)                                                              # AND mask: all 1s = transparent (all-0 would render a BLACK box)
+              $bw.Flush(); $imgData += ,($ms.ToArray()); $bw.Dispose(); $ms.Dispose()
+          }
+          $out = New-Object System.IO.MemoryStream; $ow = New-Object System.IO.BinaryWriter($out)
+          $ow.Write([int16]0); $ow.Write([int16]1); $ow.Write([int16]$sizes.Count)             # ICONDIR
+          $offset = 6 + 16 * $sizes.Count
+          for ($k = 0; $k -lt $sizes.Count; $k++) {
+              $w = $sizes[$k]; $len = $imgData[$k].Length
+              $ow.Write([byte]$w); $ow.Write([byte]$w); $ow.Write([byte]0); $ow.Write([byte]0)
+              $ow.Write([int16]1); $ow.Write([int16]32); $ow.Write([int32]$len); $ow.Write([int32]$offset); $offset += $len
+          }
+          foreach ($img in $imgData) { $ow.Write($img) }
+          $ow.Flush(); [System.IO.File]::WriteAllBytes($blank, $out.ToArray()); $ow.Dispose(); $out.Dispose()
+      }
+      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icons' -Name '29' -Type String -Value $blank
+      $script:NeedExplorerRestart = $true; $script:NeedIconCacheClear = $true
+  }}
 
   # (Restore Point - REMOVED per user request; re-add from git history if needed)
 
@@ -238,12 +385,12 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path $p -Name 'UploadUserActivities'  -Type DWord -Value '0'
   }}
 
-  # 3 - ConsumerFeatures ---------------------------------------------------------------
+  # ConsumerFeatures ---------------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksConsumerFeatures'; Content='ConsumerFeatures - Disable'; Category='Essential'; Apply={
       Set-Reg -Id 'WPFTweaksConsumerFeatures' -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableWindowsConsumerFeatures' -Type DWord -Value '1'
   }}
 
-  # 4 - Delivery Optimization ----------------------------------------------------------
+  # Delivery Optimization ----------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksDeliveryOptimization'; Content='Delivery Optimization - Disable'; Category='Essential'; Apply={
       Set-Reg -Id 'WPFTweaksDeliveryOptimization' -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' -Name 'DODownloadMode' -Type DWord -Value '0'
   }}
@@ -255,7 +402,7 @@ $script:Tweaks = @(
       Set-Reg -Id 'WPFTweaksEndTaskOnTaskbar' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings' -Name 'TaskbarEndTask' -Type DWord -Value '1'
   }}
 
-  # 7 - File Explorer Automatic Folder Discovery --------------------------------------
+  # File Explorer Automatic Folder Discovery --------------------------------------
   [pscustomobject]@{ Id='WPFTweaksDisableExplorerAutoDiscovery'; Content='File Explorer Automatic Folder Discovery - Disable'; Category='Essential'; Apply={
       Invoke-Step -Id 'WPFTweaksDisableExplorerAutoDiscovery' -Description 'reset Explorer folder-type database' -Action {
           $bags   = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\Bags'
@@ -268,7 +415,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # 8 - Location Tracking --------------------------------------------------------------
+  # Location Tracking --------------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksLocation'; Content='Location Tracking - Disable'; Category='Essential'; Apply={
       $id='WPFTweaksLocation'
       Set-Svc -Id $id -Name 'lfsvc' -StartupType 'Disable' -OriginalType 'Manual'
@@ -277,7 +424,7 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path 'HKLM:\SYSTEM\Maps' -Name 'AutoUpdateEnabled' -Type DWord -Value '0'
   }}
 
-  # 9 - Services - Set to Manual -------------------------------------------------------
+  # Services - Set to Manual -------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksServices'; Content='Services - Set to Manual'; Category='Essential'; Apply={
       $id='WPFTweaksServices'
       Set-Svc -Id $id -Name 'CscService'   -StartupType 'Disabled' -OriginalType 'Manual'
@@ -291,7 +438,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # 10 - Telemetry ---------------------------------------------------------------------
+  # Telemetry ---------------------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksTelemetry'; Content='Telemetry - Disable'; Category='Essential'; Apply={
       $id='WPFTweaksTelemetry'
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo' -Name 'Enabled' -Type DWord -Value '0'
@@ -315,7 +462,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # 11 - Temporary Files ---------------------------------------------------------------
+  # Temporary Files ---------------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksDeleteTempFiles'; Content='Temporary Files - Remove'; Category='Essential'; Apply={
       Invoke-Step -Id 'WPFTweaksDeleteTempFiles' -Description 'erase TEMP folders' -Action {
           Remove-Item -Path "$Env:Temp\*"            -Recurse -Force -ErrorAction SilentlyContinue
@@ -323,7 +470,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # 12 - Unwanted Pre-Installed Apps ---------------------------------------------------
+  # Unwanted Pre-Installed Apps ---------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksDeBloat'; Content='Unwanted Pre-Installed Apps - Remove'; Category='Essential'; Apply={
       $id='WPFTweaksDeBloat'
       $apps = @(
@@ -344,12 +491,12 @@ $script:Tweaks = @(
       }
   }}
 
-  # 13 - WPBT --------------------------------------------------------------------------
+  # WPBT --------------------------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksWPBT'; Content='Windows Platform Binary Table (WPBT) - Disable'; Category='Essential'; Apply={
       Set-Reg -Id 'WPFTweaksWPBT' -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'DisableWpbtExecution' -Type DWord -Value '1'
   }}
 
-  # 14 - Microsoft Edge - Debloat ------------------------------------------------------
+  # Microsoft Edge - Debloat ------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksEdgeDebloat'; Content='Microsoft Edge - Debloat'; Category='Advanced'; Apply={
       $id='WPFTweaksEdgeDebloat'; $e='HKLM:\SOFTWARE\Policies\Microsoft\Edge'
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate' -Name 'CreateDesktopShortcutDefault' -Type DWord -Value '0'
@@ -371,7 +518,7 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path $e -Name 'DefaultBrowserSettingsCampaignEnabled' -Type DWord -Value '0'
   }}
 
-  # 15 - Microsoft OneDrive - Remove ---------------------------------------------------
+  # Microsoft OneDrive - Remove ---------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksRemoveOneDrive'; Content='Microsoft OneDrive - Remove'; Category='Advanced'; Apply={
       $id='WPFTweaksRemoveOneDrive'
       Invoke-Step -Id $id -Description 'uninstall OneDrive + clean up' -Action {
@@ -390,7 +537,7 @@ $script:Tweaks = @(
       $script:NeedExplorerRestart = $true
   }}
 
-  # 16 - Right-Click Menu Previous Layout ----------------------------------------------
+  # Right-Click Menu Previous Layout ----------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksRightClickMenu'; Content='Right-Click Menu Previous Layout - Enable'; Category='Advanced'; Apply={
       Invoke-Step -Id 'WPFTweaksRightClickMenu' -Description 'restore classic context menu' -Action {
           New-Item -Path 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}' -Name 'InprocServer32' -Value '' -Force | Out-Null
@@ -398,7 +545,7 @@ $script:Tweaks = @(
       $script:NeedExplorerRestart = $true
   }}
 
-  # 17 - Windows AI - Disable And Remove -----------------------------------------------
+  # Windows AI - Disable And Remove -----------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksWindowsAI'; Content='Windows AI - Disable And Remove'; Category='Advanced'; Apply={
       $id='WPFTweaksWindowsAI'
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name 'SettingsPageVisibility' -Type String -Value 'hide:aicomponents'
@@ -417,7 +564,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # 18 - Dark Theme (toggle ON) --------------------------------------------------------
+  # Dark Theme (toggle ON) --------------------------------------------------------
   [pscustomobject]@{ Id='WPFToggleDarkMode'; Content='Dark Theme for Windows'; Category='Toggle'; Apply={
       $id='WPFToggleDarkMode'; $p='HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize'
       Set-Reg -Id $id -Path $p -Name 'AppsUseLightTheme'   -Type DWord -Value '0'
@@ -425,42 +572,42 @@ $script:Tweaks = @(
       Update-Explorer -Action refresh
   }}
 
-  # 19 - File Explorer File Extensions (toggle ON) -------------------------------------
+  # File Explorer File Extensions (toggle ON) -------------------------------------
   [pscustomobject]@{ Id='WPFToggleShowExt'; Content='File Explorer File Extensions'; Category='Toggle'; Apply={
       Set-Reg -Id 'WPFToggleShowExt' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'HideFileExt' -Type DWord -Value '0'
       $script:NeedExplorerRestart = $true
   }}
 
-  # 20 - Game Mode (toggle ON) ---------------------------------------------------------
+  # Game Mode (toggle ON) ---------------------------------------------------------
   [pscustomobject]@{ Id='WPFToggleGameMode'; Content='Game Mode'; Category='Toggle'; Apply={
       $id='WPFToggleGameMode'; $p='HKCU:\Software\Microsoft\GameBar'
       Set-Reg -Id $id -Path $p -Name 'AllowAutoGameMode'   -Type DWord -Value '1'
       Set-Reg -Id $id -Path $p -Name 'AutoGameModeEnabled' -Type DWord -Value '1'
   }}
 
-  # 21 - Logon Screen Acrylic Blur (toggle ON) ----------------------------------------
+  # Logon Screen Acrylic Blur (toggle ON) ----------------------------------------
   [pscustomobject]@{ Id='WPFToggleLoginBlur'; Content='Logon Screen Acrylic Blur'; Category='Toggle'; Apply={
       Set-Reg -Id 'WPFToggleLoginBlur' -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name 'DisableAcrylicBackgroundOnLogon' -Type DWord -Value '0'
   }}
 
-  # 22 - Num Lock on Startup (toggle ON) -----------------------------------------------
+  # Num Lock on Startup (toggle ON) -----------------------------------------------
   [pscustomobject]@{ Id='WPFToggleNumLock'; Content='Num Lock on Startup'; Category='Toggle'; Apply={
       $id='WPFToggleNumLock'
       Set-Reg -Id $id -Path 'HKU:\.Default\Control Panel\Keyboard' -Name 'InitialKeyboardIndicators' -Type String -Value '2'
       Set-Reg -Id $id -Path 'HKCU:\Control Panel\Keyboard'         -Name 'InitialKeyboardIndicators' -Type String -Value '2'
   }}
 
-  # 23 - S0 Sleep Network Connectivity (toggle ON) ------------------------------------
+  # S0 Sleep Network Connectivity (toggle ON) ------------------------------------
   [pscustomobject]@{ Id='WPFToggleStandbyFix'; Content='S0 Sleep Network Connectivity'; Category='Toggle'; Apply={
       Set-Reg -Id 'WPFToggleStandbyFix' -Path 'HKCU:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\f15576e8-98b7-4186-b944-eafa664402d9' -Name 'ACSettingIndex' -Type DWord -Value '1'
   }}
 
-  # 24 - Settings Home Page (toggle ON) ------------------------------------------------
+  # Settings Home Page (toggle ON) ------------------------------------------------
   [pscustomobject]@{ Id='WPFToggleHideSettingsHome'; Content='Settings Home Page'; Category='Toggle'; Apply={
       Set-Reg -Id 'WPFToggleHideSettingsHome' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name 'SettingsPageVisibility' -Type String -Value 'show:home'
   }}
 
-  # 25 - Start Menu Recommendations (toggle ON) ---------------------------------------
+  # Start Menu Recommendations (toggle ON) ---------------------------------------
   [pscustomobject]@{ Id='WPFToggleStartMenuRecommendations'; Content='Start Menu Recommendations'; Category='Toggle'; Apply={
       $id='WPFToggleStartMenuRecommendations'
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Start'     -Name 'HideRecommendedSection'  -Type DWord -Value '0'
@@ -469,12 +616,12 @@ $script:Tweaks = @(
       $script:NeedExplorerRestart = $true
   }}
 
-  # 26 - System Tray Battery Percentage (toggle ON) -----------------------------------
+  # System Tray Battery Percentage (toggle ON) -----------------------------------
   [pscustomobject]@{ Id='WPFToggleBatteryPercentage'; Content='System Tray Battery Percentage'; Category='Toggle'; Apply={
       Set-Reg -Id 'WPFToggleBatteryPercentage' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'IsBatteryPercentageEnabled' -Type DWord -Value '1'
   }}
 
-  # 27 - Taskbar Centered Icons (toggle ON) -------------------------------------------
+  # Taskbar Centered Icons (toggle ON) -------------------------------------------
   [pscustomobject]@{ Id='WPFToggleTaskbarAlignment'; Content='Taskbar Centered Icons'; Category='Toggle'; Apply={
       Set-Reg -Id 'WPFToggleTaskbarAlignment' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'TaskbarAl' -Type DWord -Value '1'
       $script:NeedExplorerRestart = $true
@@ -499,11 +646,35 @@ $script:Tweaks = @(
       }
   }}
 
-  # Ultimate Performance power plan (NOT for laptops) - max performance
+  # Ultimate Performance power plan (NOT for laptops) - max performance, then ACTIVATE it
   [pscustomobject]@{ Id='CustomUltimatePerf'; Content='Ultimate Performance - power plan'; Category='Custom'; Apply={
-      Invoke-Step -Id 'CustomUltimatePerf' -Description 'enable Ultimate Performance power plan' -Action {
-          powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 | Out-Null
-          powercfg -setactive e9a42b02-d5df-448d-aa00-03f14749eb61
+      Invoke-Step -Id 'CustomUltimatePerf' -Description 'enable + activate Ultimate Performance power plan' -Action {
+          # Reuse an existing Ultimate Performance plan if present (no duplicates on re-run); else create one.
+          $guid = ([regex]::Match((powercfg -list | Out-String), '(?im)GUID:\s*([0-9a-f-]{36})\s*\(Ultimate Performance\)')).Groups[1].Value
+          if (-not $guid) {
+              # -duplicatescheme prints the NEW plan's GUID; activate THAT (the template GUID often won't activate).
+              $guid = ([regex]::Match((powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 2>&1 | Out-String), '[0-9a-f-]{36}')).Value
+          }
+          if (-not $guid) { $guid = 'e9a42b02-d5df-448d-aa00-03f14749eb61' }
+          powercfg -setactive $guid
+          Write-Log DEBUG ("active scheme -> {0}" -f ((powercfg -getactivescheme | Out-String).Trim())) 'CustomUltimatePerf'
+      }
+  }}
+
+  # Mouse - disable "Enhance pointer precision" (mouse acceleration); preferred for gaming/consistency
+  [pscustomobject]@{ Id='CustomMouseAccel'; Content='Mouse - disable Enhance Pointer Precision'; Category='Custom'; Apply={
+      $id='CustomMouseAccel'; $m='HKCU:\Control Panel\Mouse'
+      Set-Reg -Id $id -Path $m -Name 'MouseSpeed'      -Type String -Value '0'
+      Set-Reg -Id $id -Path $m -Name 'MouseThreshold1' -Type String -Value '0'
+      Set-Reg -Id $id -Path $m -Name 'MouseThreshold2' -Type String -Value '0'
+      Invoke-Step -Id $id -Description 'apply mouse acceleration OFF (SystemParametersInfo)' -Action {
+          if (-not ([System.Management.Automation.PSTypeName]'Native.Mouse').Type) {
+              Add-Type -Namespace Native -Name Mouse -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)] public static extern bool SystemParametersInfo(uint uAction, uint uParam, int[] lpvParam, uint fuWinIni);'
+          }
+          # SPI_SETMOUSE=0x0004; lpvParam={threshold1,threshold2,acceleration}; {0,0,0}=off; fuWinIni=UPDATEINIFILE|SENDCHANGE
+          [Native.Mouse]::SystemParametersInfo(0x0004, 0, (New-Object 'int[]' 3), 3) | Out-Null
+          # also reload per-user params from the registry so it takes effect live (SPI alone can be flaky)
+          Start-Process rundll32.exe -ArgumentList 'user32.dll,UpdatePerUserSystemParameters' -WindowStyle Hidden -ErrorAction SilentlyContinue
       }
   }}
 
@@ -524,11 +695,26 @@ $script:Tweaks = @(
       $script:NeedExplorerRestart = $true
   }}
 
-  # Taskbar cleanup - hide Widgets + Chat buttons
-  [pscustomobject]@{ Id='CustomTaskbarCleanup'; Content='Taskbar - hide Widgets + Chat'; Category='Custom'; Apply={
+  # Taskbar cleanup - hide Search box, Task view, Widgets, Chat, Resume
+  [pscustomobject]@{ Id='CustomTaskbarCleanup'; Content='Taskbar - hide Search/TaskView/Widgets/Chat/Resume'; Category='Custom'; Apply={
       $id='CustomTaskbarCleanup'; $p='HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
-      Set-Reg -Id $id -Path $p -Name 'TaskbarDa' -Type DWord -Value '0'
-      Set-Reg -Id $id -Path $p -Name 'TaskbarMn' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' -Name 'SearchboxTaskbarMode' -Type DWord -Value '0'  # Search box -> Hidden
+      Set-Reg -Id $id -Path $p -Name 'ShowTaskViewButton' -Type DWord -Value '0'   # Task view button off
+      Set-Reg -Id $id -Path $p -Name 'TaskbarMn'          -Type DWord -Value '0'   # Chat button off
+      Set-Reg -Id $id -Path $p -Name 'IsEnabled'          -Type DWord -Value '0'   # Resume button off (Win11 25H2 / build 26200+)
+      # Widgets: HKCU 'TaskbarDa' is locked on 25H2 (Set fails "unauthorized"), so kill it via the
+      # HKLM policy instead - verified to set cleanly and it removes the Widgets button.
+      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' -Name 'AllowNewsAndInterests' -Type DWord -Value '0'
+      $script:NeedExplorerRestart = $true
+  }}
+
+  # Desktop cleanup - remove the Microsoft Edge desktop shortcut (a tweak, so it runs BEFORE the installs)
+  [pscustomobject]@{ Id='CustomRemoveEdgeShortcut'; Content='Desktop - remove Microsoft Edge shortcut'; Category='Custom'; Apply={
+      Invoke-Step -Id 'CustomRemoveEdgeShortcut' -Description 'remove Microsoft Edge desktop shortcut' -Action {
+          foreach ($d in @("$env:Public\Desktop", [Environment]::GetFolderPath('Desktop'))) {
+              Remove-Item (Join-Path $d 'Microsoft Edge.lnk') -Force -ErrorAction SilentlyContinue
+          }
+      }
       $script:NeedExplorerRestart = $true
   }}
 )
@@ -541,25 +727,75 @@ $script:AppsToInstall = @(
     'RevoUninstaller.RevoUninstaller',
     'Google.Chrome',
     'Nextcloud.NextcloudDesktop',
-    'Bitwarden.Bitwarden',
     'Discord.Discord',
     'Valve.Steam',
     'EpicGames.EpicGamesLauncher',
     'OBSProject.OBSStudio',
     'Blizzard.BattleNet',
     'Ubisoft.Connect',
+    'Google.PlayGames',                 # Google Play Games (PC)
     'CPUID.HWMonitor',
     'NZXT.CAM',
+    'RazerInc.RazerInstaller.Synapse4', # Razer Synapse 4 (skipped if already installed)
+    'Skillbrains.Lightshot',
+    'VideoLAN.VLC',
+    'SavardSoftware.TurboTop',           # always-on-top helper (on winget, not the savardsoftware.com exe)
     'RARLab.WinRAR'
 )
 $script:AppsToPrompt = @(
     @{ Id='AnyDesk.AnyDesk';          Name='AnyDesk' },
-    @{ Id='HPInc.HPSupportAssistant'; Name='HP Support Assistant' }
+    @{ Id='HPInc.HPSupportAssistant'; Name='HP Support Assistant' },
+    # Alienware Command Center is Store-only (msstore) and works ONLY on Alienware / Dell G
+    # hardware. If msstore fails (removed / unsupported box), grab it from Dell's support site.
+    @{ Id='9PMHP03NJ9QP'; Name='Alienware Command Center'; Source='msstore' }
 )
 # Per-app install location for packages whose winget manifest REQUIRES one (otherwise
 # winget prompts "Specify the install root:" and blocks the run). Add IDs here as needed.
 $script:AppLocations = @{
     'Blizzard.BattleNet' = 'C:\Program Files (x86)\Battle.net'
+}
+# Skip-if-already-installed detection by Add/Remove Programs DisplayName (-like pattern),
+# for apps often present OUTSIDE winget so 'winget list' alone won't see them.
+$script:AppDetectNames = @{
+    'RazerInc.RazerInstaller.Synapse4' = 'Razer Synapse*'
+}
+# Non-winget apps: fetch the vendor installer directly and run it silently (see Install-DirectDownload).
+$script:DirectApps = @(
+    @{  # NVIDIA App - not on winget (hardware-gated). Scrape the official page for the current
+        # NVIDIA_app_vX.exe and install silently. Only runs when an NVIDIA GPU is present.
+        Name       = 'NVIDIA App'
+        UrlScript  = {
+            $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+            $html = (Invoke-WebRequest 'https://www.nvidia.com/en-us/software/nvidia-app/' -UseBasicParsing -UserAgent $ua -ErrorAction Stop).Content
+            $m = [regex]::Match($html, 'https://[^\s"''<>]+/NVIDIA_app_v[\d.]+\.exe')
+            if ($m.Success) { $m.Value }
+        }
+        SilentArgs = '-s -noreboot -noeula -nofinish -nosplash'
+        DetectName = 'NVIDIA App*'
+        Require    = { [bool](Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'NVIDIA' }) }
+        RequireMsg = 'no NVIDIA GPU detected'
+    }
+    @{  # Bitwarden - winget install fails as admin (ShellExec 0x8A150006); use the official direct installer.
+        Name       = 'Bitwarden'
+        Url        = 'https://vault.bitwarden.com/download/?app=desktop&platform=windows'
+        SilentArgs = '/allusers /S'
+        DetectName = 'Bitwarden*'
+    }
+    @{  # Parsec - winget installer hash mismatch (0x8A150011, cannot override as admin); official installer.
+        Name       = 'Parsec'
+        Url        = 'https://builds.parsec.app/package/parsec-windows.exe'
+        SilentArgs = '/silent'
+        DetectName = 'Parsec*'
+    }
+)
+# Apps that should get a Desktop icon (most make their own; these do not reliably). Keyed by winget ID
+# (or a direct-download Name). Right after each app installs, New-DesktopShortcut copies its Start Menu
+# shortcut, or builds one from Exe if the app made no Start Menu entry; skipped if a Desktop icon exists.
+$script:DesktopShortcutApps = @{
+    'SavardSoftware.TurboTop' = @{ Name = 'TurboTop';  Exe = 'C:\Program Files (x86)\TurboTop\TurboTop.exe' }
+    'Blizzard.BattleNet'      = @{ Name = 'Battle.net'; Exe = "${env:ProgramFiles(x86)}\Battle.net\Battle.net Launcher.exe" }
+    'Bitwarden'               = @{ Name = 'Bitwarden'; Exe = "$env:ProgramFiles\Bitwarden\Bitwarden.exe" }
+    'Parsec'                  = @{ Name = 'Parsec';    Exe = "$env:ProgramFiles\Parsec\parsecd.exe" }
 }
 # .NET Framework via Windows features (not winget): only 3.5 and 4.
 #   NetFx3        = .NET 3.5 (inherently bundles 2.0/3.0); off by default, may need WU/source.
@@ -580,6 +816,34 @@ $script:VCRedists = @(
     'Microsoft.VCRedist.2015+.x86', 'Microsoft.VCRedist.2015+.x64'
 )
 
+# Friendly display names for the "Installing X" log line (falls back to the winget ID if not listed).
+$script:AppNames = @{
+    'Microsoft.VCRedist.2005.x86'  = 'Visual C++ 2005 (x86)';      'Microsoft.VCRedist.2005.x64'  = 'Visual C++ 2005 (x64)'
+    'Microsoft.VCRedist.2008.x86'  = 'Visual C++ 2008 (x86)';      'Microsoft.VCRedist.2008.x64'  = 'Visual C++ 2008 (x64)'
+    'Microsoft.VCRedist.2010.x86'  = 'Visual C++ 2010 (x86)';      'Microsoft.VCRedist.2010.x64'  = 'Visual C++ 2010 (x64)'
+    'Microsoft.VCRedist.2012.x86'  = 'Visual C++ 2012 (x86)';      'Microsoft.VCRedist.2012.x64'  = 'Visual C++ 2012 (x64)'
+    'Microsoft.VCRedist.2013.x86'  = 'Visual C++ 2013 (x86)';      'Microsoft.VCRedist.2013.x64'  = 'Visual C++ 2013 (x64)'
+    'Microsoft.VCRedist.2015+.x86' = 'Visual C++ 2015-2022 (x86)'; 'Microsoft.VCRedist.2015+.x64' = 'Visual C++ 2015-2022 (x64)'
+    'Microsoft.DirectX'                = 'DirectX'
+    'RevoUninstaller.RevoUninstaller'  = 'Revo Uninstaller'
+    'Google.Chrome'                    = 'Google Chrome'
+    'Nextcloud.NextcloudDesktop'       = 'Nextcloud'
+    'Discord.Discord'                  = 'Discord'
+    'Valve.Steam'                      = 'Steam'
+    'EpicGames.EpicGamesLauncher'      = 'Epic Games Launcher'
+    'OBSProject.OBSStudio'             = 'OBS Studio'
+    'Blizzard.BattleNet'               = 'Battle.net'
+    'Ubisoft.Connect'                  = 'Ubisoft Connect'
+    'Google.PlayGames'                 = 'Google Play Games'
+    'CPUID.HWMonitor'                  = 'HWMonitor'
+    'NZXT.CAM'                         = 'NZXT CAM'
+    'RazerInc.RazerInstaller.Synapse4' = 'Razer Synapse 4'
+    'Skillbrains.Lightshot'            = 'Lightshot'
+    'VideoLAN.VLC'                     = 'VLC media player'
+    'SavardSoftware.TurboTop'          = 'TurboTop'
+    'RARLab.WinRAR'                    = 'WinRAR'
+}
+
 # --------------------------------------------------------------------------------------
 #  Runner + install phase + summary
 # --------------------------------------------------------------------------------------
@@ -593,60 +857,74 @@ function Write-Banner {
 }
 
 function Invoke-Tweaks {
-    $n = $script:Tweaks.Count; $i = 0
     foreach ($t in $script:Tweaks) {
-        $i++
-        Write-Log INFO ("|> [{0}/{1}] {2}" -f $i, $n, $t.Content) $t.Id
+        Write-Log INFO ("Applying {0}" -f $t.Content) $t.Id
         $status = 'OK'; $detail = ''
         try { & $t.Apply }
         catch { $status = 'FAILED'; $detail = $_.Exception.Message; Write-Log ERROR "tweak failed: $detail" $t.Id }
-        Write-Log ($(if ($status -eq 'OK') {'OK'} else {'ERROR'})) ("<| {0}" -f $status) $t.Id
+        Write-Log ($(if ($status -eq 'OK') {'OK'} else {'ERROR'})) ($(if ($status -eq 'OK') {'Done!'} else {'Failed'})) $t.Id
         $script:Results.Add([pscustomobject]@{ Phase='Tweak'; Id=$t.Id; Content=$t.Content; Status=$status; Detail=$detail })
     }
 }
 
+function Get-StartMenuShortcuts {
+    $roots = @("$env:ProgramData\Microsoft\Windows\Start Menu\Programs", "$env:AppData\Microsoft\Windows\Start Menu\Programs")
+    Get-ChildItem $roots -Recurse -Filter '*.lnk' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+}
+
+function New-DesktopShortcut {
+    # Create a Desktop icon for ONE app, called right after that app installs. Prefer copying the app's
+    # Start Menu shortcut (correct icon+target); else build one from its .exe. Skip if a Desktop icon
+    # already exists (matched by name). Used only for the few apps that don't reliably make their own.
+    param([string]$Name, [string]$Exe)
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would create a Desktop shortcut for $Name"; return }
+    $pub = "$env:Public\Desktop"; $usr = [Environment]::GetFolderPath('Desktop')
+    $dest = Join-Path $pub "$Name.lnk"
+    $rec = [pscustomobject]@{ Phase='Install'; Id="Desktop.$Name"; Content="Desktop shortcut ($Name)"; Status='FAILED'; Detail='' }
+    if ((Test-Path $dest) -or (Test-Path (Join-Path $usr "$Name.lnk"))) {
+        Write-Log DEBUG "Desktop shortcut for $Name already present"; $rec.Status='OK'; $rec.Detail='exists'; $script:Results.Add($rec); return
+    }
+    $srcLnk = Get-StartMenuShortcuts | Where-Object {
+        $b = [IO.Path]::GetFileNameWithoutExtension($_); ($b -eq $Name) -or ($b -like "$Name*" -and $b -notmatch '(?i)uninstall|help')
+    } | Select-Object -First 1
+    try {
+        if ($srcLnk) {
+            Copy-Item -LiteralPath $srcLnk -Destination $dest -Force -ErrorAction Stop
+            Write-Log DEBUG "desktop shortcut: $Name"; $rec.Status='OK'
+        } elseif ($Exe -and (Test-Path $Exe)) {
+            $wsh = New-Object -ComObject WScript.Shell; $sc = $wsh.CreateShortcut($dest)
+            $sc.TargetPath = $Exe; $sc.WorkingDirectory = (Split-Path $Exe); $sc.Description = $Name; $sc.Save()
+            Write-Log DEBUG "desktop shortcut: $Name"; $rec.Status='OK'
+        } else {
+            Write-Log DEBUG "desktop shortcut '$Name': no Start Menu shortcut and no .exe yet - skipping (the app may create its own on first launch)"; $rec.Status='SKIPPED'; $rec.Detail='not found'
+        }
+    } catch { Write-Log DEBUG "desktop shortcut '$Name' failed: $($_.Exception.Message)"; $rec.Detail=$_.Exception.Message }
+    $script:Results.Add($rec)
+}
+
 function Invoke-InstallPhase {
-    Write-Log INFO "=========== install phase ==========="
+    Write-Log INFO "=========== installing apps ==========="
 
     if (Get-Command winget -ErrorAction SilentlyContinue) {
-        # Visual C++ Redistributables first (apps/games depend on them)
-        $vn = $script:VCRedists.Count; $vi = 0
-        foreach ($id in $script:VCRedists) {
-            $vi++
-            Write-Log INFO ("|> vcredist [{0}/{1}] install {2}" -f $vi, $vn, $id)
+        foreach ($id in $script:VCRedists) {   # Visual C++ Redistributables first (apps/games need them)
             $ok = Install-App -Id $id
             $script:Results.Add([pscustomobject]@{ Phase='VCRedist'; Id=$id; Content=$id; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
         }
-
-        $n = $script:AppsToInstall.Count; $i = 0
         foreach ($id in $script:AppsToInstall) {
-            $i++
-            Write-Log INFO ("|> [{0}/{1}] install {2}" -f $i, $n, $id)
-            $ok = Install-App -Id $id -Location $script:AppLocations[$id]
+            $ok = Install-App -Id $id -Location $script:AppLocations[$id] -DetectName $script:AppDetectNames[$id]
             $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
+            if ($ok -and $script:DesktopShortcutApps.ContainsKey($id)) { $sc = $script:DesktopShortcutApps[$id]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
         }
-
-        foreach ($a in $script:AppsToPrompt) {
-            if ($script:DryRun -or -not [Environment]::UserInteractive) {
-                Write-Log INFO "prompt-app $($a.Name): skipped (dryrun/non-interactive)"
-                $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail='prompt' })
-                continue
-            }
-            $ans = Read-Host "Install $($a.Name)? (y/N)"
-            if ($ans -match '^(y|yes)$') {
-                $ok = Install-App -Id $a.Id -Name $a.Name
-                $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
-            } else {
-                Write-Log INFO "$($a.Name): declined by user"
-                $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail='declined' })
-            }
-        }
-
-        Write-Log WARN "NVIDIA App: SKIPPED (not on winget; install manually - can be added later)."
-        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NVIDIA.App'; Content='NVIDIA App'; Status='SKIPPED'; Detail='not on winget' })
     } else {
         Write-Log ERROR "winget not found; skipping VC++/app installs. Install 'App Installer' (Microsoft.DesktopAppInstaller) and re-run."
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='winget'; Content='winget missing'; Status='SKIPPED'; Detail='no winget' })
+    }
+
+    # Non-winget apps (direct vendor download): Bitwarden, Parsec, NVIDIA App (GPU only)
+    foreach ($d in $script:DirectApps) {
+        $st = Install-DirectDownload @d
+        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$d.Name; Content=$d.Name; Status=$st; Detail='direct' })
+        if ($st -eq 'OK' -and $script:DesktopShortcutApps.ContainsKey($d.Name)) { $sc = $script:DesktopShortcutApps[$d.Name]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
     }
 
     # WinRAR license - place rarreg.key (shipped next to the script) into the WinRAR dir(s)
@@ -656,19 +934,40 @@ function Invoke-InstallPhase {
         foreach ($dir in @("$env:ProgramFiles\WinRAR", "${env:ProgramFiles(x86)}\WinRAR")) {
             if (Test-Path $dir) {
                 if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would copy rarreg.key -> $dir" }
-                else { Copy-Item -LiteralPath $rk -Destination (Join-Path $dir 'rarreg.key') -Force -ErrorAction SilentlyContinue; Write-Log OK "WinRAR license placed in $dir" }
+                else { Copy-Item -LiteralPath $rk -Destination (Join-Path $dir 'rarreg.key') -Force -ErrorAction SilentlyContinue; Write-Log DEBUG "WinRAR license placed in $dir" }
                 $placed = $true
             }
         }
-        if (-not $placed) { Write-Log WARN "WinRAR install dir not found; license not placed" }
+        if ($placed -and -not $script:DryRun) { Write-Log OK "WinRAR license installed" }
+        elseif (-not $placed) { Write-Log DEBUG "WinRAR install dir not found; license not placed" }
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status=($(if ($placed) {'OK'} else {'SKIPPED'})); Detail='' })
     } else {
-        Write-Log INFO "WinRAR license: rarreg.key not available - skipping"
+        Write-Log DEBUG "WinRAR license: rarreg.key not available - skipping"
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status='SKIPPED'; Detail='no key' })
     }
 
-    # .NET features LAST + time-bounded (NetFx3 can be slow via Windows Update), so a slow
-    # .NET download never delays the winget installs above.
+    # Prompted apps LAST - the y/N questions come after all the automatic installs.
+    foreach ($a in $script:AppsToPrompt) {
+        if ($script:DryRun -or -not [Environment]::UserInteractive) {
+            Write-Log DEBUG "prompt-app $($a.Name): skipped (dryrun/non-interactive)"
+            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail='prompt' })
+            continue
+        }
+        $ans = Read-Host "Install $($a.Name)? (y/N)"
+        if ($ans -match '^(y|yes)$') {
+            $ok = Install-App -Id $a.Id -Name $a.Name -Source $a.Source
+            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
+        } else {
+            Write-Log DEBUG "$($a.Name): declined by user"
+            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail='declined' })
+        }
+    }
+
+    # (.NET features run LAST of all - see Enable-DotNetFeatures, called from Main after the taskbar
+    #  pins + explorer restart. Desktop icons are created per-app right after each install, above.)
+}
+
+function Enable-DotNetFeatures {
     foreach ($f in $script:DotNetFeatures) {
         $st = Enable-Feature -Name $f.Name -Display $f.Display
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$f.Name; Content=$f.Display; Status=$st; Detail='' })
@@ -695,6 +994,50 @@ function Write-Summary {
         Write-Log INFO ("results summary: {0}" -f $resultsFile)
     } catch { Write-Log WARN "could not write results file: $($_.Exception.Message)" }
     Write-Log WARN "A reboot / sign-out is recommended to fully apply the changes."
+}
+
+function Invoke-TaskbarPins {
+    # Taskbar pin management via the Pin-Taskbar helper (Win11 blocks the old pin/unpin verbs; this tool
+    # writes the taskbar data structures directly - works on Win11 25H2 / build 26200+). We DOWNLOAD the
+    # helper to TEMP once, use it to (a) PIN a "This PC" shortcut and (b) UNPIN Microsoft Edge + Microsoft
+    # Store, then DELETE the helper - nothing lingers on the machine.
+    if ($script:DryRun) {
+        Write-Log DEBUG "[DRYRUN] would pin 'This PC' and unpin Edge + Store on the taskbar (download Pin-Taskbar helper, use it, delete it)"
+        $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Taskbar.Pins'; Content='Taskbar pins (This PC / -Edge / -Store)'; Status='DRYRUN'; Detail='' }); return
+    }
+    $helper = Join-Path $env:TEMP 'Pin-Taskbar.ps1'
+    try {
+        Write-Log INFO "downloading Pin-Taskbar helper (temporary; deleted after use)"
+        $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Freenitial/Pin-Taskbar/main/Pin-Taskbar.ps1' -OutFile $helper -UseBasicParsing -ErrorAction Stop
+        $ProgressPreference = $pp
+        Unblock-File $helper -ErrorAction SilentlyContinue
+
+        # (a) PIN "This PC": create a shortcut (This PC icon) in LocalAppData (out-of-the-way), then pin it
+        $r = [pscustomobject]@{ Phase='Taskbar'; Id='ThisPC.Pin'; Content='This PC pinned to taskbar'; Status='FAILED'; Detail='' }
+        try {
+            $lnk = Join-Path $env:LOCALAPPDATA 'This PC.lnk'
+            $wsh = New-Object -ComObject WScript.Shell; $sc = $wsh.CreateShortcut($lnk)
+            $sc.TargetPath = "$env:SystemRoot\explorer.exe"; $sc.Arguments = 'shell:MyComputerFolder'
+            $sc.IconLocation = "$env:SystemRoot\System32\imageres.dll,-109"; $sc.Description = 'This PC'; $sc.Save()
+            & $helper $lnk -Silent
+            Write-Log OK "pinned This PC to the taskbar"; $r.Status = 'OK'
+        } catch { Write-Log WARN "This PC pin failed: $($_.Exception.Message)"; $r.Detail = $_.Exception.Message }
+        $script:Results.Add($r)
+
+        # (b) UNPIN Microsoft Edge + Microsoft Store from the taskbar
+        foreach ($app in 'Microsoft Edge', 'Microsoft Store') {
+            $u = [pscustomobject]@{ Phase='Taskbar'; Id="Unpin.$app"; Content="Unpinned $app from taskbar"; Status='FAILED'; Detail='' }
+            try { & $helper $app -Unpin -Silent; Write-Log OK "unpinned $app from the taskbar"; $u.Status = 'OK' }
+            catch { Write-Log WARN "unpin $app failed: $($_.Exception.Message)"; $u.Detail = $_.Exception.Message }
+            $script:Results.Add($u)
+        }
+    } catch {
+        Write-Log WARN "taskbar pin helper failed: $($_.Exception.Message)"
+        $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Taskbar.Pins'; Content='Taskbar pins'; Status='FAILED'; Detail=$_.Exception.Message })
+    } finally {
+        Remove-Item $helper -Force -ErrorAction SilentlyContinue   # delete the helper - nothing lingers
+    }
 }
 
 function Show-Intro {
@@ -730,8 +1073,10 @@ try {
     Write-Banner
     if ($script:DryRun) { Write-Log WARN "DRY RUN - no changes will be made." }
     Invoke-Tweaks
-    Invoke-InstallPhase
-    if ($script:NeedExplorerRestart -and -not $script:DryRun) { Update-Explorer -Action restart }
+    Invoke-TaskbarPins        # This PC pin + unpin Edge/Store BEFORE installs...
+    if ($script:NeedExplorerRestart -and -not $script:DryRun) { Update-Explorer -Action restart }   # ...then restart explorer so the taskbar/desktop is already clean (no Widgets/Search) during the installs
+    Invoke-InstallPhase       # apps + per-app desktop icons
+    Enable-DotNetFeatures     # LAST of all - .NET 3.5 downloads from Windows Update (slow); nothing waits on it
     Write-Summary
     Write-Log INFO "=========== win11-tweaks done ==========="
     if ($Reboot -and -not $script:DryRun) {

@@ -1172,15 +1172,19 @@ function Enable-DotNetFeatures {
     if ((Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction SilentlyContinue).State -eq 'Enabled') {
         Write-Log OK "Done!"
     } elseif ($script:DotNet35Proc) {
-        # background download not finished yet (installs were quick) - wait quietly, then report
-        $sw = [System.Diagnostics.Stopwatch]::StartNew(); $lastBeat = 0
-        while (-not $script:DotNet35Proc.HasExited -and $sw.Elapsed.TotalSeconds -lt 1200) {
-            Start-Sleep -Seconds 5
-            if (($sw.Elapsed.TotalSeconds - $lastBeat) -ge 60) { $lastBeat = [int]$sw.Elapsed.TotalSeconds; Write-Log DEBUG ("...still finishing .NET 3.5 ({0} min)" -f [int]($sw.Elapsed.TotalSeconds / 60)) }
-        }
+        # It's been downloading from Windows Update since BEFORE the install phase. Give it a SHORT grace
+        # to finish; if it's genuinely slow (WU/disk-bound - can be ~30 min on a slow VM), DON'T block the
+        # user for 15+ min. Let it finish in the BACKGROUND: the DISM process + TrustedInstaller keep going
+        # after this script exits (and /NoRestart means no surprise reboot).
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while (-not $script:DotNet35Proc.HasExited -and $sw.Elapsed.TotalSeconds -lt 90) { Start-Sleep -Seconds 3 }
         Start-Sleep -Milliseconds 500
-        if ((Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction SilentlyContinue).State -eq 'Enabled') { Write-Log OK "Done!" }
-        else { Write-Log WARN "Not done yet - still finishing in the background (don't reboot until it's done)"; $st3 = 'BACKGROUND' }
+        if ((Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction SilentlyContinue).State -eq 'Enabled') {
+            Write-Log OK "Done!"
+        } else {
+            Write-Log WARN ".NET 3.5 is still downloading from Windows Update (slow on this machine) - it will FINISH ON ITS OWN in the background. You can keep using the PC / close this window; just don't reboot until it's done."
+            $st3 = 'BACKGROUND'
+        }
     } else {
         Write-Log WARN "Failed - .NET 3.5 (was not started)"; $st3 = 'FAILED'
     }

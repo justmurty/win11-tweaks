@@ -21,8 +21,8 @@ console **and** a file so the run can be reviewed afterwards.
   (Laptop only) and **Alienware Command Center** (PC only) — installed automatically per the
   PC/Laptop answer, no prompt. It also applies the **WinRAR license** and enables **.NET 3.5**
   (incl. 2.0/3.0) **and .NET 4** via DISM (like "Turn Windows features on/off").
-- **Pins "This PC"** to the taskbar (with the This PC icon) via a temporary helper that is
-  deleted afterwards, and unpins Microsoft Edge + Microsoft Store.
+- **Pins "This PC"** and **Google Chrome** to the taskbar (via a temporary helper that is deleted
+  afterwards), and unpins Microsoft Edge + Microsoft Store.
 - Already-installed apps are **skipped** (checked via `winget list` + Add/Remove Programs).
 - Makes **no** restore point and does **not** reboot on its own (unless `-Reboot`). Nothing that
   isn't selected is touched.

@@ -49,6 +49,7 @@ $script:NeedIconCacheClear   = $false
 $script:Cancelled            = $false   # set by Show-Intro if the user answers "n" (avoids `exit`, which kills an iex host)
 $script:MachineType          = ''      # 'PC' or 'Laptop' - resolved in Show-Intro; gates HP Support Assistant / Alienware
 $script:DotNet35Proc         = $null   # background DISM process for .NET 3.5 (started early, finished at the end)
+$script:PinHelper            = $null   # Pin-Taskbar helper path (kept after Invoke-TaskbarPins for the Chrome pin)
 $script:Results              = [System.Collections.Generic.List[object]]::new()
 
 # --------------------------------------------------------------------------------------
@@ -943,7 +944,7 @@ $script:AppNames = @{
 # --------------------------------------------------------------------------------------
 function Write-Banner {
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-    Write-Log INFO  "=========== win11-tweaks start ==========="
+    Write-Log INFO  "=========== WIN11-TWEAKS START ==========="
     Write-Log DEBUG ("host={0}  user={1}" -f $env:COMPUTERNAME, $env:USERNAME)
     Write-Log DEBUG ("os={0}  build={1}" -f $os.Caption, $os.BuildNumber)
     Write-Log DEBUG ("psver={0}  mode={1}" -f $PSVersionTable.PSVersion, ($(if ($script:DryRun) {'DRYRUN'} else {'APPLY'})))
@@ -1097,7 +1098,7 @@ function Install-Alienware {
 }
 
 function Invoke-InstallPhase {
-    Write-Log INFO "=========== installing apps ==========="
+    Write-Log INFO "=========== INSTALLING APPS ==========="
 
     if (Get-Command winget -ErrorAction SilentlyContinue) {
         foreach ($id in $script:VCRedists) {   # Visual C++ Redistributables first (apps/games need them)
@@ -1200,7 +1201,7 @@ function Enable-DotNetFeatures {
 }
 
 function Write-Summary {
-    Write-Log INFO "=========== summary ==========="
+    Write-Log INFO "=========== SUMMARY ==========="
     foreach ($g in ($script:Results | Group-Object Status | Sort-Object Name)) {
         Write-Log INFO ("{0,-8}: {1}" -f $g.Name, $g.Count)
     }
@@ -1231,6 +1232,7 @@ function Invoke-TaskbarPins {
         $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Taskbar.Pins'; Content='Taskbar pins (This PC / -Edge / -Store)'; Status='DRYRUN'; Detail='' }); return
     }
     $helper = Join-Path $env:TEMP 'Pin-Taskbar.ps1'
+    $script:PinHelper = $helper   # kept so Add-ChromeTaskbarPin can reuse it after Chrome installs; deleted there
     try {
         Write-Log INFO "downloading Pin-Taskbar helper (temporary; deleted after use)"
         $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
@@ -1260,9 +1262,34 @@ function Invoke-TaskbarPins {
     } catch {
         Write-Log WARN "taskbar pin helper failed: $($_.Exception.Message)"
         $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Taskbar.Pins'; Content='Taskbar pins'; Status='FAILED'; Detail=$_.Exception.Message })
-    } finally {
-        Remove-Item $helper -Force -ErrorAction SilentlyContinue   # delete the helper - nothing lingers
     }
+    # NOTE: the helper is NOT deleted here - it's kept for Add-ChromeTaskbarPin (after Chrome installs),
+    # which deletes it. So nothing lingers either way.
+}
+
+function Add-ChromeTaskbarPin {
+    # Pin Google Chrome to the taskbar AFTER it installs (Chrome is a direct-download app in the install
+    # phase, so this can't run in Invoke-TaskbarPins, which is before the installs). Reuses the kept
+    # Pin-Taskbar helper, then DELETES it. Returns $true if it pinned, so Main knows to refresh the taskbar.
+    $pinned = $false
+    try {
+        if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would pin Google Chrome to the taskbar"; return $false }
+        $chromeExe = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
+        if (-not (Test-Path $chromeExe)) { Write-Log DEBUG "Chrome not installed - skipping taskbar pin"; return $false }
+        if (-not ($script:PinHelper -and (Test-Path $script:PinHelper))) { Write-Log DEBUG "Pin helper not available - skipping Chrome taskbar pin"; return $false }
+        $lnk = Get-ChildItem "$env:ProgramData\Microsoft\Windows\Start Menu\Programs" -Filter 'Google Chrome.lnk' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        $target = if ($lnk) { $lnk.FullName } else { $chromeExe }
+        & $script:PinHelper $target -Silent
+        Write-Log OK "pinned Google Chrome to the taskbar"
+        $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Chrome.Pin'; Content='Google Chrome pinned to taskbar'; Status='OK'; Detail='' })
+        $pinned = $true
+    } catch {
+        Write-Log WARN "Chrome taskbar pin failed: $($_.Exception.Message)"
+        $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Chrome.Pin'; Content='Google Chrome pinned to taskbar'; Status='FAILED'; Detail=$_.Exception.Message })
+    } finally {
+        if ($script:PinHelper) { Remove-Item $script:PinHelper -Force -ErrorAction SilentlyContinue }   # delete the kept helper now
+    }
+    return $pinned
 }
 
 function Show-Intro {
@@ -1314,9 +1341,10 @@ try {
     if ($script:NeedExplorerRestart -and -not $script:DryRun) { Update-Explorer -Action restart }   # ...then restart explorer so the taskbar/desktop is already clean (no Widgets/Search) during the installs
     Start-DotNet35            # fire the slow .NET 3.5 WU download NOW so it overlaps the install phase (parallel)
     Invoke-InstallPhase       # apps + per-app desktop icons (.NET 3.5 downloads in the background meanwhile)
+    if ((Add-ChromeTaskbarPin) -and -not $script:DryRun) { Update-Explorer -Action restart }   # pin Chrome (installed above) + refresh taskbar to show it
     Enable-DotNetFeatures     # finish .NET 3.5 (usually already done) + .NET 4
     Write-Summary
-    Write-Log INFO "=========== win11-tweaks done ==========="
+    Write-Log INFO "=========== WIN11-TWEAKS DONE ==========="
     if ($Reboot -and -not $script:DryRun) {
         Write-Log WARN "Rebooting in 15s (-Reboot given). Press Ctrl+C to cancel."
         Start-Sleep -Seconds 15

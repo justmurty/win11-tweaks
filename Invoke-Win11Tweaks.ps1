@@ -52,12 +52,35 @@ $script:Results              = [System.Collections.Generic.List[object]]::new()
 # --------------------------------------------------------------------------------------
 #  Bootstrap: elevation, HKU: drive, log file + transcript
 # --------------------------------------------------------------------------------------
+# Self-elevate to Administrator (the script edits HKLM + services). Works BOTH when run from a file
+# (.bat / -File) AND via the `irm <url> | iex` one-liner - in the one-liner case there is no local
+# file to re-run, so the elevated instance re-fetches the script from its known raw URL (like WinUtil).
+$SelfUrl = 'https://gitlab.msuhost.com/superuser/win11-tweaks/-/raw/main/Invoke-Win11Tweaks.ps1'
 $isAdmin = ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()
     ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-    Write-Host "ERROR: This script must be run as Administrator (it edits HKLM and services)." -ForegroundColor Red
-    exit 1
+    Write-Host "Not running as Administrator - relaunching elevated (approve the UAC prompt)..." -ForegroundColor Yellow
+    try {
+        $psExe = (Get-Process -Id $PID).Path
+        if (-not $psExe) { $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" }
+        if ($PSCommandPath) {
+            # running from a file -> relaunch the file elevated, forwarding the same parameters
+            $fwd = foreach ($k in $PSBoundParameters.Keys) {
+                $v = $PSBoundParameters[$k]
+                if ($v -is [System.Management.Automation.SwitchParameter]) { if ($v.IsPresent) { "-$k" } }
+                else { "-$k"; ('"{0}"' -f $v) }
+            }
+            $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-NoExit','-File',('"{0}"' -f $PSCommandPath)) + $fwd
+        } else {
+            # running via `irm | iex` (no file) -> re-fetch from the raw URL in the elevated instance
+            $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-NoExit','-Command',"irm $SelfUrl | iex")
+        }
+        Start-Process -FilePath $psExe -Verb RunAs -ArgumentList $argList
+    } catch {
+        Write-Host "Elevation was cancelled or failed. Please run this in an elevated PowerShell." -ForegroundColor Red
+    }
+    return
 }
 
 # Some tweaks write under HKEY_USERS (e.g. NumLock -> HKU:\.Default); ensure the drive exists.

@@ -1008,6 +1008,39 @@ function Set-WinRarLicense {
     $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status='OK'; Detail='' })
 }
 
+function Install-BattleNet {
+    # winget's Battle.net install HANGS (~89%): the installer auto-launches the Battle.net app, whose
+    # Microsoft Edge WebView2 process (msedgewebview2.exe) keeps winget's -Wait from ever returning.
+    # Blizzard ships NO silent/no-launch switch (confirmed via Blizzard forums + Chocolatey). Fix: run
+    # winget NON-blocking; once the launcher is on disk AND the app has auto-launched, stop the Battle.net
+    # app + its Edge WebView2 (exactly what you'd do by hand) so winget completes. Verify on disk / ARP.
+    $id = 'Blizzard.BattleNet'; $label = 'Battle.net'
+    $dir = $script:AppLocations[$id]; $exe = Join-Path $dir 'Battle.net Launcher.exe'
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $label (non-blocking + WebView2 unblock)"; return $true }
+    if (Test-AppInstalled -Id $id -NamePattern 'Battle.net*') { Write-Log OK "Already installed - $label"; return $true }
+    Write-Log INFO "Installing $label"
+    $wo = Join-Path $env:TEMP 'winget_bnet.log'
+    $wargs = "install $id --accept-package-agreements --accept-source-agreements --source winget --silent --location `"$dir`""
+    $p = Start-Process -FilePath 'winget' -NoNewWindow -PassThru -ArgumentList $wargs -RedirectStandardOutput $wo
+    $sw = [System.Diagnostics.Stopwatch]::StartNew(); $cleaned = $false
+    while (-not $p.HasExited -and $sw.Elapsed.TotalSeconds -lt 360) {
+        Start-Sleep -Seconds 5
+        $running = Get-Process -Name 'Battle.net', 'Battle.net Launcher' -ErrorAction SilentlyContinue
+        if (-not $cleaned -and (Test-Path $exe) -and $running -and $sw.Elapsed.TotalSeconds -ge 20) {
+            Start-Sleep -Seconds 6   # let the install finalize after the app auto-launches
+            Write-Log DEBUG "Battle.net installed + auto-launched; stopping the app + Edge WebView2 so winget can return"
+            Get-Process -Name 'Battle.net', 'Battle.net Launcher', 'Battle.net Helper' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Get-Process -Name 'Agent' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*Battle.net*' } | Stop-Process -Force -ErrorAction SilentlyContinue
+            Get-Process -Name 'msedgewebview2' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue   # the blocker you kill by hand
+            $cleaned = $true
+        }
+    }
+    if (-not $p.HasExited) { try { $p.Kill() } catch { }; Start-Sleep -Seconds 2 }
+    Remove-Item $wo -Force -ErrorAction SilentlyContinue
+    if ((Test-Path $exe) -or (Test-AppInstalled -Id $id -NamePattern 'Battle.net*')) { Write-Log OK "Done!"; return $true }
+    Write-Log WARN "Failed - $label"; return $false
+}
+
 function Invoke-InstallPhase {
     Write-Log INFO "=========== installing apps ==========="
 
@@ -1017,7 +1050,8 @@ function Invoke-InstallPhase {
             $script:Results.Add([pscustomobject]@{ Phase='VCRedist'; Id=$id; Content=$id; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
         }
         foreach ($id in $script:AppsToInstall) {
-            $ok = Install-App -Id $id -Location $script:AppLocations[$id] -DetectName $script:AppDetectNames[$id]
+            if ($id -eq 'Blizzard.BattleNet') { $ok = Install-BattleNet }   # special: winget hangs on the auto-launched app + Edge WebView2
+            else { $ok = Install-App -Id $id -Location $script:AppLocations[$id] -DetectName $script:AppDetectNames[$id] }
             $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
             if ($ok -and $script:DesktopShortcutApps.ContainsKey($id)) { $sc = $script:DesktopShortcutApps[$id]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
             if ($id -eq 'RARLab.WinRAR') { Set-WinRarLicense }   # license right after WinRAR installs (clean pairing)

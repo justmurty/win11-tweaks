@@ -11,15 +11,17 @@ everything to console **and** a file.
 
 ## Какво прави / What it does
 
-- **30 tweaks** — 25 от WinUtil (Essential + Advanced + Customize Preferences toggles) + 5
-  custom (Spotlight off + default тапет, Ultimate Performance, DNS→Cloudflare, Explorer→This PC,
-  taskbar cleanup: Search hide / Task view / Widgets / Chat / Resume off). Подробно:
-  [`docs/2026-07-11-win11-tweaks-design.md`](docs/2026-07-11-win11-tweaks-design.md).
-- Показва **MSUHost банер** и пита **`Continue? (Y/n)`**, преди да пипне нещо.
-- После **install фаза**: **12 Visual C++ redist** + **18 winget приложения** автоматично
-  (вкл. Razer Synapse 4, VLC, Lightshot, Google Play Games, TurboTop) + **3 директно от сайта**
-  (**NVIDIA App** само при NVIDIA GPU, **Bitwarden**, **Parsec**) + **3 с питане** (AnyDesk,
-  HP Support Assistant, Alienware Command Center), поставя **WinRAR лиценз** (`rarreg.key`) и
+- **35 tweaks** — 25 от WinUtil (Essential + Advanced + Customize Preferences toggles) + 10
+  custom (shortcut-arrow off, Spotlight off + default тапет, Ultimate Performance,
+  **Memory Integrity/VBS off** за gaming, mouse acceleration off, DNS→Cloudflare, Explorer→This PC,
+  taskbar cleanup: Search hide / Task view / Widgets / Chat / Resume off, **web/Bing search в Start off**,
+  remove Edge desktop shortcut). Подробно: [`docs/2026-07-11-win11-tweaks-design.md`](docs/2026-07-11-win11-tweaks-design.md).
+- Показва **MSUHost банер**, пита **`Continue? (Y/n)`** и **`PC или Laptop?`** (`1` PC / `2` Laptop).
+- После **install фаза**: **12 Visual C++ redist** + **17 winget приложения** автоматично
+  (вкл. Razer Synapse 4, VLC, Lightshot, TurboTop) + **5 директно от сайта**
+  (**NVIDIA App** само при NVIDIA GPU, **Bitwarden**, **Parsec**, **Google Play Games**, **FL Studio**) + **machine-специфични**:
+  **HP Support Assistant** (само Laptop) и **Alienware Command Center** (само PC) — без питане, според избора;
+  поставя **WinRAR лиценз** (`rarreg.key`) и
   активира **.NET 3.5** (вкл. 2.0/3.0) **и .NET 4** (през DISM, като "Turn Windows features on/off").
 - **Pin-ва "This PC" в taskbar** (с иконата на This PC) чрез временен helper, който се трие след това.
 - Вече инсталирано приложение се **прескача** (проверка през `winget list` + Add/Remove Programs).

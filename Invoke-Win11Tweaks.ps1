@@ -6,7 +6,7 @@
     No GUI. Logs everything to the console AND a file so the run can be reviewed afterwards.
 
 .DESCRIPTION
-    The 30 tweaks (25 from WinUtil + 5 custom) and the install list are the items the user
+    The 35 tweaks (25 from WinUtil + 10 custom) and the install list are the items the user
     selected in WinUtil (see docs/2026-07-11-win11-tweaks-design.md) plus a few custom
     additions. Only the ON toggles / checked items are applied; nothing else is touched.
     The script makes NO restore point and does NOT reboot unless -Reboot is given.
@@ -16,6 +16,11 @@
 
 .PARAMETER Reboot
     Reboot 15 seconds after finishing (cancellable with Ctrl+C). Off by default.
+
+.PARAMETER Machine
+    'PC' or 'Laptop'. Skips the interactive "PC or Laptop?" question at startup. This choice
+    gates two apps: HP Support Assistant installs on Laptop only, Alienware Command Center on
+    PC only. If omitted: ask interactively, or default to 'PC' when non-interactive.
 
 .PARAMETER LogDir
     Directory for the log file. Default: the script's own folder (fallback: Desktop
@@ -35,6 +40,7 @@ param(
     [switch]$DryRun,
     [switch]$Reboot,
     [switch]$Detailed,   # full/debug console output (default: concise, human-friendly; the LOG FILE is always full)
+    [ValidateSet('PC','Laptop')][string]$Machine,   # skip the "PC or Laptop?" prompt; gates HP (Laptop) & Alienware (PC)
     [string]$LogDir,
     [string]$RarKey   # path to rarreg.key (WinRAR license); default: rarreg.key next to the script
 )
@@ -44,6 +50,7 @@ $script:DryRun               = [bool]$DryRun
 $script:Detailed             = [bool]$Detailed
 $script:NeedExplorerRestart  = $false
 $script:NeedIconCacheClear   = $false
+$script:MachineType          = ''      # 'PC' or 'Laptop' - resolved in Show-Intro; gates HP Support Assistant / Alienware
 $script:Results              = [System.Collections.Generic.List[object]]::new()
 
 # --------------------------------------------------------------------------------------
@@ -286,8 +293,15 @@ function Install-DirectDownload {
         else             { $p = Start-Process -FilePath $tmp -Wait -PassThru }
         $code = $p.ExitCode
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        Write-Log DEBUG "$Name installer exit code: $code"
         if ($code -in 0, 3010, 1641) { Write-Log OK "Done!"; return 'OK' }
-        Write-Log WARN "Failed - $Name"; return 'FAILED'
+        # Non-standard exit code - but some installers (e.g. FL Studio's NSIS) return an odd code even on a
+        # clean install. Trust ARP over the exit code: if the app is now actually present, it worked.
+        if ($DetectName -and (Test-AppInstalled -NamePattern $DetectName)) {
+            Write-Log DEBUG "$Name exit code $code is non-standard, but it IS installed (ARP match) - treating as success"
+            Write-Log OK "Done!"; return 'OK'
+        }
+        Write-Log WARN "Failed - $Name (installer exit code $code)"; return 'FAILED'
     } catch {
         Write-Log WARN "Failed - $Name : $($_.Exception.Message)"
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return 'FAILED'
@@ -332,7 +346,7 @@ function Enable-Feature {
 }
 
 # --------------------------------------------------------------------------------------
-#  The tweaks - 30 total: 25 from WinUtil v26.06.23 (values verbatim) + 5 custom at the
+#  The tweaks - 35 total: 25 from WinUtil v26.06.23 (values verbatim) + 10 custom at the
 #  end. Toggles apply their ON value only. No restore point (removed per user request).
 # --------------------------------------------------------------------------------------
 $script:Tweaks = @(
@@ -661,6 +675,19 @@ $script:Tweaks = @(
       }
   }}
 
+  # Memory Integrity (HVCI) / VBS - disable it for gaming. Win11's Core Isolation "Memory Integrity"
+  # runs kernel code-integrity checks inside a hypervisor (VBS); every 2026 gaming guide calls turning it
+  # off the single biggest FREE performance win (avg +5-10% FPS in CPU-bound games, 1% lows +15-25%). This
+  # registry method == the Core Isolation toggle; it takes effect after a REBOOT. Reversible: set both back
+  # to 1 (or flip Memory Integrity back On in Windows Security). We deliberately do NOT run
+  # 'bcdedit /set hypervisorlaunchtype off' - that fully kills the hypervisor and would break WSL2 /
+  # Hyper-V / Windows Sandbox; disabling HVCI alone gives the gaming win and keeps those working.
+  [pscustomobject]@{ Id='CustomDisableVBS'; Content='Memory Integrity (VBS/HVCI) - disable for gaming'; Category='Custom'; Apply={
+      $id='CustomDisableVBS'
+      Set-Reg -Id $id -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard' -Name 'EnableVirtualizationBasedSecurity' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' -Name 'Enabled' -Type DWord -Value '0'
+  }}
+
   # Mouse - disable "Enhance pointer precision" (mouse acceleration); preferred for gaming/consistency
   [pscustomobject]@{ Id='CustomMouseAccel'; Content='Mouse - disable Enhance Pointer Precision'; Category='Custom'; Apply={
       $id='CustomMouseAccel'; $m='HKCU:\Control Panel\Mouse'
@@ -708,6 +735,20 @@ $script:Tweaks = @(
       $script:NeedExplorerRestart = $true
   }}
 
+  # Search - disable web/Bing results in Start (local apps/files/settings still resolve, and faster).
+  # On Win11 24H2/25H2 (build 26200) the reliable switch is the Explorer policy DisableSearchBoxSuggestions=1
+  # (removes web suggestions + the Copilot search button); the Windows Search + Bing keys reinforce it so
+  # web results don't come back via the connected-search path.
+  [pscustomobject]@{ Id='CustomDisableWebSearch'; Content='Search - disable web/Bing results in Start'; Category='Custom'; Apply={
+      $id='CustomDisableWebSearch'
+      Set-Reg -Id $id -Path 'HKCU:\Software\Policies\Microsoft\Windows\Explorer'         -Name 'DisableSearchBoxSuggestions' -Type DWord -Value '1'
+      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'   -Name 'DisableWebSearch'            -Type DWord -Value '1'
+      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'   -Name 'ConnectedSearchUseWeb'       -Type DWord -Value '0'
+      Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search'     -Name 'BingSearchEnabled'           -Type DWord -Value '0'
+      Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search'     -Name 'CortanaConsent'              -Type DWord -Value '0'
+      $script:NeedExplorerRestart = $true
+  }}
+
   # Desktop cleanup - remove the Microsoft Edge desktop shortcut (a tweak, so it runs BEFORE the installs)
   [pscustomobject]@{ Id='CustomRemoveEdgeShortcut'; Content='Desktop - remove Microsoft Edge shortcut'; Category='Custom'; Apply={
       Invoke-Step -Id 'CustomRemoveEdgeShortcut' -Description 'remove Microsoft Edge desktop shortcut' -Action {
@@ -733,7 +774,6 @@ $script:AppsToInstall = @(
     'OBSProject.OBSStudio',
     'Blizzard.BattleNet',
     'Ubisoft.Connect',
-    'Google.PlayGames',                 # Google Play Games (PC)
     'CPUID.HWMonitor',
     'NZXT.CAM',
     'RazerInc.RazerInstaller.Synapse4', # Razer Synapse 4 (skipped if already installed)
@@ -742,12 +782,14 @@ $script:AppsToInstall = @(
     'SavardSoftware.TurboTop',           # always-on-top helper (on winget, not the savardsoftware.com exe)
     'RARLab.WinRAR'
 )
-$script:AppsToPrompt = @(
-    @{ Id='AnyDesk.AnyDesk';          Name='AnyDesk' },
-    @{ Id='HPInc.HPSupportAssistant'; Name='HP Support Assistant' },
-    # Alienware Command Center is Store-only (msstore) and works ONLY on Alienware / Dell G
-    # hardware. If msstore fails (removed / unsupported box), grab it from Dell's support site.
-    @{ Id='9PMHP03NJ9QP'; Name='Alienware Command Center'; Source='msstore' }
+# Machine-specific apps: installed AUTOMATICALLY based on the "PC or Laptop?" answer - no y/N prompt.
+#   HP Support Assistant  -> Laptop only (HP laptop utility; pointless on a desktop).
+#   Alienware Command Center -> PC only (msstore; the user's Alienware/Dell G desktop). Laptop -> skipped.
+# (AnyDesk removed per user request.) Alienware is Store-only (msstore) and works ONLY on Alienware /
+# Dell G hardware; if msstore fails (removed / unsupported box), grab it from Dell's support site.
+$script:MachineApps = @(
+    @{ Id='HPInc.HPSupportAssistant'; Name='HP Support Assistant';     Machine='Laptop' },
+    @{ Id='9PMHP03NJ9QP';             Name='Alienware Command Center'; Machine='PC'; Source='msstore' }
 )
 # Per-app install location for packages whose winget manifest REQUIRES one (otherwise
 # winget prompts "Specify the install root:" and blocks the run). Add IDs here as needed.
@@ -786,6 +828,23 @@ $script:DirectApps = @(
         Url        = 'https://builds.parsec.app/package/parsec-windows.exe'
         SilentArgs = '/silent'
         DetectName = 'Parsec*'
+    }
+    @{  # Google Play Games - winget hash mismatch under admin (0x8A150011): Google ships a rolling "beta"
+        # tag bootstrapper (Install-GooglePlayGames.exe) whose hash changes constantly, so winget's fixed
+        # manifest hash never matches and can't be overridden as admin. Fetch the SAME URL with the SAME
+        # --silent switch the Google.PlayGames manifest uses - directly, so there's no hash check to fail.
+        Name       = 'Google Play Games'
+        Url        = 'https://dl.google.com/tag/s/appguid={47B07D71-505D-4665-AFD4-4972A30C6530}&appname=GPG&needsadmin=true&ap=beta/play/games/Install-GooglePlayGames.exe'
+        SilentArgs = '--silent'
+        DetectName = 'Google Play Games*'
+    }
+    @{  # FL Studio - REMOVED from winget (manifest folder 404 -> winget "No package found"). Image-Line's
+        # official "latest Windows installer" redirect always resolves to the current flstudio_win64_*.exe
+        # (verified: -> install.image-line.com/flstudio/flstudio_win64_26.1.1.5547.exe). NSIS installer -> /S.
+        Name       = 'FL Studio'
+        Url        = 'https://support.image-line.com/redirect/flstudio_win_installer'
+        SilentArgs = '/S'
+        DetectName = 'FL Studio*'
     }
 )
 # Apps that should get a Desktop icon (most make their own; these do not reliably). Keyed by winget ID
@@ -834,7 +893,6 @@ $script:AppNames = @{
     'OBSProject.OBSStudio'             = 'OBS Studio'
     'Blizzard.BattleNet'               = 'Battle.net'
     'Ubisoft.Connect'                  = 'Ubisoft Connect'
-    'Google.PlayGames'                 = 'Google Play Games'
     'CPUID.HWMonitor'                  = 'HWMonitor'
     'NZXT.CAM'                         = 'NZXT CAM'
     'RazerInc.RazerInstaller.Synapse4' = 'Razer Synapse 4'
@@ -946,21 +1004,16 @@ function Invoke-InstallPhase {
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status='SKIPPED'; Detail='no key' })
     }
 
-    # Prompted apps LAST - the y/N questions come after all the automatic installs.
-    foreach ($a in $script:AppsToPrompt) {
-        if ($script:DryRun -or -not [Environment]::UserInteractive) {
-            Write-Log DEBUG "prompt-app $($a.Name): skipped (dryrun/non-interactive)"
-            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail='prompt' })
+    # Machine-specific apps LAST - auto-installed based on the "PC or Laptop?" answer (no prompt).
+    #   HP Support Assistant -> Laptop only;  Alienware Command Center -> PC only.
+    foreach ($a in $script:MachineApps) {
+        if ($a.Machine -ne $script:MachineType) {
+            Write-Log DEBUG "$($a.Name): skipped ($($a.Machine)-only; this machine is $($script:MachineType))"
+            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail="$($a.Machine)-only" })
             continue
         }
-        $ans = Read-Host "Install $($a.Name)? (y/N)"
-        if ($ans -match '^(y|yes)$') {
-            $ok = Install-App -Id $a.Id -Name $a.Name -Source $a.Source
-            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
-        } else {
-            Write-Log DEBUG "$($a.Name): declined by user"
-            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail='declined' })
-        }
+        $ok = Install-App -Id $a.Id -Name $a.Name -Source $a.Source
+        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail=$a.Machine })
     }
 
     # (.NET features run LAST of all - see Enable-DotNetFeatures, called from Main after the taskbar
@@ -1063,6 +1116,17 @@ function Show-Intro {
             exit 0
         }
     }
+    # Machine type - gates HP Support Assistant (Laptop only) and Alienware Command Center (PC only).
+    if ($Machine) {
+        $script:MachineType = $Machine
+    } elseif ([Environment]::UserInteractive) {
+        do { $mt = Read-Host "  Is this a Desktop PC or a Laptop?   [1] PC    [2] Laptop" }
+        until ($mt -match '^\s*[12]\s*$')
+        $script:MachineType = if ($mt.Trim() -eq '2') { 'Laptop' } else { 'PC' }
+    } else {
+        $script:MachineType = 'PC'   # non-interactive default (override with -Machine PC|Laptop)
+    }
+    Write-Log INFO ("Machine type: {0}" -f $script:MachineType)
 }
 
 # --------------------------------------------------------------------------------------

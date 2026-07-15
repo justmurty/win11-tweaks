@@ -1224,21 +1224,19 @@ function Write-Summary {
     Write-Log WARN "A reboot / sign-out is recommended to fully apply the changes."
 }
 
-function Invoke-TaskbarPins {
-    # Taskbar pin management via the Pin-Taskbar helper (Win11 blocks the old pin/unpin verbs; this tool
-    # writes the taskbar data structures directly - works on Win11 25H2 / build 26200+). We DOWNLOAD the
-    # helper to TEMP once, use it to (a) PIN a "This PC" shortcut and (b) UNPIN Microsoft Edge + Microsoft
-    # Store, then DELETE the helper - nothing lingers on the machine.
-    if ($script:DryRun) {
-        Write-Log DEBUG "[DRYRUN] would pin 'This PC' and unpin Edge + Store on the taskbar (download Pin-Taskbar helper, use it, delete it)"
-        $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Taskbar.Pins'; Content='Taskbar pins (This PC / -Edge / -Store)'; Status='DRYRUN'; Detail='' }); return
-    }
+function Test-TaskbarPinned {
+    # A taskbar-pinned item has a matching <Name>.lnk in the User Pinned\TaskBar Quick Launch folder (Win11).
+    param([string]$Name)
+    Test-Path (Join-Path $env:APPDATA "Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\$Name.lnk")
+}
+
+function Get-PinHelper {
+    # Return a ready-to-use Pin-Taskbar helper path (in TEMP), fetching it ONCE and only when needed. Prefer
+    # OUR copy next to the script (download/.bat -> no download); else fetch OUR copy from OUR repo (one-liner).
+    # Cached in $script:PinHelper (deleted by Add-ChromeTaskbarPin). Returns $null on failure.
+    if ($script:PinHelper -and (Test-Path $script:PinHelper)) { return $script:PinHelper }
     $helper = Join-Path $env:TEMP 'Pin-Taskbar.ps1'
-    $script:PinHelper = $helper   # kept so Add-ChromeTaskbarPin can reuse it after Chrome installs; deleted there
     try {
-        # Use OUR vendored Pin-Taskbar helper (never the upstream repo, which could disappear). Prefer the
-        # copy shipped next to the script (download/.bat flow -> NO download); else fetch OUR copy from OUR
-        # repo (the `irm|iex` one-liner flow). Either way it lands in TEMP and is deleted after use.
         $bundled = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'Pin-Taskbar.ps1' } else { $null }
         if ($bundled -and (Test-Path $bundled)) {
             Copy-Item -LiteralPath $bundled -Destination $helper -Force
@@ -1250,8 +1248,28 @@ function Invoke-TaskbarPins {
             $ProgressPreference = $pp
         }
         Unblock-File $helper -ErrorAction SilentlyContinue
+        $script:PinHelper = $helper
+        return $helper
+    } catch { Write-Log WARN "could not get the Pin-Taskbar helper: $($_.Exception.Message)"; return $null }
+}
 
-        # (a) PIN "This PC": create a shortcut (This PC icon) in LocalAppData (out-of-the-way), then pin it
+function Invoke-TaskbarPins {
+    # Pin "This PC" + unpin Edge/Store on the taskbar via the Pin-Taskbar helper. IDEMPOTENT: skips any item
+    # already in the desired state, so a re-run doesn't re-pin. The helper is fetched only if something's needed.
+    if ($script:DryRun) {
+        Write-Log DEBUG "[DRYRUN] would pin 'This PC' and unpin Edge + Store on the taskbar (only what's not already set)"
+        $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Taskbar.Pins'; Content='Taskbar pins (This PC / -Edge / -Store)'; Status='DRYRUN'; Detail='' }); return
+    }
+    $needThisPC = -not (Test-TaskbarPinned 'This PC')
+    $needEdge   = Test-TaskbarPinned 'Microsoft Edge'
+    $needStore  = Test-TaskbarPinned 'Microsoft Store'
+    if (-not ($needThisPC -or $needEdge -or $needStore)) {
+        Write-Log DEBUG "taskbar already set (This PC pinned, Edge/Store unpinned) - nothing to do"; return
+    }
+    $helper = Get-PinHelper
+    if (-not $helper) { $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Taskbar.Pins'; Content='Taskbar pins'; Status='FAILED'; Detail='no helper' }); return }
+    # (a) PIN "This PC" - only if not already pinned
+    if ($needThisPC) {
         $r = [pscustomobject]@{ Phase='Taskbar'; Id='ThisPC.Pin'; Content='This PC pinned to taskbar'; Status='FAILED'; Detail='' }
         try {
             $lnk = Join-Path $env:LOCALAPPDATA 'This PC.lnk'
@@ -1262,20 +1280,16 @@ function Invoke-TaskbarPins {
             Write-Log OK "pinned This PC to the taskbar"; $r.Status = 'OK'
         } catch { Write-Log WARN "This PC pin failed: $($_.Exception.Message)"; $r.Detail = $_.Exception.Message }
         $script:Results.Add($r)
-
-        # (b) UNPIN Microsoft Edge + Microsoft Store from the taskbar
-        foreach ($app in 'Microsoft Edge', 'Microsoft Store') {
-            $u = [pscustomobject]@{ Phase='Taskbar'; Id="Unpin.$app"; Content="Unpinned $app from taskbar"; Status='FAILED'; Detail='' }
-            try { & $helper $app -Unpin -Silent; Write-Log OK "unpinned $app from the taskbar"; $u.Status = 'OK' }
-            catch { Write-Log WARN "unpin $app failed: $($_.Exception.Message)"; $u.Detail = $_.Exception.Message }
-            $script:Results.Add($u)
-        }
-    } catch {
-        Write-Log WARN "taskbar pin helper failed: $($_.Exception.Message)"
-        $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Taskbar.Pins'; Content='Taskbar pins'; Status='FAILED'; Detail=$_.Exception.Message })
+    } else { Write-Log DEBUG "This PC already pinned - skipping" }
+    # (b) UNPIN Edge + Store - only if currently pinned
+    foreach ($app in 'Microsoft Edge', 'Microsoft Store') {
+        if (-not (Test-TaskbarPinned $app)) { Write-Log DEBUG "$app already unpinned - skipping"; continue }
+        $u = [pscustomobject]@{ Phase='Taskbar'; Id="Unpin.$app"; Content="Unpinned $app from taskbar"; Status='FAILED'; Detail='' }
+        try { & $helper $app -Unpin -Silent; Write-Log OK "unpinned $app from the taskbar"; $u.Status = 'OK' }
+        catch { Write-Log WARN "unpin $app failed: $($_.Exception.Message)"; $u.Detail = $_.Exception.Message }
+        $script:Results.Add($u)
     }
-    # NOTE: the helper is NOT deleted here - it's kept for Add-ChromeTaskbarPin (after Chrome installs),
-    # which deletes it. So nothing lingers either way.
+    # (helper kept for Add-ChromeTaskbarPin, which deletes it)
 }
 
 function Add-ChromeTaskbarPin {
@@ -1284,13 +1298,15 @@ function Add-ChromeTaskbarPin {
     # Pin-Taskbar helper, then DELETES it. Returns $true if it pinned, so Main knows to refresh the taskbar.
     $pinned = $false
     try {
-        if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would pin Google Chrome to the taskbar"; return $false }
+        if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would pin Google Chrome to the taskbar (if not already)"; return $false }
         $chromeExe = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
         if (-not (Test-Path $chromeExe)) { Write-Log DEBUG "Chrome not installed - skipping taskbar pin"; return $false }
-        if (-not ($script:PinHelper -and (Test-Path $script:PinHelper))) { Write-Log DEBUG "Pin helper not available - skipping Chrome taskbar pin"; return $false }
+        if (Test-TaskbarPinned 'Google Chrome') { Write-Log DEBUG "Google Chrome already pinned - skipping"; return $false }
+        $helper = Get-PinHelper
+        if (-not $helper) { return $false }
         $lnk = Get-ChildItem "$env:ProgramData\Microsoft\Windows\Start Menu\Programs" -Filter 'Google Chrome.lnk' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
         $target = if ($lnk) { $lnk.FullName } else { $chromeExe }
-        & $script:PinHelper $target -Silent
+        & $helper $target -Silent
         Write-Log OK "pinned Google Chrome to the taskbar"
         $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Chrome.Pin'; Content='Google Chrome pinned to taskbar'; Status='OK'; Detail='' })
         $pinned = $true
@@ -1298,7 +1314,7 @@ function Add-ChromeTaskbarPin {
         Write-Log WARN "Chrome taskbar pin failed: $($_.Exception.Message)"
         $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Chrome.Pin'; Content='Google Chrome pinned to taskbar'; Status='FAILED'; Detail=$_.Exception.Message })
     } finally {
-        if ($script:PinHelper) { Remove-Item $script:PinHelper -Force -ErrorAction SilentlyContinue }   # delete the kept helper now
+        if ($script:PinHelper) { Remove-Item $script:PinHelper -Force -ErrorAction SilentlyContinue; $script:PinHelper = $null }   # delete the kept helper
     }
     return $pinned
 }

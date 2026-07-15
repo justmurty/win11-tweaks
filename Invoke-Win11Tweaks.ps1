@@ -1209,7 +1209,8 @@ function Start-DotNet35 {
 
 function Enable-DotNetFeatures {
     # Print a clean "Installing .NET 3.5 / Done!" pair HERE at the end. The download already ran in the
-    # background during the install phase (Start-DotNet35), so this is usually instant. Then .NET 4 (quiet).
+    # background during the install phase (Start-DotNet35), so on a normal machine this is instant; if it's
+    # still going we WAIT until it fully finishes (live heartbeat, no cap). Then .NET 4 (quiet).
     if ($script:DryRun) {
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NetFx3'; Content='.NET 3.5'; Status='DRYRUN'; Detail='' })
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NetFx4-AdvSrvs'; Content='.NET 4'; Status='DRYRUN'; Detail='' })
@@ -1217,24 +1218,28 @@ function Enable-DotNetFeatures {
     }
     Write-Log INFO "Installing .NET 3.5"
     $st3 = 'OK'
+    if ($script:DotNet35Proc -and -not $script:DotNet35Proc.HasExited) {
+        # Still downloading from Windows Update (started before the install phase). WAIT until it fully
+        # finishes - no cap. The background DISM holds the servicing lock, so we do NOT query the feature
+        # state while it runs (that can block ON the lock); we just wait for the DISM PROCESS to exit,
+        # printing a live one-line heartbeat so the console never looks frozen. On a normal machine this is
+        # seconds; on a WU-throttled box it can be ~30 min (Ctrl+C to skip - /NoRestart means no reboot).
+        # The heartbeat uses Write-Host (console only) so it never spams the log file.
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while (-not $script:DotNet35Proc.HasExited) {
+            Write-Host ("`r  .NET 3.5 still installing (downloading from Windows Update)... {0:mm\:ss}   " -f $sw.Elapsed) -NoNewline -ForegroundColor DarkYellow
+            Start-Sleep -Seconds 3
+        }
+        Write-Host ("`r{0}`r" -f (' ' * 78)) -NoNewline   # wipe the heartbeat line before the final status
+        Start-Sleep -Milliseconds 500
+    }
+    # .NET 3.5 was already enabled, the DISM just finished, or it was never started - safe to query state now.
     if ((Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction SilentlyContinue).State -eq 'Enabled') {
         Write-Log OK "Done!"
-    } elseif ($script:DotNet35Proc) {
-        # It's been downloading from Windows Update since BEFORE the install phase. Give it a SHORT grace
-        # to finish; if it's genuinely slow (WU/disk-bound - can be ~30 min on a slow VM), DON'T block the
-        # user for 15+ min. Let it finish in the BACKGROUND: the DISM process + TrustedInstaller keep going
-        # after this script exits (and /NoRestart means no surprise reboot).
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        while (-not $script:DotNet35Proc.HasExited -and $sw.Elapsed.TotalSeconds -lt 90) { Start-Sleep -Seconds 3 }
-        Start-Sleep -Milliseconds 500
-        if ((Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction SilentlyContinue).State -eq 'Enabled') {
-            Write-Log OK "Done!"
-        } else {
-            Write-Log WARN ".NET 3.5 is still downloading from Windows Update (slow on this machine) - it will FINISH ON ITS OWN in the background. You can keep using the PC / close this window; just don't reboot until it's done."
-            $st3 = 'BACKGROUND'
-        }
-    } else {
+    } elseif (-not $script:DotNet35Proc) {
         Write-Log WARN "Failed - .NET 3.5 (was not started)"; $st3 = 'FAILED'
+    } else {
+        Write-Log WARN "Failed - .NET 3.5 (DISM finished but the feature is not enabled - see %TEMP%\dism_NetFx3.log)"; $st3 = 'FAILED'
     }
     $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NetFx3'; Content='.NET 3.5'; Status=$st3; Detail='' })
     # .NET 4 is already enabled on Win11 -> record quietly (no console clutter); enable only if somehow off.

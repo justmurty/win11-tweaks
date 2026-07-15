@@ -108,5 +108,7 @@ direct-download apps, or `$script:MachineApps` for PC/Laptop-gated apps.
 - **winget needs an interactive session** — run via `Run-Win11Tweaks.bat` (double-click) or the
   one-liner in an interactive elevated shell, not over SSH/remoting (winget fails with
   `0x8A15000F` otherwise).
-- **.NET 3.5** pulls its payload from Windows Update — it succeeds on a machine with internet; on
-  a box with WU blocked it keeps trying up to 30 minutes and then moves on.
+- **.NET 3.5** pulls its payload from Windows Update. It's started early (in parallel with the app
+  installs) and the script **waits** for it to finish at the end, showing a live one-line heartbeat.
+  On a normal connection this is seconds; on a WU-throttled box it can take ~30 min (press Ctrl+C to
+  skip — `/NoRestart` means no surprise reboot, and it finishes on its own).

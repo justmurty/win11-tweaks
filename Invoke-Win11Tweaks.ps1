@@ -42,6 +42,11 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+# Silence ALL cmdlet progress banners (Disable-WindowsOptionalFeature, Remove-AppxProvisionedPackage,
+# Get-AppxPackage, Invoke-WebRequest, ...). Those blue "Running [ooooo]" bars sometimes fail to clear and
+# "stick" at the top of the console while the script keeps going underneath. We use our own [OK]/Done!
+# logging, not Write-Progress, so nothing is lost. (The per-call save/restore dances become redundant now.)
+$ProgressPreference = 'SilentlyContinue'
 $script:DryRun               = [bool]$DryRun
 $script:Detailed             = [bool]$Detailed
 $script:NeedExplorerRestart  = $false

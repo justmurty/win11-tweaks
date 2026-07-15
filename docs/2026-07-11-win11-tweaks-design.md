@@ -9,7 +9,7 @@
 
 ## 1. Goal
 
-A single, self-contained PowerShell script that applies **exactly** the WinUtil
+A single, self-contained PowerShell script that applies **exactly** the the reference config
 tweaks the user selected in the screenshot — **no GUI**, verbose DEBUG logging to
 console **and** to a log file, so the script can be run on a Windows 11 machine and
 the resulting log handed back for verification ("did it actually happen, what
@@ -20,20 +20,20 @@ Point is created instead), no tweaks other than the 27 selected.
 
 ## 2. Source of truth
 
-The screenshot is **Chris Titus WinUtil, release `v26.06.23`**, i.e. exactly what
-`irm christitus.com/win | iex` serves today. All operations below were extracted
+The screenshot is **the reference config, release `v26.06.23`**, i.e. exactly what
+`irm the-reference-config | iex` serves today. All operations below were extracted
 verbatim from that build's embedded `tweaks` config and its apply engine
-(`Invoke-WinUtilTweaks`, `Set-WinUtilRegistry`, `Set-WinUtilService`,
-`Remove-WinUtilAPPX`, `Invoke-WinUtilExplorerUpdate`).
+(`the tweaks engine`, `the registry helper`, `the service helper`,
+`the appx helper`, `the explorer-update helper`).
 
 > Note: a newer `main` branch replaced the single `WPFTweaksDeBloat` item with a
 > per-app removal panel and tweaked a couple of scripts (e.g. Windows AI). We
 > deliberately follow **v26.06.23**, because that is the version the user runs.
 > Minor UI label discrepancy ("Win11 Creator" tab) does not affect any tweak.
 
-## 3. WinUtil apply semantics we replicate
+## 3. the reference config apply semantics we replicate
 
-For each selected item, WinUtil applies its sub-parts in this **order**:
+For each selected item, the reference config applies its sub-parts in this **order**:
 `service → registry → InvokeScript → appx`. We mirror it. Details:
 
 - **registry**: ensure `HKU:` PSDrive exists; create the key path if missing
@@ -44,10 +44,10 @@ For each selected item, WinUtil applies its sub-parts in this **order**:
   if its *current* start type still equals the tweak's `OriginalType` (i.e. it has
   not already been customized by the user/another program). If the service is
   missing, log a warning and skip. Normalize the value `"Disable"` → `"Disabled"`
-  (WinUtil ships `"Disable"` for `lfsvc`, which is not a valid `Set-Service`
+  (the reference config ships `"Disable"` for `lfsvc`, which is not a valid `Set-Service`
   value; we normalize so the intended effect actually applies).
-- **InvokeScript**: run the ported command block (see §6 for the WinUtil-internal
-  substitutions we make, since functions like `Invoke-WinUtilExplorerUpdate` and
+- **InvokeScript**: run the ported command block (see §6 for the reference-internal
+  substitutions we make, since functions like `the explorer-update helper` and
   `$sync.ThemeButton` do not exist outside the GUI).
 - **appx**: for each package pattern, `Get-AppxPackage $Name -AllUsers |
   Remove-AppxPackage -AllUsers` **and** `Get-AppxProvisionedPackage -Online |
@@ -69,7 +69,7 @@ requested, and flagged as such in the log.
 
 | # | Id | Content | Operations |
 |---|----|---------|-----------|
-| 1 | WPFTweaksRestorePoint | Restore Point - Create | reg `HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore\SystemRestorePointCreationFrequency=0` (DWord); script: `Enable-ComputerRestore -Drive $Env:SystemDrive` if no RP exists, then `Checkpoint-Computer -Description "System Restore Point created by WinUtil" -RestorePointType MODIFY_SETTINGS`. **Runs FIRST.** |
+| 1 | WPFTweaksRestorePoint | Restore Point - Create | reg `HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore\SystemRestorePointCreationFrequency=0` (DWord); script: `Enable-ComputerRestore -Drive $Env:SystemDrive` if no RP exists, then `Checkpoint-Computer -Description "System Restore Point created by the reference config" -RestorePointType MODIFY_SETTINGS`. **Runs FIRST.** |
 | 2 | WPFTweaksActivity | Activity History - Disable | reg `HKLM:\SOFTWARE\Policies\Microsoft\Windows\System`: `EnableActivityFeed=0`, `PublishUserActivities=0`, `UploadUserActivities=0` (DWord) |
 | 3 | WPFTweaksConsumerFeatures | ConsumerFeatures - Disable | reg `HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent\DisableWindowsConsumerFeatures=1` (DWord) |
 | 4 | WPFTweaksDeliveryOptimization | Delivery Optimization - Disable | reg `HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization\DODownloadMode=0` (DWord) |
@@ -107,16 +107,16 @@ requested, and flagged as such in the log.
 | 26 | WPFToggleBatteryPercentage | System Tray Battery Percentage | `HKCU:\...\Explorer\Advanced\IsBatteryPercentageEnabled=1` (DWord) |
 | 27 | WPFToggleTaskbarAlignment | Taskbar Centered Icons | `HKCU:\...\Explorer\Advanced\TaskbarAl=1` (DWord) + explorer restart *(default)* |
 
-## 6. WinUtil-internal substitutions
+## 6. reference-internal substitutions
 
 These GUI-only calls appear inside selected InvokeScripts and are replaced with a
 standalone equivalent:
 
-- `Invoke-WinUtilExplorerUpdate -action "restart"` → our `Update-Explorer -Action restart`
+- `the explorer-update helper -action "restart"` → our `Update-Explorer -Action restart`
   (`taskkill /F /IM explorer.exe` + `Start-Process explorer.exe`).
-- `Invoke-WinUtilExplorerUpdate` (default refresh) → our `Update-Explorer -Action refresh`
+- `the explorer-update helper` (default refresh) → our `Update-Explorer -Action refresh`
   (broadcast `WM_SETTINGCHANGE "ImmersiveColorSet"` via `SendMessageTimeout`).
-- `if ($sync.ThemeButton.Content ...) { Invoke-WinutilThemeChange ... }` (DarkMode) →
+- `if ($sync.ThemeButton.Content ...) { the theme helper ... }` (DarkMode) →
   **dropped** (GUI theme-button branch); the registry writes already switch dark mode,
   the refresh is preserved.
 
@@ -127,7 +127,7 @@ done inline). Avoids repeatedly killing explorer mid-run.
 ## 6a. Install software phase (winget) — runs AFTER all tweaks
 
 Per the user's decision, once the 27 tweaks complete, the script installs the
-user's chosen applications via **winget** (WinUtil's default manager), plus one
+user's chosen applications via **winget** (the reference config's default manager), plus one
 Windows Feature. Lists live in clearly-commented, **easily-extensible** arrays near
 the top of the script (the user plans to add more apps over time).
 
@@ -136,13 +136,13 @@ the top of the script (the user plans to add more apps over time).
   `Bitwarden.Bitwarden`, `Discord.Discord`, `Valve.Steam`,
   `EpicGames.EpicGamesLauncher`, `OBSProject.OBSStudio`, `Blizzard.BattleNet`,
   `Ubisoft.Connect`, `CPUID.HWMonitor`, `NZXT.CAM`.
-  (IDs verified against Microsoft `winget-pkgs`; the WinUtil-listed ones match
-  WinUtil, the rest — DirectX/Battle.net/NZXT — verified directly.)
+  (IDs verified against Microsoft `winget-pkgs`; the reference-listed ones match
+  the reference config, the rest — DirectX/Battle.net/NZXT — verified directly.)
 - **Prompted via winget (`$AppsToPrompt`, 2):** `AnyDesk.AnyDesk`,
   `HPInc.HPSupportAssistant`. For each, `Read-Host "Install <name>? (y/N)"`; install
   only on `y`. In `-DryRun` or a non-interactive session, the prompt is skipped and
   logged as "skipped (prompt)".
-- **.NET Framework 2/3/4 (Windows Feature, not winget):** exactly as WinUtil's
+- **.NET Framework 2/3/4 (Windows Feature, not winget):** exactly as the reference config's
   `WPFFeaturesdotnet` — `Enable-WindowsOptionalFeature -Online -FeatureName NetFx3 -All -NoRestart`
   and `... -FeatureName NetFx4-AdvSrvs -All -NoRestart`. Runs in the install phase.
 - **NVIDIA App:** **skipped** (not available on winget under any publisher; NVIDIA
@@ -150,9 +150,9 @@ the top of the script (the user plans to add more apps over time).
   A direct-download handler can be added later.
 - **Winget presence:** `Get-Command winget`. If missing, log ERROR with guidance
   (install "App Installer" / `Microsoft.DesktopAppInstaller`) and skip the install
-  phase (tweaks unaffected). *Modern Win11 ships winget; WinUtil auto-installs it —
+  phase (tweaks unaffected). *Modern Win11 ships winget; the reference config auto-installs it —
   a bootstrap can be added later if needed.*
-- **Install command** (mirrors WinUtil, `+ --accept-source-agreements` for headless
+- **Install command** (mirrors the reference config, `+ --accept-source-agreements` for headless
   safety):
   `winget install <id> --accept-package-agreements --accept-source-agreements --source winget --silent`
   via `Start-Process -FilePath winget -NoNewWindow -Wait`.
@@ -173,10 +173,10 @@ Single self-contained `.ps1`, no external dependencies, no GUI.
 - **Primitive helpers** (all DryRun-aware, all log via `Write-Log`):
   - `Write-Log -Level DEBUG|INFO|OK|WARN|ERROR -Message` — timestamped, colored
     console line + appended to log.
-  - `Set-Reg -Path -Name -Type -Value` — mirrors `Set-WinUtilRegistry`.
-  - `Set-Svc -Name -StartupType [-OriginalType]` — mirrors `Set-WinUtilService` +
+  - `Set-Reg -Path -Name -Type -Value` — mirrors `the registry helper`.
+  - `Set-Svc -Name -StartupType [-OriginalType]` — mirrors `the service helper` +
     KeepServiceStartup guard + `"Disable"`→`"Disabled"` normalization.
-  - `Remove-Appx -Name` — mirrors `Remove-WinUtilAPPX` (AllUsers + provisioned).
+  - `Remove-Appx -Name` — mirrors `the appx helper` (AllUsers + provisioned).
   - `Invoke-Step -Description -Action {}` — for raw command blocks: in DryRun logs the
     description and skips; else runs `Action` in try/catch and logs OK/ERROR.
   - `Update-Explorer -Action refresh|restart`.
@@ -297,7 +297,7 @@ Removed via `Remove-Appx` (AllUsers + provisioned), in this order:
 `Microsoft.ZuneMusic`, `MicrosoftCorporationII.QuickAssist`, `MSTeams`.
 Then the classic-Teams uninstall via `Update.exe -uninstall`.
 
-**Kept** (not in Chris's v26.06.23 debloat list): Calculator, Photos, Camera,
+**Kept** (not in the reference v26.06.23 debloat list): Calculator, Photos, Camera,
 Notepad, Snipping Tool, Copilot app, Phone Link, Microsoft 365 hub, Mobile Devices,
 Xbox app/Game Bar/Identity/TCUI (those are a separate, *unselected* "Xbox & Gaming
 Components - Remove" item).

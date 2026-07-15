@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A single, no-GUI PowerShell script that applies the 27 selected WinUtil
+**Goal:** A single, no-GUI PowerShell script that applies the 27 selected tweaks
 tweaks and then installs a defined app set via winget, with DEBUG logging to console
 and file, plus a `-DryRun` mode — runnable on Win11 to produce a log for review.
 
 **Architecture:** One self-contained `Invoke-Win11Tweaks.ps1`. A handful of DryRun-aware
 primitive helpers (`Set-Reg`, `Set-Svc`, `Remove-Appx`, `Invoke-Step`, `Update-Explorer`,
-`Install-App`, `Enable-Feature`) mirror WinUtil's apply engine. An ordered data table of
+`Install-App`, `Enable-Feature`) mirror the reference config's apply engine. An ordered data table of
 27 tweak objects (each with an `Apply` scriptblock) is executed by a runner that logs
 per-item status; then an install phase runs; then a summary prints. `Start-Transcript`
 captures everything to the log file.
@@ -18,7 +18,7 @@ winget for installs. No Pester (Windows-only runtime; see Testing Strategy).
 
 ## Global Constraints
 
-- **Source of truth:** Chris Titus WinUtil **v26.06.23** (`irm christitus.com/win`). All
+- **Source of truth:** the reference config **v26.06.23** (`irm the-reference-config`). All
   registry paths/values/services/scripts/appx are verbatim from the spec
   (`docs/2026-07-11-win11-tweaks-design.md` §5 + appendices A/B/C). Do not invent values.
 - **Platform:** Windows 11; **must run elevated** (Administrator). Refuse otherwise.
@@ -89,7 +89,7 @@ logs/
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Applies a fixed set of WinUtil (v26.06.23) tweaks, then installs a defined app set
+    Applies a fixed set of a fixed set of Win11 tweaks, then installs a defined app set
     via winget. No GUI. Logs everything to console + a file.
 .PARAMETER DryRun
     Log what WOULD happen; make no system changes.
@@ -183,7 +183,7 @@ function Write-Log {
 }
 ```
 
-- [ ] **Step 2: `Set-Reg`** (mirrors WinUtil `Set-WinUtilRegistry`)
+- [ ] **Step 2: `Set-Reg`** (mirrors `the registry helper`)
 
 ```powershell
 function Set-Reg {
@@ -209,12 +209,12 @@ function Set-Reg {
 }
 ```
 
-- [ ] **Step 3: `Set-Svc`** (mirrors `Set-WinUtilService` + KeepServiceStartup)
+- [ ] **Step 3: `Set-Svc`** (mirrors `the service helper` + KeepServiceStartup)
 
 ```powershell
 function Set-Svc {
     param([string]$Name,[string]$StartupType,[string]$OriginalType,[string]$Id='')
-    if ($StartupType -eq 'Disable') { $StartupType = 'Disabled' }   # WinUtil quirk
+    if ($StartupType -eq 'Disable') { $StartupType = 'Disabled' }   # the reference config quirk
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
     if (-not $svc) { Write-Log WARN "service $Name not found; skipping" $Id; return }
     if ($OriginalType -and ($svc.StartType.ToString() -ne $OriginalType)) {
@@ -229,7 +229,7 @@ function Set-Svc {
 }
 ```
 
-- [ ] **Step 4: `Remove-Appx`** (mirrors `Remove-WinUtilAPPX`)
+- [ ] **Step 4: `Remove-Appx`** (mirrors `the appx helper`)
 
 ```powershell
 function Remove-Appx {
@@ -304,7 +304,7 @@ function Enable-Feature {
 
 ```bash
 git add Invoke-Win11Tweaks.ps1
-git commit -m "feat: DryRun-aware primitive helpers mirroring WinUtil engine"
+git commit -m "feat: DryRun-aware primitive helpers mirroring the reference config engine"
 ```
 
 ---
@@ -343,7 +343,7 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore' -Name 'SystemRestorePointCreationFrequency' -Type 'DWord' -Value '0'
       Invoke-Step -Id $id -Description 'create system restore point' -Action {
           if (-not (Get-ComputerRestorePoint)) { Enable-ComputerRestore -Drive $Env:SystemDrive }
-          Checkpoint-Computer -Description 'System Restore Point created by WinUtil' -RestorePointType MODIFY_SETTINGS
+          Checkpoint-Computer -Description 'System Restore Point created by the reference config' -RestorePointType MODIFY_SETTINGS
       }
   }}
 

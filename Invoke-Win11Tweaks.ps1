@@ -232,7 +232,7 @@ function Test-AppInstalled {
     # Return $true if the package is already installed, so Install-App can skip it.
     #  - winget list uses a locale-independent EXIT CODE (0 = found) -> catches winget-tracked installs.
     #  - the Add/Remove Programs DisplayName scan catches installs made OUTSIDE winget
-    #    (e.g. Razer Synapse bundled with Razer hardware), which 'winget list' won't see.
+    #    (e.g. an OEM/vendor app pre-installed on the PC), which 'winget list' won't see.
     param([string]$Id, [string]$NamePattern)
     if ($Id) {
         try {
@@ -826,7 +826,6 @@ $script:AppsToInstall = @(
     'Ubisoft.Connect',
     'CPUID.HWMonitor',
     'NZXT.CAM',
-    'RazerInc.RazerInstaller.Synapse4', # Razer Synapse 4 (skipped if already installed)
     'Skillbrains.Lightshot',
     'VideoLAN.VLC',
     'SavardSoftware.TurboTop',           # always-on-top helper (on winget, not the savardsoftware.com exe)
@@ -847,9 +846,8 @@ $script:AppLocations = @{
     'Blizzard.BattleNet' = 'C:\Program Files (x86)\Battle.net'
 }
 # Skip-if-already-installed detection by Add/Remove Programs DisplayName (-like pattern),
-# for apps often present OUTSIDE winget so 'winget list' alone won't see them.
+# for apps often present OUTSIDE winget so 'winget list' alone won't see them. Add IDs here as needed.
 $script:AppDetectNames = @{
-    'RazerInc.RazerInstaller.Synapse4' = 'Razer Synapse*'
 }
 # Non-winget apps: fetch the vendor installer directly and run it silently (see Install-DirectDownload).
 $script:DirectApps = @(
@@ -954,7 +952,6 @@ $script:AppNames = @{
     'Ubisoft.Connect'                  = 'Ubisoft Connect'
     'CPUID.HWMonitor'                  = 'HWMonitor'
     'NZXT.CAM'                         = 'NZXT CAM'
-    'RazerInc.RazerInstaller.Synapse4' = 'Razer Synapse 4'
     'Skillbrains.Lightshot'            = 'Lightshot'
     'VideoLAN.VLC'                     = 'VLC media player'
     'SavardSoftware.TurboTop'          = 'TurboTop'

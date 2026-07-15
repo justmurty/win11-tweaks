@@ -601,6 +601,9 @@ $script:Tweaks = @(
       $id='WPFTweaksWindowsAI'
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name 'SettingsPageVisibility' -Type String -Value 'hide:aicomponents'
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\WindowsNotepad' -Name 'DisableAIFeatures' -Type DWord -Value '1'
+      # Official Recall GP ("Turn off saving snapshots for Windows") - disables Recall instantly via registry
+      # (fast + idempotent), independent of the slow DISM feature removal below.
+      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' -Name 'DisableAIDataAnalysis' -Type DWord -Value '1'
       Invoke-Step -Id $id -Description 'remove AI packages (Copilot, CoreAI, OfficeHub), disable Recall + WSAIFabricSvc' -Action {
           $appx = (Get-AppxPackage MicrosoftWindows.Client.CoreAI -ErrorAction SilentlyContinue).PackageFullName
           $sid  = (Get-LocalUser $Env:UserName -ErrorAction SilentlyContinue).Sid.Value
@@ -611,7 +614,11 @@ $script:Tweaks = @(
           Get-AppxPackage -AllUsers Microsoft.MicrosoftOfficeHub -ErrorAction SilentlyContinue | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
           if ($appx) { Remove-AppxPackage $appx -ErrorAction SilentlyContinue }
           Set-Service -Name WSAIFabricSvc -StartupType Disabled -ErrorAction SilentlyContinue
-          Disable-WindowsOptionalFeature -FeatureName Recall -Online -NoRestart -ErrorAction SilentlyContinue | Out-Null
+          # Only run the (slow) DISM disable if Recall is actually still Enabled - on a re-run it's already
+          # off, and calling Disable-WindowsOptionalFeature again re-does the whole servicing pass for nothing.
+          if ((Get-WindowsOptionalFeature -Online -FeatureName Recall -ErrorAction SilentlyContinue).State -eq 'Enabled') {
+              Disable-WindowsOptionalFeature -FeatureName Recall -Online -NoRestart -ErrorAction SilentlyContinue | Out-Null
+          }
       }
   }}
 

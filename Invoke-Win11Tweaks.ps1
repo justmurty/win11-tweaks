@@ -1070,6 +1070,7 @@ function Install-BattleNet {
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $label (non-blocking, poll for install, then tear down)"; return $true }
     if (Test-AppInstalled -Id $id -NamePattern 'Battle.net*') { Write-Log OK "Already installed - $label"; return $true }
     Write-Log INFO "Installing $label"
+    $preEdge = @((Get-Process msedge -ErrorAction SilentlyContinue).Id)   # Edge already running - leave it alone
     $wo = Join-Path $env:TEMP 'winget_bnet.log'
     $wargs = "install $id --accept-package-agreements --accept-source-agreements --source winget --silent --location `"$dir`""
     $wg = Start-Process -FilePath 'winget' -NoNewWindow -PassThru -ArgumentList $wargs -RedirectStandardOutput $wo
@@ -1089,6 +1090,10 @@ function Install-BattleNet {
     if ($wg -and -not $wg.HasExited) { try { $wg.Kill() } catch { } }
     for ($i = 0; $i -lt 4; $i++) {
         Stop-BattleNetProcs
+        # Battle.net's login flow launches Edge (its Agent -> msedge). Close ONLY the Edge that appeared during
+        # this install; any Edge already running before it (snapshot above) is left untouched. Once the Agent
+        # is dead it can't relaunch Edge, so this sticks.
+        Get-Process msedge -ErrorAction SilentlyContinue | Where-Object { $_.Id -notin $preEdge } | Stop-Process -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 3
         if (-not (Get-Process -Name 'Battle.net', 'Battle.net Launcher' -ErrorAction SilentlyContinue)) { break }
     }

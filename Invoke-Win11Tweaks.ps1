@@ -1042,34 +1042,56 @@ function Set-WinRarLicense {
     $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status='OK'; Detail='' })
 }
 
+function Stop-BattleNetProcs {
+    # Kill the Battle.net tree: app + launcher + CEF helper subprocesses (all named Battle.net*) + the updater
+    # Agent (path-filtered). Battle.net's UI is its OWN embedded Chromium (Battle.net.exe subprocesses), NOT
+    # Edge WebView2 - so we do NOT blanket-kill msedgewebview2 (on this box those 18 are Windows Widgets!); we
+    # only stop a WebView2 whose command line actually points at Battle.net (in case a build uses it), leaving
+    # unrelated WebView2 apps alone. No watchdog/scheduled task restarts these once the launcher is installed.
+    Get-Process -Name 'Battle.net', 'Battle.net Launcher', 'Battle.net Helper', 'BlizzardError' -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-Process -Name 'Agent' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*Battle.net*' } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*Battle.net*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+}
+
 function Install-BattleNet {
-    # winget's Battle.net install HANGS (~89%): the installer auto-launches the Battle.net app, whose
-    # Microsoft Edge WebView2 process (msedgewebview2.exe) keeps winget's -Wait from ever returning.
-    # Blizzard ships NO silent/no-launch switch (confirmed via Blizzard forums + Chocolatey). Fix: run
-    # winget NON-blocking; once the launcher is on disk AND the app has auto-launched, stop the Battle.net
-    # app + its Edge WebView2 (exactly what you'd do by hand) so winget completes. Verify on disk / ARP.
+    # winget can't cleanly install Battle.net: the Battle.net-Setup bootstrapper hands off to the Battle.net
+    # "Agent", which downloads + installs the launcher IN THE BACKGROUND (can take minutes) and auto-launches
+    # the login window. winget's -Wait then never returns, and - the bug we hit - verifying right after we kill
+    # winget reports a false FAILED while the Agent is still installing, leaving the app lingering on screen.
+    # Fix: run winget NON-blocking and DON'T wait on it; poll for the launcher on disk / ARP entry (the real
+    # success signal) with a generous timeout so the Agent can finish. Then tear the whole Battle.net tree down
+    # (sweeping until it stays dead - no watchdog survives) so nothing is left running.
     $id = 'Blizzard.BattleNet'; $label = 'Battle.net'
     $dir = $script:AppLocations[$id]; $exe = Join-Path $dir 'Battle.net Launcher.exe'
-    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $label (non-blocking + WebView2 unblock)"; return $true }
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $label (non-blocking, poll for install, then tear down)"; return $true }
     if (Test-AppInstalled -Id $id -NamePattern 'Battle.net*') { Write-Log OK "Already installed - $label"; return $true }
     Write-Log INFO "Installing $label"
     $wo = Join-Path $env:TEMP 'winget_bnet.log'
     $wargs = "install $id --accept-package-agreements --accept-source-agreements --source winget --silent --location `"$dir`""
-    $p = Start-Process -FilePath 'winget' -NoNewWindow -PassThru -ArgumentList $wargs -RedirectStandardOutput $wo
-    $sw = [System.Diagnostics.Stopwatch]::StartNew(); $cleaned = $false
-    while (-not $p.HasExited -and $sw.Elapsed.TotalSeconds -lt 360) {
+    $wg = Start-Process -FilePath 'winget' -NoNewWindow -PassThru -ArgumentList $wargs -RedirectStandardOutput $wo
+    # Poll for the REAL result (background Agent install) - don't trust winget's exit or verify early.
+    $sw = [System.Diagnostics.Stopwatch]::StartNew(); $ok = $false
+    while ($sw.Elapsed.TotalSeconds -lt 300) {
         Start-Sleep -Seconds 5
-        $running = Get-Process -Name 'Battle.net', 'Battle.net Launcher' -ErrorAction SilentlyContinue
-        if (-not $cleaned -and (Test-Path $exe) -and $running -and $sw.Elapsed.TotalSeconds -ge 20) {
-            Start-Sleep -Seconds 6   # let the install finalize after the app auto-launches
-            Write-Log DEBUG "Battle.net installed + auto-launched; stopping the app + Edge WebView2 so winget can return"
-            Get-Process -Name 'Battle.net', 'Battle.net Launcher', 'Battle.net Helper' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Get-Process -Name 'Agent' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*Battle.net*' } | Stop-Process -Force -ErrorAction SilentlyContinue
-            Get-Process -Name 'msedgewebview2' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue   # the blocker you kill by hand
-            $cleaned = $true
-        }
+        if ((Test-Path $exe) -or (Test-AppInstalled -Id $id -NamePattern 'Battle.net*')) { $ok = $true; break }
     }
-    if (-not $p.HasExited) { try { $p.Kill() } catch { }; Start-Sleep -Seconds 2 }
+    if ($ok) {
+        Write-Log DEBUG "Battle.net installed after $([int]$sw.Elapsed.TotalSeconds)s (launcher/ARP present); closing the auto-launched app"
+        Start-Sleep -Seconds 5   # let the Agent finish writing files before we stop it
+    } else {
+        Write-Log DEBUG "Battle.net not detected within $([int]$sw.Elapsed.TotalSeconds)s; tearing down anyway"
+    }
+    # Tear down winget + the whole Battle.net tree, sweeping until it stays down (the Agent may relaunch once).
+    if ($wg -and -not $wg.HasExited) { try { $wg.Kill() } catch { } }
+    for ($i = 0; $i -lt 4; $i++) {
+        Stop-BattleNetProcs
+        Start-Sleep -Seconds 3
+        if (-not (Get-Process -Name 'Battle.net', 'Battle.net Launcher' -ErrorAction SilentlyContinue)) { break }
+    }
     Remove-Item $wo -Force -ErrorAction SilentlyContinue
     if ((Test-Path $exe) -or (Test-AppInstalled -Id $id -NamePattern 'Battle.net*')) { Write-Log OK "Done!"; return $true }
     Write-Log WARN "Failed - $label"; return $false
@@ -1128,7 +1150,7 @@ function Invoke-InstallPhase {
             $script:Results.Add([pscustomobject]@{ Phase='VCRedist'; Id=$id; Content=$id; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
         }
         foreach ($id in $script:AppsToInstall) {
-            if ($id -eq 'Blizzard.BattleNet') { $ok = Install-BattleNet }   # special: winget hangs on the auto-launched app + Edge WebView2
+            if ($id -eq 'Blizzard.BattleNet') { $ok = Install-BattleNet }   # special: background Agent install + auto-launched app (winget hangs / verifies too early)
             else { $ok = Install-App -Id $id -Location $script:AppLocations[$id] -DetectName $script:AppDetectNames[$id] }
             $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
             if ($ok -and $script:DesktopShortcutApps.ContainsKey($id)) { $sc = $script:DesktopShortcutApps[$id]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }

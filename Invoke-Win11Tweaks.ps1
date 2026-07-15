@@ -1039,72 +1039,6 @@ function Set-WinRarLicense {
     $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status='OK'; Detail='' })
 }
 
-function Stop-BattleNetProcs {
-    # Kill the Battle.net tree: app + launcher + CEF helper subprocesses (all named Battle.net*) + the updater
-    # Agent (path-filtered). Battle.net's UI is its OWN embedded Chromium (Battle.net.exe subprocesses), NOT
-    # Edge WebView2 - so we do NOT blanket-kill msedgewebview2 (on this box those 18 are Windows Widgets!); we
-    # only stop a WebView2 whose command line actually points at Battle.net (in case a build uses it), leaving
-    # unrelated WebView2 apps alone. No watchdog/scheduled task restarts these once the launcher is installed.
-    Get-Process -Name 'Battle.net', 'Battle.net Launcher', 'Battle.net Helper', 'Battle.net-Setup', 'BlizzardError' -ErrorAction SilentlyContinue |
-        Stop-Process -Force -ErrorAction SilentlyContinue
-    Get-Process -Name 'Agent' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*Battle.net*' } |
-        Stop-Process -Force -ErrorAction SilentlyContinue
-    Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*Battle.net*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-}
-
-function Install-BattleNet {
-    # Battle.net has no silent install (Blizzard ships no switch) and its install is slow + multi-stage:
-    # Battle.net-Setup.exe hands off to the "Agent", which downloads the ~750 MB client IN THE BACKGROUND
-    # (its own GUI progress bar) and auto-launches the login window (+ opens Edge for web login). We download
-    # BLIZZARD'S OWN setup directly (always latest; the winget wrapper reported a false FAILED on a slow-CDN
-    # day) and run it, then WAIT until it truly finishes - the launcher on disk / ARP entry is the only real
-    # success signal. NO fixed-time kill: we wait as long as the install keeps making progress (its folder
-    # keeps growing) and give up ONLY if it STALLS (no growth for 5 min) - so a slow CDN is just a longer,
-    # visible wait, not a false FAILED. Live heartbeat. Then tear down the app + the Edge it opened.
-    $id = 'Blizzard.BattleNet'; $label = 'Battle.net'
-    $dir = $script:AppLocations[$id]; $exe = Join-Path $dir 'Battle.net Launcher.exe'
-    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $label (direct Blizzard setup, wait until it finishes)"; return $true }
-    if (Test-AppInstalled -Id $id -NamePattern 'Battle.net*') { Write-Log OK "Already installed - $label"; return $true }
-    Write-Log INFO "Installing $label"
-    $preEdge = @((Get-Process msedge -ErrorAction SilentlyContinue).Id)   # Edge already running - leave it alone
-    $setup = Join-Path $env:TEMP 'Battle.net-Setup.exe'
-    try {
-        $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest 'https://downloader.battle.net/download/getInstaller?os=win&installer=Battle.net-Setup.exe' -OutFile $setup -UseBasicParsing -ErrorAction Stop
-        $ProgressPreference = $pp
-    } catch { Write-Log WARN "Failed - $label (could not download the Blizzard setup: $($_.Exception.Message))"; return $false }
-    Start-Process -FilePath $setup   # installs to the default C:\Program Files (x86)\Battle.net (= $dir); its GUI shows (no silent mode)
-    # Wait until the install actually completes. Give up ONLY if the download stalls (folder stops growing for
-    # 5 min) - never on a fixed clock, so a slow CDN just means a longer (visible) wait, not a false FAILED.
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $lastSize = -1; $stall = [System.Diagnostics.Stopwatch]::StartNew(); $ok = $false
-    while ($true) {
-        Start-Sleep -Seconds 5
-        if ((Test-Path $exe) -or (Test-AppInstalled -Id $id -NamePattern 'Battle.net*')) { $ok = $true; break }
-        $size = 0
-        if (Test-Path $dir) { $size = [int]((Get-ChildItem $dir -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1MB) }
-        if ($size -gt $lastSize) { $lastSize = $size; $stall.Restart() }   # still downloading -> reset the stall timer
-        if ($stall.Elapsed.TotalSeconds -ge 300) { break }                # no progress for 5 min -> genuinely stuck, give up
-        Write-Host ("`r  Battle.net installing... {0:mm\:ss}  ({1} MB)   " -f $sw.Elapsed, $size) -NoNewline -ForegroundColor DarkYellow
-    }
-    Write-Host ("`r{0}`r" -f (' ' * 66)) -NoNewline   # wipe the heartbeat line
-    if ($ok) { Start-Sleep -Seconds 5 }   # let the Agent finish writing before we stop it
-    # Tear down the app + the Edge it opened (install done or stalled). Sweep until it stays down (no watchdog).
-    for ($i = 0; $i -lt 4; $i++) {
-        Stop-BattleNetProcs
-        # Close ONLY the Edge that appeared during this install (Battle.net's web login); a pre-existing Edge
-        # (snapshot above) is left untouched. Once the Agent is dead it can't relaunch Edge, so this sticks.
-        Get-Process msedge -ErrorAction SilentlyContinue | Where-Object { $_.Id -notin $preEdge } | Stop-Process -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 3
-        if (-not (Get-Process -Name 'Battle.net', 'Battle.net Launcher' -ErrorAction SilentlyContinue)) { break }
-    }
-    Remove-Item $setup -Force -ErrorAction SilentlyContinue
-    if ((Test-Path $exe) -or (Test-AppInstalled -Id $id -NamePattern 'Battle.net*')) { Write-Log OK "Done!"; return $true }
-    Write-Log WARN "Failed - $label"; return $false
-}
-
 function Install-Alienware {
     # Alienware Command Center. Returns a STATUS ('OK'/'SKIPPED'/'FAILED') so a non-Alienware box shows
     # SKIPPED, NOT a scary "Failed". We check the ACTUAL hardware (Win32_ComputerSystem model) instead of
@@ -1158,8 +1092,7 @@ function Invoke-InstallPhase {
             $script:Results.Add([pscustomobject]@{ Phase='VCRedist'; Id=$id; Content=$id; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
         }
         foreach ($id in $script:AppsToInstall) {
-            if ($id -eq 'Blizzard.BattleNet') { $ok = Install-BattleNet }   # special: direct Blizzard setup + wait-until-done (no silent mode; slow Agent install)
-            else { $ok = Install-App -Id $id -Location $script:AppLocations[$id] -DetectName $script:AppDetectNames[$id] }
+            $ok = Install-App -Id $id -Location $script:AppLocations[$id] -DetectName $script:AppDetectNames[$id]
             $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
             if ($ok -and $script:DesktopShortcutApps.ContainsKey($id)) { $sc = $script:DesktopShortcutApps[$id]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
             if ($id -eq 'RARLab.WinRAR') { Set-WinRarLicense }   # license right after WinRAR installs (clean pairing)

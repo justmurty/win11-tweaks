@@ -50,6 +50,7 @@ $script:Cancelled            = $false   # set by Show-Intro if the user answers 
 $script:MachineType          = ''      # 'PC' or 'Laptop' - resolved in Show-Intro; gates HP Support Assistant / Alienware
 $script:DotNet35Proc         = $null   # background DISM process for .NET 3.5 (started early, finished at the end)
 $script:PinHelper            = $null   # Pin-Taskbar helper path (kept after Invoke-TaskbarPins for the Chrome pin)
+$script:ChromePinned         = $false  # set by Add-ChromeTaskbarPin (right after Chrome installs) - Main refreshes the taskbar if true
 $script:Results              = [System.Collections.Generic.List[object]]::new()
 
 # --------------------------------------------------------------------------------------
@@ -1122,6 +1123,7 @@ function Invoke-InstallPhase {
         $st = Install-DirectDownload @d
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$d.Name; Content=$d.Name; Status=$st; Detail='direct' })
         if ($st -eq 'OK' -and $script:DesktopShortcutApps.ContainsKey($d.Name)) { $sc = $script:DesktopShortcutApps[$d.Name]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
+        if ($d.Name -eq 'Google Chrome') { $script:ChromePinned = Add-ChromeTaskbarPin }   # pin Chrome to the taskbar RIGHT AFTER it installs
     }
 
     # (WinRAR license is created right after WinRAR installs, in the loop above - see Set-WinRarLicense.)
@@ -1349,8 +1351,8 @@ try {
     Invoke-TaskbarPins        # This PC pin + unpin Edge/Store BEFORE installs...
     if ($script:NeedExplorerRestart -and -not $script:DryRun) { Update-Explorer -Action restart }   # ...then restart explorer so the taskbar/desktop is already clean (no Widgets/Search) during the installs
     Start-DotNet35            # fire the slow .NET 3.5 WU download NOW so it overlaps the install phase (parallel)
-    Invoke-InstallPhase       # apps + per-app desktop icons (.NET 3.5 downloads in the background meanwhile)
-    if ((Add-ChromeTaskbarPin) -and -not $script:DryRun) { Update-Explorer -Action restart }   # pin Chrome (installed above) + refresh taskbar to show it
+    Invoke-InstallPhase       # apps + per-app desktop icons (Chrome is pinned right after it installs, inside this)
+    if ($script:ChromePinned -and -not $script:DryRun) { Update-Explorer -Action restart }   # refresh the taskbar to show the Chrome pin
     Enable-DotNetFeatures     # finish .NET 3.5 (usually already done) + .NET 4
     Write-Summary
     Write-Log INFO "=========== WIN11-TWEAKS DONE ==========="

@@ -564,17 +564,26 @@ $script:Tweaks = @(
   [pscustomobject]@{ Id='WPFTweaksRemoveOneDrive'; Content='Microsoft OneDrive - Remove'; Category='Advanced'; Apply={
       $id='WPFTweaksRemoveOneDrive'
       Invoke-Step -Id $id -Description 'uninstall OneDrive + clean up' -Action {
-          icacls $Env:OneDrive /deny "Administrators:(D,DC)" 2>$null
-          Start-Process 'C:\Windows\System32\OneDriveSetup.exe' -ArgumentList '/uninstall' -Wait -ErrorAction SilentlyContinue
-          Stop-Process -Name FileCoAuth,Explorer -Force -ErrorAction SilentlyContinue
-          Remove-Item "$Env:LocalAppData\Microsoft\OneDrive" -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item 'C:\ProgramData\Microsoft OneDrive' -Recurse -Force -ErrorAction SilentlyContinue
-          icacls $Env:OneDrive /grant "Administrators:(D,DC)" 2>$null
-          if ($Env:OneDrive -and -not (Get-ChildItem -Path $Env:OneDrive -ErrorAction SilentlyContinue)) {
-              Remove-Item -Path $Env:OneDrive -Recurse -ErrorAction SilentlyContinue
-              [Environment]::SetEnvironmentVariable('OneDrive', $null, 'User')
+          # Only run the (disruptive) removal if OneDrive is actually still present - so a RE-RUN doesn't
+          # redo it. On a re-run OneDrive is already gone and $Env:OneDrive is empty, which made the old
+          # `icacls $Env:OneDrive ...` run with NO path -> icacls dumped its whole usage/help to the console.
+          $odInstalled = ($Env:OneDrive -and (Test-Path $Env:OneDrive)) -or (Test-Path "$env:LocalAppData\Microsoft\OneDrive\OneDrive.exe")
+          if ($odInstalled) {
+              if ($Env:OneDrive) { icacls $Env:OneDrive /deny "Administrators:(D,DC)" 2>&1 | Out-Null }   # guard empty path + silence icacls
+              $odSetup = @("$env:SystemRoot\System32\OneDriveSetup.exe", "$env:SystemRoot\SysWOW64\OneDriveSetup.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+              if ($odSetup) { Start-Process $odSetup -ArgumentList '/uninstall' -Wait -ErrorAction SilentlyContinue }
+              Stop-Process -Name FileCoAuth, Explorer -Force -ErrorAction SilentlyContinue
+              Remove-Item "$Env:LocalAppData\Microsoft\OneDrive" -Recurse -Force -ErrorAction SilentlyContinue
+              Remove-Item 'C:\ProgramData\Microsoft OneDrive' -Recurse -Force -ErrorAction SilentlyContinue
+              if ($Env:OneDrive) {
+                  icacls $Env:OneDrive /grant "Administrators:(D,DC)" 2>&1 | Out-Null
+                  if (-not (Get-ChildItem -Path $Env:OneDrive -ErrorAction SilentlyContinue)) {
+                      Remove-Item -Path $Env:OneDrive -Recurse -ErrorAction SilentlyContinue
+                      [Environment]::SetEnvironmentVariable('OneDrive', $null, 'User')
+                  }
+              }
           }
-          Set-Service -Name OneSyncSvc -StartupType Disabled -ErrorAction SilentlyContinue
+          Set-Service -Name OneSyncSvc -StartupType Disabled -ErrorAction SilentlyContinue   # always ensure disabled (idempotent)
       }
       $script:NeedExplorerRestart = $true
   }}

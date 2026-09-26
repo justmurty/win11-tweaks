@@ -1288,15 +1288,22 @@ function Get-PinHelper {
 }
 
 function Invoke-PinHelper {
-    # Run the Pin-Taskbar helper. It reports its own failures through its exit code (0 = OK, 2 = nothing
-    # found to pin/unpin, 3 = failed) - a non-zero exit does NOT throw - so turn it into an exception that the
-    # caller records as FAILED (the helper's internal errors already throw). $LASTEXITCODE is reset first so
-    # an earlier native command's code can't leak in.
+    # Run the Pin-Taskbar helper in its OWN Windows PowerShell process with -ExecutionPolicy Bypass (like the
+    # .bat and the self-elevation relaunch do). Run in-process, the helper - a .ps1 FILE - was blocked by
+    # Windows' default 'Restricted' policy whenever the `irm | iex` one-liner was started from an already
+    # elevated window (iex itself isn't subject to the policy, script files are). A separate process also
+    # keeps the helper's own `exit` / error handling out of this session.
+    # The helper's exit code: 0 = OK, 2 = nothing found to pin/unpin, 3 = failed, 1 = it crashed - anything
+    # but 0 becomes an exception that the caller records as FAILED.
     param([string]$Helper, [string]$Target, [switch]$Unpin)
-    $global:LASTEXITCODE = 0
-    if ($Unpin) { $null = & $Helper $Target -Unpin -Silent } else { $null = & $Helper $Target -Silent }
+    $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $ps)) { throw "Windows PowerShell not found at $ps" }
+    $helperArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Helper, $Target, '-Silent')
+    if ($Unpin) { $helperArgs += '-Unpin' }
+    $out = & $ps @helperArgs 2>&1   # it runs -Silent, so anything it prints is an error message - kept for the log
     if ($LASTEXITCODE -ne 0) {
-        $why = switch ($LASTEXITCODE) { 2 { 'nothing found to pin/unpin' } 3 { 'pin/unpin failed' } default { 'unexpected' } }
+        @($out) | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Select-Object -Last 5 | ForEach-Object { Write-Log DEBUG "  pin-helper> $_" }
+        $why = switch ($LASTEXITCODE) { 2 { 'nothing found to pin/unpin' } 3 { 'pin/unpin failed' } default { 'helper error' } }
         throw ("Pin-Taskbar exit code {0} ({1})" -f $LASTEXITCODE, $why)
     }
 }

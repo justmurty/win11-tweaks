@@ -8,18 +8,20 @@ console **and** a file so the run can be reviewed afterwards.
 ## What it does
 
 - **35 tweaks** — 25 standard (Essential + Advanced + Customize Preferences toggles) + 10
-  custom (shortcut-arrow off, Spotlight off + default wallpaper, Ultimate Performance,
+  custom (shortcut-arrow off, Spotlight off + default wallpaper, Ultimate Performance (PC only),
   **Memory Integrity / VBS off** for gaming, mouse acceleration off, DNS → Cloudflare,
   Explorer → This PC, taskbar cleanup (Search / Task view / Widgets / Chat / Resume off),
   **web/Bing + Store search in Start off**, remove the Edge desktop shortcut). Details:
   [`docs/2026-07-11-win11-tweaks-design.md`](docs/2026-07-11-win11-tweaks-design.md).
 - Shows the **MSUHost banner**, asks **`Continue? (Y/n)`** and **`PC or Laptop?`** (`1` PC / `2` Laptop).
+  On a laptop the **Ultimate Performance** power plan is skipped (it keeps the CPU from idling —
+  heat and battery drain).
 - Then the **install phase**: **12 Visual C++ redists** + **15 winget apps**
   (incl. VLC, Lightshot, TurboTop, WinRAR) + **6 direct-download**
   (**Google Chrome**, **NVIDIA App** only if an NVIDIA GPU is present, **Bitwarden**, **Parsec**,
-  **Google Play Games**, **FL Studio**) + **machine-specific**: **HP Support Assistant**
-  (Laptop only) and **Alienware Command Center** (PC only) — installed automatically per the
-  PC/Laptop answer, no prompt. It also applies the **WinRAR license** and enables **.NET 3.5**
+  **Google Play Games**, **FL Studio**) + **vendor apps**, installed automatically (no prompt) only
+  on that vendor's hardware, desktop or laptop: **HP Support Assistant** on HP, **Alienware Command
+  Center** on Alienware / Dell G-series. It also applies the **WinRAR license** and enables **.NET 3.5**
   (incl. 2.0/3.0) **and .NET 4** via DISM (like "Turn Windows features on/off").
 - **Pins "This PC"** and **Google Chrome** to the taskbar (via a temporary helper that is deleted
   afterwards), and unpins Microsoft Edge + Microsoft Store.
@@ -37,14 +39,14 @@ console **and** a file so the run can be reviewed afterwards.
 
 ### 1) One-liner
 
-Open **PowerShell as Administrator** and run:
+Open **PowerShell** and run:
 
 ```powershell
 irm https://gitlab.msuhost.com/superuser/win11-tweaks/-/raw/main/Invoke-Win11Tweaks.ps1 | iex
 ```
 
-This downloads and runs the latest script directly. It must be an **elevated** PowerShell
-(there is no `.bat` self-elevation in this flow).
+This downloads and runs the latest script directly. If the window isn't elevated, the script
+asks for admin rights (UAC) and re-launches itself in a new elevated window.
 
 ### 2) Download + double-click
 
@@ -78,6 +80,12 @@ The script prints the full log path at the start and end. Lines are timestamped 
 `*_results.txt` is written alongside it. The console stays concise; the log file always has full
 detail (use `-Detailed` for verbose console output).
 
+Each item in the summary gets one status: `OK`, `WARN` (applied, but a step failed — see the
+log), `FAILED`, `SKIPPED` (not needed, or not for this machine), `DRYRUN`, or `BACKGROUND`
+(a Windows feature — normally .NET 3.5 — still installing). If you stop the run with Ctrl+C,
+the summary still covers what ran. (That holds in Windows PowerShell, which the `.bat` and a
+default Windows 11 shell use; PowerShell 7 has an open bug where Ctrl+C can skip it.)
+
 ## Flags
 
 | Flag | Effect |
@@ -85,7 +93,7 @@ detail (use `-Detailed` for verbose console output).
 | `-DryRun` | Log what it WOULD do, change **nothing**. Run this first. |
 | (none) | Actually apply the tweaks + install the apps. |
 | `-Detailed` | Verbose console output (the log file is always full). |
-| `-Machine PC\|Laptop` | Skip the "PC or Laptop?" question (gates HP / Alienware). |
+| `-Machine PC\|Laptop` | Skip the "PC or Laptop?" question (`Laptop` skips Ultimate Performance). |
 | `-Reboot` | Reboot 15s after finishing (cancel with Ctrl+C). |
 | `-LogDir <path>` | Different folder for the log (default: the script's folder). |
 
@@ -93,7 +101,8 @@ detail (use `-Detailed` for verbose console output).
 
 Edit the arrays near the top of the install section of the script: `$script:AppsToInstall`
 for winget apps (add winget IDs, e.g. `'Mozilla.Firefox'`), `$script:DirectApps` for
-direct-download apps, or `$script:MachineApps` for PC/Laptop-gated apps.
+direct-download apps, or `$script:VendorApps` for apps that belong on one vendor's hardware
+(`Hardware` is a regex matched against the PC's manufacturer + model).
 
 ## Notes
 
@@ -106,9 +115,11 @@ direct-download apps, or `$script:MachineApps` for PC/Laptop-gated apps.
 - **No undo and no restore point** — if you want to roll back, take a snapshot/backup yourself
   before the real run.
 - **winget needs an interactive session** — run via `Run-Win11Tweaks.bat` (double-click) or the
-  one-liner in an interactive elevated shell, not over SSH/remoting (winget fails with
+  one-liner in a PowerShell window on the PC itself, not over SSH/remoting (winget fails with
   `0x8A15000F` otherwise).
 - **.NET 3.5** pulls its payload from Windows Update. It's started early (in parallel with the app
   installs) and the script **waits** for it to finish at the end, showing a live one-line heartbeat.
-  On a normal connection this is seconds; on a WU-throttled box it can take ~30 min (press Ctrl+C to
-  skip — `/NoRestart` means no surprise reboot, and it finishes on its own).
+  On a normal connection this is seconds; on a WU-throttled box it can take ~30 min. Ctrl+C stops
+  the script there (the summary is still written — see [The log](#the-log)), and .NET 3.5 keeps
+  installing in the background (`/NoRestart`, so no surprise reboot — just don't reboot until
+  it's done).

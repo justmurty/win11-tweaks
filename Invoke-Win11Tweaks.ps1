@@ -18,9 +18,10 @@
     Reboot 15 seconds after finishing (cancellable with Ctrl+C). Off by default.
 
 .PARAMETER Machine
-    'PC' or 'Laptop'. Skips the interactive "PC or Laptop?" question at startup. This choice
-    gates two apps: HP Support Assistant installs on Laptop only, Alienware Command Center on
-    PC only. If omitted: ask interactively, or default to 'PC' when non-interactive.
+    'PC' or 'Laptop'. Skips the interactive "PC or Laptop?" question at startup. A laptop skips
+    the PC-only Ultimate Performance power plan. (HP Support Assistant / Alienware Command Center
+    go by the actual hardware vendor, not by this answer.) If omitted: ask interactively, or
+    default to 'PC' when non-interactive.
 
 .PARAMETER LogDir
     Directory for the log file. Default: the script's own folder (fallback: Desktop
@@ -52,7 +53,10 @@ $script:Detailed             = [bool]$Detailed
 $script:NeedExplorerRestart  = $false
 $script:NeedIconCacheClear   = $false
 $script:Cancelled            = $false   # set by Show-Intro if the user answers "n" (avoids `exit`, which kills an iex host)
-$script:MachineType          = ''      # 'PC' or 'Laptop' - resolved in Show-Intro; gates HP Support Assistant / Alienware
+$script:MachineType          = ''      # 'PC' or 'Laptop' - resolved in Show-Intro; a laptop skips the PC-only tweaks
+$script:WarnCount            = 0       # WARN lines logged so far - a tweak that logs one is reported WARN, not OK
+$script:RunStarted           = $false  # past the intro -> Main's finally writes the summary (also after Ctrl+C)
+$script:RunFinished          = $false  # got to the end without being stopped
 $script:DotNet35Proc         = $null   # background DISM process for .NET 3.5 (started early, finished at the end)
 $script:PinHelper            = $null   # Pin-Taskbar helper path (kept after Invoke-TaskbarPins for the Chrome pin)
 $script:ChromePinned         = $false  # set by Add-ChromeTaskbarPin (right after Chrome installs) - Main refreshes the taskbar if true
@@ -124,6 +128,7 @@ function Write-Log {
     $tag = if ($Id) { "[$Id] " } else { '' }
     # the LOG FILE gets the full line (incl. the [Id] tag, for diagnostics); the CONSOLE omits the tag
     try { Add-Content -Path $script:LogFile -Value ("{0} [{1,-5}] {2}{3}" -f $ts, $Level, $tag, $Message) -Encoding UTF8 -ErrorAction SilentlyContinue } catch { }
+    if ($Level -eq 'WARN') { $script:WarnCount++ }   # Invoke-Tweaks compares this before/after each tweak
     if ($Level -eq 'DEBUG' -and -not $script:Detailed) { return }   # concise console - hide DEBUG unless -Detailed
     $color = switch ($Level) {
         'OK'    { 'Green' }
@@ -163,7 +168,8 @@ function Set-Svc {
     param([string]$Name, [string]$StartupType, [string]$OriginalType, [string]$Id = '')
     if ($StartupType -eq 'Disable') { $StartupType = 'Disabled' }   # the manifest ships "Disable" for lfsvc
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
-    if (-not $svc) { Write-Log WARN "service $Name not found; skipping" $Id; return }
+    # not a failure: the service doesn't exist on this edition (e.g. CscService on Home) - nothing to change
+    if (-not $svc) { Write-Log DEBUG "service $Name not present on this system; skipping" $Id; return }
     if ($OriginalType -and ($svc.StartType.ToString() -ne $OriginalType)) {
         Write-Log DEBUG "service $Name already customized (is $($svc.StartType), expected $OriginalType); leaving as-is" $Id
         return
@@ -253,27 +259,39 @@ function Test-AppInstalled {
     return $false
 }
 
+function Invoke-Winget {
+    # Run winget (output redirected to $OutFile) and return its exit code. Waits for winget ONLY - NOT
+    # Start-Process -Wait, which waits for the whole process TREE (it puts the child in a job object): an app
+    # the installer launches when it's done (Battle.net + its browser helpers) would then hold the run until
+    # someone closed it. winget itself waits for its installer, so this behaves like `winget install` by hand.
+    param([string]$ArgumentList, [string]$OutFile)
+    $p = Start-Process -FilePath 'winget' -NoNewWindow -PassThru -ArgumentList $ArgumentList -RedirectStandardOutput $OutFile
+    $null = $p.Handle   # open the handle NOW - Windows PowerShell returns the process by PID, and without a handle ExitCode can be empty after exit
+    Wait-Process -InputObject $p
+    return $p.ExitCode
+}
+
 function Install-App {
     # Clean console output: just "Installing <name>" then "Done!" (or "Failed"). winget's own chatter
     # (Found / Downloading / Successfully installed) is redirected to a temp file - shown only in the
-    # log file on failure, never on the console.
+    # log file on failure, never on the console. Returns a STATUS: OK / FAILED / DRYRUN.
     param([string]$Id, [string]$Name, [string]$Location, [string]$DetectName, [string]$Source)
     $label = if ($Name) { $Name } elseif ($script:AppNames.ContainsKey($Id)) { $script:AppNames[$Id] } else { $Id }
     $src = if ($Source) { $Source } else { 'winget' }   # 'msstore' for Store-only apps (e.g. Alienware Command Center)
     $wingetArgs = "install $Id --accept-package-agreements --accept-source-agreements --source $src --silent"
     if ($Location) { $wingetArgs += " --location `"$Location`"" }   # e.g. Battle.net requires an install location
-    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $label"; return $true }
-    if (Test-AppInstalled -Id $Id -NamePattern $DetectName) { Write-Log OK "Already installed - $label"; return $true }
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $label"; return 'DRYRUN' }
+    if (Test-AppInstalled -Id $Id -NamePattern $DetectName) { Write-Log OK "Already installed - $label"; return 'OK' }
     Write-Log INFO "Installing $label"
     $wo = Join-Path $env:TEMP 'winget_out.log'
     try {
-        $p = Start-Process -FilePath 'winget' -NoNewWindow -Wait -PassThru -ArgumentList $wingetArgs -RedirectStandardOutput $wo
-        if ($p.ExitCode -eq 0) { Remove-Item $wo -Force -ErrorAction SilentlyContinue; Write-Log OK "Done!"; return $true }
+        $code = Invoke-Winget -ArgumentList $wingetArgs -OutFile $wo
+        if ($code -eq 0) { Remove-Item $wo -Force -ErrorAction SilentlyContinue; Write-Log OK "Done!"; return 'OK' }
         Write-Log WARN "Failed - $label"
         if (Test-Path $wo) { Get-Content $wo -ErrorAction SilentlyContinue | Where-Object { $_.Trim() } | Select-Object -Last 8 | ForEach-Object { Write-Log DEBUG "  winget> $($_.Trim())" }; Remove-Item $wo -Force -ErrorAction SilentlyContinue }
-        return $false
+        return 'FAILED'
     } catch {
-        Write-Log WARN "Failed - $label : $($_.Exception.Message)"; return $false
+        Write-Log WARN "Failed - $label : $($_.Exception.Message)"; return 'FAILED'
     }
 }
 
@@ -709,8 +727,9 @@ $script:Tweaks = @(
       }
   }}
 
-  # Ultimate Performance power plan (NOT for laptops) - max performance, then ACTIVATE it
-  [pscustomobject]@{ Id='CustomUltimatePerf'; Content='Ultimate Performance - power plan'; Category='Custom'; Apply={
+  # Ultimate Performance power plan - max performance, then ACTIVATE it. PC only (Machine='PC'): skipped on
+  # a laptop, where it keeps the CPU from idling (heat + battery drain).
+  [pscustomobject]@{ Id='CustomUltimatePerf'; Content='Ultimate Performance - power plan'; Category='Custom'; Machine='PC'; Apply={
       Invoke-Step -Id 'CustomUltimatePerf' -Description 'enable + activate Ultimate Performance power plan' -Action {
           # Reuse an existing Ultimate Performance plan if present (no duplicates on re-run); else create one.
           $guid = ([regex]::Match((powercfg -list | Out-String), '(?im)GUID:\s*([0-9a-f-]{36})\s*\(Ultimate Performance\)')).Groups[1].Value
@@ -777,7 +796,8 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' -Name 'SearchboxTaskbarMode' -Type DWord -Value '0'  # Search box -> Hidden
       Set-Reg -Id $id -Path $p -Name 'ShowTaskViewButton' -Type DWord -Value '0'   # Task view button off
       Set-Reg -Id $id -Path $p -Name 'TaskbarMn'          -Type DWord -Value '0'   # Chat button off
-      Set-Reg -Id $id -Path $p -Name 'IsEnabled'          -Type DWord -Value '0'   # Resume button off (Win11 25H2 / build 26200+)
+      # Resume ("continue on this PC" from your phone - Settings > Apps > Resume) off; applies at the next sign-in
+      Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' -Name 'IsResumeAllowed' -Type DWord -Value '0'
       # Widgets: HKCU 'TaskbarDa' is locked on 25H2 (Set fails "unauthorized"), so kill it via the
       # HKLM policy instead - verified to set cleanly and it removes the Widgets button.
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' -Name 'AllowNewsAndInterests' -Type DWord -Value '0'
@@ -831,14 +851,17 @@ $script:AppsToInstall = @(
     'SavardSoftware.TurboTop',           # always-on-top helper (on winget, not the savardsoftware.com exe)
     'RARLab.WinRAR'
 )
-# Machine-specific apps: installed AUTOMATICALLY based on the "PC or Laptop?" answer - no y/N prompt.
-#   HP Support Assistant  -> Laptop only (HP laptop utility; pointless on a desktop).
-#   Alienware Command Center -> PC only (msstore; the user's Alienware/Dell G desktop). Laptop -> skipped.
-# (AnyDesk removed per user request.) Alienware is Store-only (msstore) and works ONLY on Alienware /
-# Dell G hardware; if msstore fails (removed / unsupported box), grab it from Dell's support site.
-$script:MachineApps = @(
-    @{ Id='HPInc.HPSupportAssistant'; Name='HP Support Assistant';     Machine='Laptop' },
-    @{ Id='9PMHP03NJ9QP';             Name='Alienware Command Center'; Machine='PC'; Source='msstore' }
+# Vendor apps: installed AUTOMATICALLY - no y/N prompt - but ONLY on that vendor's hardware, desktop or
+# laptop alike (Hardware is a regex against Win32_ComputerSystem "<Manufacturer> <Model>"):
+#   HP Support Assistant     -> HP machines.
+#   Alienware Command Center -> Alienware / Dell G-series (msstore - the Store only offers it there; if the
+#                               Store install fails, Install-Alienware falls back to Dell's direct installer).
+#                               Older G models have no "Dell " in the model ("Dell Inc. G5 5500"), newer ones
+#                               do ("Dell Inc. Dell G15 5511") - hence "Dell ... G<n> <4 digits>".
+# (AnyDesk removed per user request.)
+$script:VendorApps = @(
+    @{ Id='HPInc.HPSupportAssistant'; Name='HP Support Assistant';     Vendor='HP';               Hardware='^(HP|Hewlett)\b' },
+    @{ Id='9PMHP03NJ9QP';             Name='Alienware Command Center'; Vendor='Alienware/Dell G'; Hardware='Alienware|^Dell\b.*\bG\d{1,2}\s+\d{4}\b'; Source='msstore' }
 )
 # Per-app install location for packages whose winget manifest REQUIRES one (otherwise
 # winget prompts "Specify the install root:" and blocks the run). Add IDs here as needed.
@@ -972,11 +995,25 @@ function Write-Banner {
 
 function Invoke-Tweaks {
     foreach ($t in $script:Tweaks) {
+        if ($t.Machine -and $t.Machine -ne $script:MachineType) {   # e.g. Ultimate Performance is PC only
+            Write-Log INFO ("Skipping {0} ({1} only)" -f $t.Content, $t.Machine) $t.Id
+            $script:Results.Add([pscustomobject]@{ Phase='Tweak'; Id=$t.Id; Content=$t.Content; Status='SKIPPED'; Detail="$($t.Machine) only" })
+            continue
+        }
         Write-Log INFO ("Applying {0}" -f $t.Content) $t.Id
-        $status = 'OK'; $detail = ''
+        $status = 'OK'; $detail = ''; $warnsBefore = $script:WarnCount
         try { & $t.Apply }
         catch { $status = 'FAILED'; $detail = $_.Exception.Message; Write-Log ERROR "tweak failed: $detail" $t.Id }
-        Write-Log ($(if ($status -eq 'OK') {'OK'} else {'ERROR'})) ($(if ($status -eq 'OK') {'Done!'} else {'Failed'})) $t.Id
+        # Set-Reg / Set-Svc / Invoke-Step log a WARN instead of throwing -> a tweak with a failed step is WARN, not OK
+        if ($status -eq 'OK' -and $script:WarnCount -gt $warnsBefore) {
+            $status = 'WARN'; $detail = '{0} step(s) failed - see the log' -f ($script:WarnCount - $warnsBefore)
+        }
+        if ($status -eq 'OK' -and $script:DryRun) { $status = 'DRYRUN' }
+        switch ($status) {
+            'FAILED' { Write-Log ERROR 'Failed' $t.Id }
+            'WARN'   { Write-Log WARN "Done, but $detail" $t.Id }
+            default  { Write-Log OK 'Done!' $t.Id }
+        }
         $script:Results.Add([pscustomobject]@{ Phase='Tweak'; Id=$t.Id; Content=$t.Content; Status=$status; Detail=$detail })
     }
 }
@@ -1031,39 +1068,34 @@ function Set-WinRarLicense {
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status='SKIPPED'; Detail='no key/dir' }); return
     }
     Write-Log INFO "Creating WinRAR license"
+    $placed = 0
     foreach ($dir in $rarDirs) {
-        try { [System.IO.File]::WriteAllBytes((Join-Path $dir 'rarreg.key'), $rkBytes); Write-Log DEBUG "placed rarreg.key in $dir" }
+        try { [System.IO.File]::WriteAllBytes((Join-Path $dir 'rarreg.key'), $rkBytes); $placed++; Write-Log DEBUG "placed rarreg.key in $dir" }
         catch { Write-Log DEBUG "place failed in ${dir}: $($_.Exception.Message)" }
     }
-    Write-Log OK "Done!"
-    $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status='OK'; Detail='' })
+    $st = if ($placed) { 'OK' } else { 'FAILED' }   # OK only if the key actually landed somewhere
+    if ($placed) { Write-Log OK "Done!" } else { Write-Log WARN "Failed - WinRAR license (could not write rarreg.key)" }
+    $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status=$st; Detail='' })
 }
 
 function Install-Alienware {
-    # Alienware Command Center. Returns a STATUS ('OK'/'SKIPPED'/'FAILED') so a non-Alienware box shows
-    # SKIPPED, NOT a scary "Failed". We check the ACTUAL hardware (Win32_ComputerSystem model) instead of
-    # relying on the Store's flaky detection: not Alienware/Dell G -> SKIPPED. On Alienware/Dell G -> try
-    # the Microsoft Store first (official/latest); if the Store gating misfires, fall back to Dell's
-    # DIRECT Full Installer EXE (bypasses the Store). Only a genuine install failure -> FAILED.
+    # Alienware Command Center - only called on Alienware / Dell G hardware (the vendor gate in
+    # Invoke-InstallPhase checks Win32_ComputerSystem, so other boxes show SKIPPED, not a scary "Failed").
+    # Returns a STATUS ('OK'/'FAILED'/'DRYRUN'). Tries the Microsoft Store first (official/latest); if the
+    # Store gating misfires, falls back to Dell's DIRECT Full Installer EXE (bypasses the Store). Only a
+    # genuine install failure -> FAILED.
     # NOTE: the Dell URL is version-pinned (update when Dell ships newer) + /s is a best-effort silent
     # switch; can't be tested on the non-Alienware VM.
     $id = '9PMHP03NJ9QP'; $label = 'Alienware Command Center'
     $dellUrl = 'https://dl.dell.com/FOLDER12874937M/2/Alienware-Command-Center-6-x-Full-Installer-for_5T498_WIN64_6.7.37.0_A00_01.EXE'
-    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $label on Alienware/Dell G hardware"; return 'DRYRUN' }
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $label"; return 'DRYRUN' }
     if (Test-AppInstalled -NamePattern 'Alienware Command Center*') { Write-Log OK "Already installed - $label"; return 'OK' }
-    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
-    $hw = "$($cs.Manufacturer) $($cs.Model)"
-    if ($hw -notmatch 'Alienware' -and $hw -notmatch 'Dell\s*G\d') {
-        Write-Log INFO "$label - skipped (not Alienware/Dell hardware)"   # NOT a failure
-        return 'SKIPPED'
-    }
     Write-Log INFO "Installing $label"
     # 1) Microsoft Store (official, always-latest)
     $wo = Join-Path $env:TEMP 'winget_awcc.log'
     try {
-        $p = Start-Process -FilePath 'winget' -NoNewWindow -Wait -PassThru -RedirectStandardOutput $wo `
-            -ArgumentList "install $id --accept-package-agreements --accept-source-agreements --source msstore --silent"
-        if ($p.ExitCode -eq 0) { Remove-Item $wo -Force -EA SilentlyContinue; Write-Log OK "Done!"; return 'OK' }
+        $code = Invoke-Winget -OutFile $wo -ArgumentList "install $id --accept-package-agreements --accept-source-agreements --source msstore --silent"
+        if ($code -eq 0) { Remove-Item $wo -Force -EA SilentlyContinue; Write-Log OK "Done!"; return 'OK' }
     } catch { }
     Remove-Item $wo -Force -ErrorAction SilentlyContinue
     # 2) Dell direct Full Installer fallback (bypasses the Store's hardware gating)
@@ -1088,13 +1120,13 @@ function Invoke-InstallPhase {
 
     if (Get-Command winget -ErrorAction SilentlyContinue) {
         foreach ($id in $script:VCRedists) {   # Visual C++ Redistributables first (apps/games need them)
-            $ok = Install-App -Id $id
-            $script:Results.Add([pscustomobject]@{ Phase='VCRedist'; Id=$id; Content=$id; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
+            $st = Install-App -Id $id
+            $script:Results.Add([pscustomobject]@{ Phase='VCRedist'; Id=$id; Content=$id; Status=$st; Detail='' })
         }
         foreach ($id in $script:AppsToInstall) {
-            $ok = Install-App -Id $id -Location $script:AppLocations[$id] -DetectName $script:AppDetectNames[$id]
-            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status=($(if ($ok) {'OK'} else {'FAILED'})); Detail='' })
-            if ($ok -and $script:DesktopShortcutApps.ContainsKey($id)) { $sc = $script:DesktopShortcutApps[$id]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
+            $st = Install-App -Id $id -Location $script:AppLocations[$id] -DetectName $script:AppDetectNames[$id]
+            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status=$st; Detail='' })
+            if ($st -ne 'FAILED' -and $script:DesktopShortcutApps.ContainsKey($id)) { $sc = $script:DesktopShortcutApps[$id]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
             if ($id -eq 'RARLab.WinRAR') { Set-WinRarLicense }   # license right after WinRAR installs (clean pairing)
         }
     } else {
@@ -1112,18 +1144,19 @@ function Invoke-InstallPhase {
 
     # (WinRAR license is created right after WinRAR installs, in the loop above - see Set-WinRarLicense.)
 
-    # Machine-specific apps LAST - auto-installed based on the "PC or Laptop?" answer (no prompt).
-    #   HP Support Assistant -> Laptop only;  Alienware Command Center -> PC only.
-    foreach ($a in $script:MachineApps) {
-        if ($a.Machine -ne $script:MachineType) {
-            Write-Log DEBUG "$($a.Name): skipped ($($a.Machine)-only; this machine is $($script:MachineType))"
-            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail="$($a.Machine)-only" })
+    # Vendor apps LAST - auto-installed (no prompt) ONLY on that vendor's hardware, desktop or laptop alike:
+    #   HP Support Assistant -> HP;  Alienware Command Center -> Alienware / Dell G-series.
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $hw = ("{0} {1}" -f $cs.Manufacturer, $cs.Model).Trim()
+    foreach ($a in $script:VendorApps) {
+        if ($hw -notmatch $a.Hardware) {   # NOT a failure - just not this vendor's machine
+            Write-Log DEBUG "$($a.Name): skipped (not $($a.Vendor) hardware: '$hw')"
+            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail="not $($a.Vendor) hardware" })
             continue
         }
-        # Alienware returns a STATUS (OK/SKIPPED/FAILED) - not-Alienware-hardware is SKIPPED, not FAILED.
-        if ($a.Id -eq '9PMHP03NJ9QP') { $st = Install-Alienware }
-        else { $st = if (Install-App -Id $a.Id -Name $a.Name -Source $a.Source) { 'OK' } else { 'FAILED' } }
-        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=$st; Detail=$a.Machine })
+        if ($a.Id -eq '9PMHP03NJ9QP') { $st = Install-Alienware }   # Store first, then Dell's direct installer
+        else { $st = Install-App -Id $a.Id -Name $a.Name -Source $a.Source }
+        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=$st; Detail=$hw })
     }
 
     # (.NET 3.5 was started in the BACKGROUND before this phase (Start-DotNet35) so it downloads in
@@ -1156,13 +1189,18 @@ function Enable-DotNetFeatures {
         return
     }
     Write-Log INFO "Installing .NET 3.5"
+    # Recorded up-front as BACKGROUND and updated below: if the run is stopped (Ctrl+C) during the wait, the
+    # summary - written from Main's finally - still shows that .NET 3.5 is finishing in the background.
+    $rec3 = [pscustomobject]@{ Phase='Install'; Id='NetFx3'; Content='.NET 3.5'; Status='BACKGROUND'; Detail='' }
+    $script:Results.Add($rec3)
     $st3 = 'OK'
     if ($script:DotNet35Proc -and -not $script:DotNet35Proc.HasExited) {
         # Still downloading from Windows Update (started before the install phase). WAIT until it fully
         # finishes - no cap. The background DISM holds the servicing lock, so we do NOT query the feature
         # state while it runs (that can block ON the lock); we just wait for the DISM PROCESS to exit,
         # printing a live one-line heartbeat so the console never looks frozen. On a normal machine this is
-        # seconds; on a WU-throttled box it can be ~30 min (Ctrl+C to skip - /NoRestart means no reboot).
+        # seconds; on a WU-throttled box it can be ~30 min. Ctrl+C stops the run here: the summary is still
+        # written and DISM keeps going on its own (/NoRestart - no surprise reboot).
         # The heartbeat uses Write-Host (console only) so it never spams the log file.
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         while (-not $script:DotNet35Proc.HasExited) {
@@ -1180,7 +1218,7 @@ function Enable-DotNetFeatures {
     } else {
         Write-Log WARN "Failed - .NET 3.5 (DISM finished but the feature is not enabled - see %TEMP%\dism_NetFx3.log)"; $st3 = 'FAILED'
     }
-    $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NetFx3'; Content='.NET 3.5'; Status=$st3; Detail='' })
+    $rec3.Status = $st3
     # .NET 4 is already enabled on Win11 -> record quietly (no console clutter); enable only if somehow off.
     if ((Get-WindowsOptionalFeature -Online -FeatureName 'NetFx4-AdvSrvs' -ErrorAction SilentlyContinue).State -eq 'Enabled') {
         Write-Log DEBUG ".NET 4 already enabled"
@@ -1196,6 +1234,9 @@ function Write-Summary {
     foreach ($g in ($script:Results | Group-Object Status | Sort-Object Name)) {
         Write-Log INFO ("{0,-8}: {1}" -f $g.Name, $g.Count)
     }
+    foreach ($r in ($script:Results | Where-Object { $_.Status -eq 'WARN' })) {
+        Write-Log WARN ("WARN    [{0}] {1} - {2}" -f $r.Phase, $r.Content, $r.Detail)
+    }
     foreach ($r in ($script:Results | Where-Object { $_.Status -eq 'FAILED' })) {
         Write-Log ERROR ("FAILED  [{0}] {1} - {2}" -f $r.Phase, $r.Content, $r.Detail)
     }
@@ -1210,7 +1251,11 @@ function Write-Summary {
         $lines | Out-File -FilePath $resultsFile -Encoding UTF8 -Force
         Write-Log INFO ("results summary: {0}" -f $resultsFile)
     } catch { Write-Log WARN "could not write results file: $($_.Exception.Message)" }
-    Write-Log WARN "A reboot / sign-out is recommended to fully apply the changes."
+    if ($script:DotNet35Proc -and -not $script:DotNet35Proc.HasExited) {
+        Write-Log WARN ".NET 3.5 is still installing in the background - reboot / sign out only after it finishes."
+    } else {
+        Write-Log WARN "A reboot / sign-out is recommended to fully apply the changes."
+    }
 }
 
 function Test-TaskbarPinned {
@@ -1242,6 +1287,20 @@ function Get-PinHelper {
     } catch { Write-Log WARN "could not get the Pin-Taskbar helper: $($_.Exception.Message)"; return $null }
 }
 
+function Invoke-PinHelper {
+    # Run the Pin-Taskbar helper. It reports its own failures through its exit code (0 = OK, 2 = nothing
+    # found to pin/unpin, 3 = failed) - a non-zero exit does NOT throw - so turn it into an exception that the
+    # caller records as FAILED (the helper's internal errors already throw). $LASTEXITCODE is reset first so
+    # an earlier native command's code can't leak in.
+    param([string]$Helper, [string]$Target, [switch]$Unpin)
+    $global:LASTEXITCODE = 0
+    if ($Unpin) { $null = & $Helper $Target -Unpin -Silent } else { $null = & $Helper $Target -Silent }
+    if ($LASTEXITCODE -ne 0) {
+        $why = switch ($LASTEXITCODE) { 2 { 'nothing found to pin/unpin' } 3 { 'pin/unpin failed' } default { 'unexpected' } }
+        throw ("Pin-Taskbar exit code {0} ({1})" -f $LASTEXITCODE, $why)
+    }
+}
+
 function Invoke-TaskbarPins {
     # Pin "This PC" + unpin Edge/Store on the taskbar via the Pin-Taskbar helper. IDEMPOTENT: skips any item
     # already in the desired state, so a re-run doesn't re-pin. The helper is fetched only if something's needed.
@@ -1265,7 +1324,7 @@ function Invoke-TaskbarPins {
             $wsh = New-Object -ComObject WScript.Shell; $sc = $wsh.CreateShortcut($lnk)
             $sc.TargetPath = "$env:SystemRoot\explorer.exe"; $sc.Arguments = 'shell:MyComputerFolder'
             $sc.IconLocation = "$env:SystemRoot\System32\imageres.dll,-109"; $sc.Description = 'This PC'; $sc.Save()
-            & $helper $lnk -Silent
+            Invoke-PinHelper -Helper $helper -Target $lnk
             Write-Log OK "pinned This PC to the taskbar"; $r.Status = 'OK'
         } catch { Write-Log WARN "This PC pin failed: $($_.Exception.Message)"; $r.Detail = $_.Exception.Message }
         $script:Results.Add($r)
@@ -1274,7 +1333,7 @@ function Invoke-TaskbarPins {
     foreach ($app in 'Microsoft Edge', 'Microsoft Store') {
         if (-not (Test-TaskbarPinned $app)) { Write-Log DEBUG "$app already unpinned - skipping"; continue }
         $u = [pscustomobject]@{ Phase='Taskbar'; Id="Unpin.$app"; Content="Unpinned $app from taskbar"; Status='FAILED'; Detail='' }
-        try { & $helper $app -Unpin -Silent; Write-Log OK "unpinned $app from the taskbar"; $u.Status = 'OK' }
+        try { Invoke-PinHelper -Helper $helper -Target $app -Unpin; Write-Log OK "unpinned $app from the taskbar"; $u.Status = 'OK' }
         catch { Write-Log WARN "unpin $app failed: $($_.Exception.Message)"; $u.Detail = $_.Exception.Message }
         $script:Results.Add($u)
     }
@@ -1292,10 +1351,13 @@ function Add-ChromeTaskbarPin {
         if (-not (Test-Path $chromeExe)) { Write-Log DEBUG "Chrome not installed - skipping taskbar pin"; return $false }
         if (Test-TaskbarPinned 'Google Chrome') { Write-Log DEBUG "Google Chrome already pinned - skipping"; return $false }
         $helper = Get-PinHelper
-        if (-not $helper) { return $false }
+        if (-not $helper) {
+            $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Chrome.Pin'; Content='Google Chrome pinned to taskbar'; Status='FAILED'; Detail='no Pin-Taskbar helper' })
+            return $false
+        }
         $lnk = Get-ChildItem "$env:ProgramData\Microsoft\Windows\Start Menu\Programs" -Filter 'Google Chrome.lnk' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
         $target = if ($lnk) { $lnk.FullName } else { $chromeExe }
-        & $helper $target -Silent
+        Invoke-PinHelper -Helper $helper -Target $target
         Write-Log OK "pinned Google Chrome to the taskbar"
         $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Chrome.Pin'; Content='Google Chrome pinned to taskbar'; Status='OK'; Detail='' })
         $pinned = $true
@@ -1331,7 +1393,8 @@ function Show-Intro {
             return
         }
     }
-    # Machine type - gates HP Support Assistant (Laptop only) and Alienware Command Center (PC only).
+    # Machine type - a laptop skips the PC-only tweaks (Ultimate Performance). (HP Support Assistant /
+    # Alienware Command Center go by the actual hardware vendor instead - see Invoke-InstallPhase.)
     if ($Machine -eq 'PC' -or $Machine -eq 'Laptop') {
         $script:MachineType = if ($Machine -eq 'Laptop') { 'Laptop' } else { 'PC' }
     } elseif ([Environment]::UserInteractive) {
@@ -1350,6 +1413,7 @@ function Show-Intro {
 try {
     Show-Intro
     if ($script:Cancelled) { return }   # user answered "n" to Continue
+    $script:RunStarted = $true          # from here on the summary is written - also if the run is stopped (see finally)
     Write-Banner
     if ($script:DryRun) { Write-Log WARN "DRY RUN - no changes will be made." }
     Invoke-Tweaks
@@ -1359,14 +1423,23 @@ try {
     Invoke-InstallPhase       # apps + per-app desktop icons (Chrome is pinned right after it installs, inside this)
     if ($script:ChromePinned -and -not $script:DryRun) { Update-Explorer -Action restart }   # refresh the taskbar to show the Chrome pin
     Enable-DotNetFeatures     # finish .NET 3.5 (usually already done) + .NET 4
-    Write-Summary
-    Write-Log INFO "=========== WIN11-TWEAKS DONE ==========="
-    if ($Reboot -and -not $script:DryRun) {
-        Write-Log WARN "Rebooting in 15s (-Reboot given). Press Ctrl+C to cancel."
-        Start-Sleep -Seconds 15
-        Restart-Computer -Force
-    }
+    $script:RunFinished = $true
 }
 finally {
+    # The summary is written HERE so it also lands when the run is stopped early with Ctrl+C - e.g. during
+    # the .NET 3.5 wait, which then simply keeps installing in the background (/NoRestart).
+    if ($script:RunStarted) {
+        if (-not $script:RunFinished) {
+            Write-Host ''   # end the line - Ctrl+C can land mid-heartbeat (.NET 3.5 wait), which never printed its newline
+            Write-Log WARN "Stopped early - this summary only covers what ran."
+        }
+        Write-Summary
+        Write-Log INFO ("=========== WIN11-TWEAKS {0} ===========" -f $(if ($script:RunFinished) { 'DONE' } else { 'STOPPED' }))
+    }
     try { Stop-Transcript | Out-Null } catch { }
+}
+if ($script:RunFinished -and $Reboot -and -not $script:DryRun) {
+    Write-Log WARN "Rebooting in 15s (-Reboot given). Press Ctrl+C to cancel."
+    Start-Sleep -Seconds 15
+    Restart-Computer -Force
 }

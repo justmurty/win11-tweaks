@@ -420,7 +420,11 @@ $script:Tweaks = @(
               $bw.Write([int32]40); $bw.Write([int32]$w); $bw.Write([int32]($w * 2))          # BITMAPINFOHEADER
               $bw.Write([int16]1); $bw.Write([int16]32); $bw.Write([int32]0)
               $bw.Write([int32]0); $bw.Write([int32]0); $bw.Write([int32]0); $bw.Write([int32]0); $bw.Write([int32]0)
-              $bw.Write((New-Object 'byte[]' ($w * $w * 4)))                                   # XOR bitmap: all zero = alpha 0
+              # XOR bitmap: black pixels with alpha 1 (of 255) - invisible, but NOT all-zero: Windows treats a
+              # 32bpp image whose alpha is ALL 0 as old-style "0RGB" (no alpha), and Explorer then draws it
+              # OPAQUE at bigger icon sizes / high DPI -> a black square on every shortcut.
+              $xor = New-Object 'byte[]' ($w * $w * 4); for ($j = 3; $j -lt $xor.Length; $j += 4) { $xor[$j] = 1 }
+              $bw.Write($xor)
               $andBytes = New-Object 'byte[]' ($andRow * $w); for ($j = 0; $j -lt $andBytes.Length; $j++) { $andBytes[$j] = 0xFF }
               $bw.Write($andBytes)                                                              # AND mask: all 1s = transparent (all-0 would render a BLACK box)
               $bw.Flush(); $imgData += ,($ms.ToArray()); $bw.Dispose(); $ms.Dispose()

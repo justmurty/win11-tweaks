@@ -15,9 +15,9 @@ console **and** a file so the run can be reviewed afterwards.
   [`docs/2026-07-11-win11-tweaks-design.md`](docs/2026-07-11-win11-tweaks-design.md).
 - Shows the **MSUHost banner**, asks **`Continue? (Y/n)`** and **`PC or Laptop?`** (`1` PC / `2` Laptop).
   On a laptop the **Ultimate Performance** power plan is skipped (it keeps the CPU from idling —
-  heat and battery drain).
+  heat and battery drain) and **NZXT CAM** isn't installed (it's for desktop NZXT coolers/cases).
 - Then the **install phase**: **12 Visual C++ redists** + **15 winget apps**
-  (incl. VLC, Lightshot, TurboTop, WinRAR) + **6 direct-download**
+  (incl. VLC, Lightshot, TurboTop, WinRAR; NZXT CAM on a PC only) + **6 direct-download**
   (**Google Chrome**, **NVIDIA App** only if an NVIDIA GPU is present, **Bitwarden**, **Parsec**,
   **Google Play Games**, **FL Studio**) + **Alienware Command Center**, installed automatically
   (no prompt) only on Alienware / Dell G-series hardware, desktop or laptop. It also applies the
@@ -93,7 +93,7 @@ default Windows 11 shell use; PowerShell 7 has an open bug where Ctrl+C can skip
 | `-DryRun` | Log what it WOULD do, change **nothing**. Run this first. |
 | (none) | Actually apply the tweaks + install the apps. |
 | `-Detailed` | Verbose console output (the log file is always full). |
-| `-Machine PC\|Laptop` | Skip the "PC or Laptop?" question (`Laptop` skips Ultimate Performance). |
+| `-Machine PC\|Laptop` | Skip the "PC or Laptop?" question (`Laptop` skips Ultimate Performance and NZXT CAM). |
 | `-Reboot` | Reboot 15s after finishing (cancel with Ctrl+C). |
 | `-LogDir <path>` | Different folder for the log (default: the script's folder). |
 

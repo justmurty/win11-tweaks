@@ -19,9 +19,9 @@
 
 .PARAMETER Machine
     'PC' or 'Laptop'. Skips the interactive "PC or Laptop?" question at startup. A laptop skips
-    the PC-only Ultimate Performance power plan. (Alienware Command Center goes by the actual
-    hardware, not by this answer.) If omitted: ask interactively, or default to 'PC' when
-    non-interactive.
+    the PC-only items: the Ultimate Performance power plan and NZXT CAM. (Alienware Command Center
+    goes by the actual hardware, not by this answer.) If omitted: ask interactively, or default
+    to 'PC' when non-interactive.
 
 .PARAMETER LogDir
     Directory for the log file. Default: the script's own folder (fallback: Desktop
@@ -53,7 +53,7 @@ $script:Detailed             = [bool]$Detailed
 $script:NeedExplorerRestart  = $false
 $script:NeedIconCacheClear   = $false
 $script:Cancelled            = $false   # set by Show-Intro if the user answers "n" (avoids `exit`, which kills an iex host)
-$script:MachineType          = ''      # 'PC' or 'Laptop' - resolved in Show-Intro; a laptop skips the PC-only tweaks
+$script:MachineType          = ''      # 'PC' or 'Laptop' - resolved in Show-Intro; a laptop skips the PC-only tweaks/apps
 $script:WarnCount            = 0       # WARN lines logged so far - a tweak that logs one is reported WARN, not OK
 $script:RunStarted           = $false  # past the intro -> Main's finally writes the summary (also after Ctrl+C)
 $script:RunFinished          = $false  # got to the end without being stopped
@@ -861,6 +861,11 @@ $script:AppsToInstall = @(
 $script:VendorApps = @(
     @{ Id='9PMHP03NJ9QP'; Name='Alienware Command Center'; Vendor='Alienware/Dell G'; Hardware='Alienware|^Dell\b.*\bG\d{1,2}\s+\d{4}\b'; Source='msstore' }
 )
+# Apps for ONE machine type only (the "PC or Laptop?" answer) - skipped on the other, like the Machine='PC'
+# tweaks. Keyed by winget ID.
+$script:AppMachine = @{
+    'NZXT.CAM' = 'PC'   # NZXT coolers / fans / cases - a desktop thing
+}
 # Per-app install location for packages whose winget manifest REQUIRES one (otherwise
 # winget prompts "Specify the install root:" and blocks the run). Add IDs here as needed.
 $script:AppLocations = @{
@@ -1122,6 +1127,13 @@ function Invoke-InstallPhase {
             $script:Results.Add([pscustomobject]@{ Phase='VCRedist'; Id=$id; Content=$id; Status=$st; Detail='' })
         }
         foreach ($id in $script:AppsToInstall) {
+            $only = $script:AppMachine[$id]
+            if ($only -and $only -ne $script:MachineType) {   # e.g. NZXT CAM is PC only
+                $label = if ($script:AppNames.ContainsKey($id)) { $script:AppNames[$id] } else { $id }
+                Write-Log INFO ("Skipping {0} ({1} only)" -f $label, $only)
+                $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status='SKIPPED'; Detail="$only only" })
+                continue
+            }
             $st = Install-App -Id $id -Location $script:AppLocations[$id] -DetectName $script:AppDetectNames[$id]
             $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status=$st; Detail='' })
             if ($st -ne 'FAILED' -and $script:DesktopShortcutApps.ContainsKey($id)) { $sc = $script:DesktopShortcutApps[$id]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
@@ -1398,8 +1410,8 @@ function Show-Intro {
             return
         }
     }
-    # Machine type - a laptop skips the PC-only tweaks (Ultimate Performance). (Alienware Command Center
-    # goes by the actual hardware instead - see Invoke-InstallPhase.)
+    # Machine type - a laptop skips the PC-only items (Ultimate Performance, NZXT CAM). (Alienware Command
+    # Center goes by the actual hardware instead - see Invoke-InstallPhase.)
     if ($Machine -eq 'PC' -or $Machine -eq 'Laptop') {
         $script:MachineType = if ($Machine -eq 'Laptop') { 'Laptop' } else { 'PC' }
     } elseif ([Environment]::UserInteractive) {

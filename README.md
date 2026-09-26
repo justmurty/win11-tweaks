@@ -19,9 +19,9 @@ console **and** a file so the run can be reviewed afterwards.
 - Then the **install phase**: **12 Visual C++ redists** + **15 winget apps**
   (incl. VLC, Lightshot, TurboTop, WinRAR) + **6 direct-download**
   (**Google Chrome**, **NVIDIA App** only if an NVIDIA GPU is present, **Bitwarden**, **Parsec**,
-  **Google Play Games**, **FL Studio**) + **vendor apps**, installed automatically (no prompt) only
-  on that vendor's hardware, desktop or laptop: **HP Support Assistant** on HP, **Alienware Command
-  Center** on Alienware / Dell G-series. It also applies the **WinRAR license** and enables **.NET 3.5**
+  **Google Play Games**, **FL Studio**) + **Alienware Command Center**, installed automatically
+  (no prompt) only on Alienware / Dell G-series hardware, desktop or laptop. It also applies the
+  **WinRAR license** and enables **.NET 3.5**
   (incl. 2.0/3.0) **and .NET 4** via DISM (like "Turn Windows features on/off").
 - **Pins "This PC"** and **Google Chrome** to the taskbar (via a temporary helper that is deleted
   afterwards), and unpins Microsoft Edge + Microsoft Store.

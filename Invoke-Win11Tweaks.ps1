@@ -19,9 +19,9 @@
 
 .PARAMETER Machine
     'PC' or 'Laptop'. Skips the interactive "PC or Laptop?" question at startup. A laptop skips
-    the PC-only Ultimate Performance power plan. (HP Support Assistant / Alienware Command Center
-    go by the actual hardware vendor, not by this answer.) If omitted: ask interactively, or
-    default to 'PC' when non-interactive.
+    the PC-only Ultimate Performance power plan. (Alienware Command Center goes by the actual
+    hardware, not by this answer.) If omitted: ask interactively, or default to 'PC' when
+    non-interactive.
 
 .PARAMETER LogDir
     Directory for the log file. Default: the script's own folder (fallback: Desktop
@@ -853,15 +853,13 @@ $script:AppsToInstall = @(
 )
 # Vendor apps: installed AUTOMATICALLY - no y/N prompt - but ONLY on that vendor's hardware, desktop or
 # laptop alike (Hardware is a regex against Win32_ComputerSystem "<Manufacturer> <Model>"):
-#   HP Support Assistant     -> HP machines.
 #   Alienware Command Center -> Alienware / Dell G-series (msstore - the Store only offers it there; if the
 #                               Store install fails, Install-Alienware falls back to Dell's direct installer).
 #                               Older G models have no "Dell " in the model ("Dell Inc. G5 5500"), newer ones
 #                               do ("Dell Inc. Dell G15 5511") - hence "Dell ... G<n> <4 digits>".
-# (AnyDesk removed per user request.)
+# (AnyDesk and HP Support Assistant removed per user request.)
 $script:VendorApps = @(
-    @{ Id='HPInc.HPSupportAssistant'; Name='HP Support Assistant';     Vendor='HP';               Hardware='^(HP|Hewlett)\b' },
-    @{ Id='9PMHP03NJ9QP';             Name='Alienware Command Center'; Vendor='Alienware/Dell G'; Hardware='Alienware|^Dell\b.*\bG\d{1,2}\s+\d{4}\b'; Source='msstore' }
+    @{ Id='9PMHP03NJ9QP'; Name='Alienware Command Center'; Vendor='Alienware/Dell G'; Hardware='Alienware|^Dell\b.*\bG\d{1,2}\s+\d{4}\b'; Source='msstore' }
 )
 # Per-app install location for packages whose winget manifest REQUIRES one (otherwise
 # winget prompts "Specify the install root:" and blocks the run). Add IDs here as needed.
@@ -1145,7 +1143,7 @@ function Invoke-InstallPhase {
     # (WinRAR license is created right after WinRAR installs, in the loop above - see Set-WinRarLicense.)
 
     # Vendor apps LAST - auto-installed (no prompt) ONLY on that vendor's hardware, desktop or laptop alike:
-    #   HP Support Assistant -> HP;  Alienware Command Center -> Alienware / Dell G-series.
+    #   Alienware Command Center -> Alienware / Dell G-series.
     $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
     $hw = ("{0} {1}" -f $cs.Manufacturer, $cs.Model).Trim()
     foreach ($a in $script:VendorApps) {
@@ -1400,8 +1398,8 @@ function Show-Intro {
             return
         }
     }
-    # Machine type - a laptop skips the PC-only tweaks (Ultimate Performance). (HP Support Assistant /
-    # Alienware Command Center go by the actual hardware vendor instead - see Invoke-InstallPhase.)
+    # Machine type - a laptop skips the PC-only tweaks (Ultimate Performance). (Alienware Command Center
+    # goes by the actual hardware instead - see Invoke-InstallPhase.)
     if ($Machine -eq 'PC' -or $Machine -eq 'Laptop') {
         $script:MachineType = if ($Machine -eq 'Laptop') { 'Laptop' } else { 'PC' }
     } elseif ([Environment]::UserInteractive) {

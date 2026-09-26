@@ -1077,8 +1077,9 @@ function Set-WinRarLicense {
         catch { Write-Log DEBUG "place failed in ${dir}: $($_.Exception.Message)" }
     }
     $st = if ($placed) { 'OK' } else { 'FAILED' }   # OK only if the key actually landed somewhere
-    if ($placed) { Write-Log OK "Done!" } else { Write-Log WARN "Failed - WinRAR license (could not write rarreg.key)" }
-    $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status=$st; Detail='' })
+    $why = if ($placed) { '' } else { 'could not write rarreg.key' }
+    if ($placed) { Write-Log OK "Done!" } else { Write-Log WARN "Failed - WinRAR license ($why)" }
+    $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status=$st; Detail=$why })
 }
 
 function Install-Alienware {
@@ -1312,7 +1313,8 @@ function Invoke-PinHelper {
     if ($Unpin) { $helperArgs += '-Unpin' }
     $out = & $ps @helperArgs 2>&1   # it runs -Silent, so anything it prints is an error message - kept for the log
     if ($LASTEXITCODE -ne 0) {
-        @($out) | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Select-Object -Last 5 | ForEach-Object { Write-Log DEBUG "  pin-helper> $_" }
+        # FIRST lines: a crash prints the message first, then "At ...", code context, CategoryInfo, ErrorId
+        @($out) | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Select-Object -First 10 | ForEach-Object { Write-Log DEBUG "  pin-helper> $_" }
         $why = switch ($LASTEXITCODE) { 2 { 'nothing found to pin/unpin' } 3 { 'pin/unpin failed' } default { 'helper error' } }
         throw ("Pin-Taskbar exit code {0} ({1})" -f $LASTEXITCODE, $why)
     }

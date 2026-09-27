@@ -6,7 +6,7 @@
     console AND a file so the run can be reviewed afterwards.
 
 .DESCRIPTION
-    The 51 tweaks (25 standard + 26 custom) and the install list are a fixed, curated set
+    The 53 tweaks (25 standard + 28 custom) and the install list are a fixed, curated set
     (see docs/2026-07-11-win11-tweaks-design.md). Only the ON toggles / checked items are
     applied; nothing else is touched.
     The script makes NO restore point and does NOT reboot unless -Reboot is given.
@@ -19,8 +19,9 @@
 
 .PARAMETER Machine
     'PC' or 'Laptop'. Skips the interactive "PC or Laptop?" question at startup. A laptop skips
-    the PC-only items: the Ultimate Performance power plan, hibernation off and NZXT CAM; a PC skips
-    the laptop-only "no network while asleep on battery". (Alienware Command Center goes by the actual
+    the PC-only items: the Ultimate Performance power plan (a laptop gets Ultimate on the charger +
+    Balanced on battery instead), hibernation off, the highest monitor refresh rate and NZXT CAM; a PC
+    skips the laptop-only items (that power plan, no network while asleep on battery). (Alienware Command Center goes by the actual
     hardware, not by this answer.) If omitted: ask interactively, or default to 'PC' when non-interactive.
 
 .PARAMETER LogDir
@@ -330,6 +331,157 @@ function Clear-StartPins {
     if ($changed) { Get-Process StartMenuExperienceHost -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
 }
 
+function Initialize-NativeW11T {
+    # Screen modes (user32) and power-plan values (powrprof) for the refresh-rate and laptop-power tweaks. Once per session.
+    if ('W11T.Power' -as [type]) { return }
+    Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+namespace W11T {
+    public static class Display {
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct DEVMODE {
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+            public short dmSpecVersion; public short dmDriverVersion; public short dmSize; public short dmDriverExtra;
+            public int dmFields; public int dmPositionX; public int dmPositionY; public int dmDisplayOrientation; public int dmDisplayFixedOutput;
+            public short dmColor; public short dmDuplex; public short dmYResolution; public short dmTTOption; public short dmCollate;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+            public short dmLogPixels; public int dmBitsPerPel; public int dmPelsWidth; public int dmPelsHeight;
+            public int dmDisplayFlags; public int dmDisplayFrequency; public int dmICMMethod; public int dmICMIntent;
+            public int dmMediaType; public int dmDitherType; public int dmReserved1; public int dmReserved2;
+            public int dmPanningWidth; public int dmPanningHeight;
+        }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct DISPLAY_DEVICE {
+            public int cb;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
+            public int StateFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey;
+        }
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplayDevices(string device, int index, ref DISPLAY_DEVICE dd, int flags);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplaySettings(string device, int mode, ref DEVMODE dm);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int ChangeDisplaySettingsEx(string device, ref DEVMODE dm, IntPtr hwnd, int flags, IntPtr param);
+
+        // "device|monitor|current Hz|highest Hz" per screen on the desktop. Highest = among the modes Windows lists for
+        // that monitor (only modes it reports) at the CURRENT resolution and colour depth, not interlaced.
+        public static string[] List() {
+            List<string> res = new List<string>();
+            for (int i = 0; ; i++) {
+                DISPLAY_DEVICE dd = new DISPLAY_DEVICE(); dd.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+                if (!EnumDisplayDevices(null, i, ref dd, 0)) break;
+                if ((dd.StateFlags & 1) == 0) continue;                                   // not on the desktop
+                DEVMODE cur = new DEVMODE(); cur.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+                if (!EnumDisplaySettings(dd.DeviceName, -1, ref cur)) continue;          // ENUM_CURRENT_SETTINGS
+                int best = cur.dmDisplayFrequency;
+                DEVMODE m = new DEVMODE(); m.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+                for (int n = 0; EnumDisplaySettings(dd.DeviceName, n, ref m); n++) {
+                    if (m.dmPelsWidth == cur.dmPelsWidth && m.dmPelsHeight == cur.dmPelsHeight && m.dmBitsPerPel == cur.dmBitsPerPel
+                        && (m.dmDisplayFlags & 2) == 0 && m.dmDisplayFrequency > best) best = m.dmDisplayFrequency;
+                }
+                DISPLAY_DEVICE mon = new DISPLAY_DEVICE(); mon.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+                string name = EnumDisplayDevices(dd.DeviceName, 0, ref mon, 0) ? mon.DeviceString : dd.DeviceString;
+                res.Add(dd.DeviceName + "|" + name + "|" + cur.dmDisplayFrequency + "|" + best);
+            }
+            return res.ToArray();
+        }
+        // One screen to hz at its current resolution: tested first, then applied and saved. 0 = done, 1 = after a restart.
+        public static int SetRate(string device, int hz) {
+            DEVMODE dm = new DEVMODE(); dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+            if (!EnumDisplaySettings(device, -1, ref dm)) return -5;
+            dm.dmDisplayFrequency = hz; dm.dmFields = 0x400000;                           // DM_DISPLAYFREQUENCY
+            int rc = ChangeDisplaySettingsEx(device, ref dm, IntPtr.Zero, 2, IntPtr.Zero);  // CDS_TEST
+            if (rc != 0) return rc;
+            return ChangeDisplaySettingsEx(device, ref dm, IntPtr.Zero, 1, IntPtr.Zero);   // CDS_UPDATEREGISTRY
+        }
+    }
+    public static class Power {
+        [DllImport("powrprof.dll")] static extern uint PowerEnumerate(IntPtr root, ref Guid scheme, IntPtr sub, int flags, uint index, byte[] buffer, ref uint size);
+        [DllImport("powrprof.dll", EntryPoint = "PowerEnumerate")] static extern uint PowerEnumerateIn(IntPtr root, ref Guid scheme, ref Guid sub, int flags, uint index, byte[] buffer, ref uint size);
+        [DllImport("powrprof.dll")] static extern uint PowerReadDCValueIndex(IntPtr root, ref Guid scheme, ref Guid sub, ref Guid setting, out uint value);
+        [DllImport("powrprof.dll")] static extern uint PowerWriteDCValueIndex(IntPtr root, ref Guid scheme, ref Guid sub, ref Guid setting, uint value);
+        // Every battery (DC) value of plan "from" written into plan "to"; returns how many.
+        public static int CopyDc(Guid from, Guid to) {
+            int copied = 0; byte[] buf = new byte[16];
+            for (uint i = 0; ; i++) {
+                uint size = 16;
+                if (PowerEnumerate(IntPtr.Zero, ref from, IntPtr.Zero, 17, i, buf, ref size) != 0) break;        // ACCESS_SUBGROUP
+                Guid sub = new Guid(buf);
+                for (uint j = 0; ; j++) {
+                    uint s2 = 16;
+                    if (PowerEnumerateIn(IntPtr.Zero, ref from, ref sub, 18, j, buf, ref s2) != 0) break;       // ACCESS_INDIVIDUAL_SETTING
+                    Guid setting = new Guid(buf);
+                    uint v;
+                    if (PowerReadDCValueIndex(IntPtr.Zero, ref from, ref sub, ref setting, out v) == 0 &&
+                        PowerWriteDCValueIndex(IntPtr.Zero, ref to, ref sub, ref setting, v) == 0) copied++;
+                }
+            }
+            return copied;
+        }
+    }
+}
+'@
+}
+
+function Get-DisplayRates {
+    # Every screen on the desktop: device, monitor name, current Hz, highest Hz Windows offers at the current resolution.
+    Initialize-NativeW11T
+    foreach ($l in [W11T.Display]::List()) {
+        $p = $l -split '\|'
+        [pscustomobject]@{ Device = $p[0]; Name = $p[1]; Hz = [int]$p[2]; MaxHz = [int]$p[3] }
+    }
+}
+
+function Set-DisplayRate {
+    # One screen to $Hz (tested, then saved); returns Windows' DISP_CHANGE code (0 = done, 1 = after a restart).
+    param([string]$Device, [int]$Hz)
+    Initialize-NativeW11T
+    return [W11T.Display]::SetRate($Device, $Hz)
+}
+
+function Set-MaxRefreshRate {
+    # A 144 / 165 Hz monitor often comes set to 60 Hz: every screen to the highest refresh rate Windows offers for it at
+    # its current resolution. Only modes the monitor reports are listed, and each switch is tested before it is saved.
+    param([string]$Id = '')
+    foreach ($d in @(Get-DisplayRates)) {
+        $label = if ($d.Name) { $d.Name } else { $d.Device }
+        if ($d.MaxHz -le $d.Hz) { Write-Log DEBUG ("{0}: already at its highest refresh rate ({1} Hz)" -f $label, $d.Hz) $Id; continue }
+        $rc = Set-DisplayRate -Device $d.Device -Hz $d.MaxHz
+        if ($rc -eq 0 -or $rc -eq 1) { Write-Log INFO ("{0}: {1} Hz -> {2} Hz{3}" -f $label, $d.Hz, $d.MaxHz, $(if ($rc -eq 1) { ' (after a restart)' })) $Id }
+        else { Write-Log WARN ("{0}: could not switch to {1} Hz (Windows answered {2}) - it stays at {3} Hz" -f $label, $d.MaxHz, $rc, $d.Hz) $Id }
+    }
+}
+
+function Copy-PowerDcValues {
+    # Every battery (DC) value of plan $From into plan $To (GUIDs); returns how many were copied.
+    param([string]$From, [string]$To)
+    Initialize-NativeW11T
+    return [W11T.Power]::CopyDc([guid]$From, [guid]$To)
+}
+
+function Set-LaptopPowerPlan {
+    # Laptop: ONE plan that is Ultimate Performance on the charger and Balanced on battery - a copy of Ultimate
+    # Performance whose battery (DC) values are Balanced's, so Windows switches by itself when the cable comes out.
+    # A re-run finds it by its name (no second copy) and refreshes the battery values.
+    param([string]$Id = '')
+    $name = 'Ultimate + Balanced on battery'
+    $balanced = '381b4222-f694-41f0-9685-ff5bb260df2e'
+    $g = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    $guid = [regex]::Match((powercfg -list | Out-String), ("(?i)($g)\s*\(" + [regex]::Escape($name) + '\)')).Groups[1].Value
+    if (-not $guid) {
+        $out = (powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 2>&1 | Out-String)
+        $guid = [regex]::Match($out, "(?i)$g").Value   # the NEW plan's GUID
+        if (-not $guid) { throw ("could not copy the Ultimate Performance plan: {0}" -f $out.Trim()) }
+        $null = powercfg -changename $guid $name 'win11-tweaks: Ultimate Performance when plugged in, Balanced on battery'
+    }
+    $n = Copy-PowerDcValues -From $balanced -To $guid
+    $null = powercfg -setactive $guid
+    if ($LASTEXITCODE -ne 0) { throw ("powercfg -setactive {0} failed (exit code {1})" -f $guid, $LASTEXITCODE) }
+    Write-Log DEBUG ("power plan '{0}' ({1}) active - {2} battery settings taken from Balanced" -f $name, $guid, $n) $Id
+}
+
 function Test-KeepLegacyPlayer {
     # Windows Media Player Legacy is the last video player on the PC when a New user said n to VLC AND to keeping
     # Media Player - then it stays. (Gele always gets VLC.)
@@ -554,8 +706,8 @@ function Enable-Feature {
 }
 
 # --------------------------------------------------------------------------------------
-#  The tweaks - 51 total: 25 standard Win11 tweaks (values verbatim, except where a comment
-#  says why) + 26 custom at the end. Toggles apply their ON value only. No restore point
+#  The tweaks - 53 total: 25 standard Win11 tweaks (values verbatim, except where a comment
+#  says why) + 28 custom at the end. Toggles apply their ON value only. No restore point
 #  (removed per user request). A tweak with Late=$true runs after the installs (Main).
 # --------------------------------------------------------------------------------------
 $script:Tweaks = @(
@@ -923,8 +1075,8 @@ $script:Tweaks = @(
       }
   }}
 
-  # Ultimate Performance power plan - max performance, then ACTIVATE it. PC only (Machine='PC'): skipped on
-  # a laptop, where it keeps the CPU from idling (heat + battery drain).
+  # Ultimate Performance power plan - max performance, then ACTIVATE it. PC only (Machine='PC'): a laptop gets
+  # CustomLaptopPower instead (Ultimate on the charger only - on battery it would keep the CPU from idling).
   [pscustomobject]@{ Id='CustomUltimatePerf'; Content='Ultimate Performance - power plan'; Category='Custom'; Machine='PC'; Apply={
       Invoke-Step -Id 'CustomUltimatePerf' -Description 'enable + activate Ultimate Performance power plan' -Action {
           # Reuse an existing Ultimate Performance plan if present (no duplicates on re-run); else create one.
@@ -937,6 +1089,12 @@ $script:Tweaks = @(
           powercfg -setactive $guid
           Write-Log DEBUG ("active scheme -> {0}" -f ((powercfg -getactivescheme | Out-String).Trim())) 'CustomUltimatePerf'
       }
+  }}
+
+  # Laptop power (superuser, 2026-09-27): Ultimate Performance on the charger, Balanced on battery - ONE plan, so
+  # Windows switches by itself when the cable comes out (see Set-LaptopPowerPlan). A PC keeps plain Ultimate.
+  [pscustomobject]@{ Id='CustomLaptopPower'; Content='Power plan - Ultimate on the charger, Balanced on battery'; Category='Custom'; Machine='Laptop'; Apply={
+      Invoke-Step -Id 'CustomLaptopPower' -Description 'power plan: Ultimate Performance on the charger, Balanced on battery' -Action { Set-LaptopPowerPlan -Id 'CustomLaptopPower' }
   }}
 
   # Memory Integrity (HVCI) / VBS - disable it for gaming. Win11's Core Isolation "Memory Integrity"
@@ -1243,6 +1401,14 @@ $script:Tweaks = @(
           Remove-WinCapability -Id $id -Name 'Media.WindowsMediaPlayer' -Label 'Windows Media Player Legacy'
           Disable-WinFeature   -Id $id -Name 'WindowsMediaPlayer' -Label 'Windows Media Player Legacy (feature)'
       }
+  }}
+
+  # Monitors (superuser, 2026-09-27): a 144 / 165 Hz monitor often comes set to 60 Hz - every screen to its highest
+  # refresh rate (see Set-MaxRefreshRate). PC only: a laptop's own panel stays as its maker set it (more Hz = less
+  # battery). LATE: without the real GPU driver Windows offers 60 Hz only, and that driver often arrives from Windows
+  # Update while the apps install. (Re-run the script after the driver if a screen stayed at 60 Hz.)
+  [pscustomobject]@{ Id='CustomMaxRefreshRate'; Content='Monitors - highest refresh rate (e.g. 144 / 165 Hz)'; Category='Custom'; Machine='PC'; Late=$true; Apply={
+      Invoke-Step -Id 'CustomMaxRefreshRate' -Description 'every screen to its highest refresh rate at the current resolution' -Action { Set-MaxRefreshRate -Id 'CustomMaxRefreshRate' }
   }}
 
   # VBScript (51) - deprecated, Microsoft is phasing it out. LATE: removed after the app installs, in case an

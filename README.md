@@ -7,8 +7,9 @@ console **and** a file so the run can be reviewed afterwards.
 
 ## What it does
 
-- **51 tweaks** — 25 standard (Essential + Advanced + Customize Preferences toggles) + 26
-  custom (shortcut-arrow off, Spotlight off + default wallpaper, Ultimate Performance (PC only),
+- **53 tweaks** — 25 standard (Essential + Advanced + Customize Preferences toggles) + 28
+  custom (shortcut-arrow off, Spotlight off + default wallpaper, **Ultimate Performance** on a PC — on a
+  laptop **Ultimate on the charger, Balanced on battery** (one plan, it switches by itself),
   **Memory Integrity / VBS off** for gaming, mouse acceleration off, DNS → Cloudflare,
   Explorer → This PC, taskbar cleanup (Search / Task view / Widgets / Chat / Resume off),
   **web/Bing, Store, highlights and cloud results in Start search off**, remove the Edge desktop
@@ -42,15 +43,19 @@ console **and** a file so the run can be reviewed afterwards.
   - **Copilot** "share" button on taskbar previews and Click to Do off; **Windows Error Reporting** off;
     the **Sticky / Filter / Toggle Keys** pop-ups (5× Shift in a game) off; **no automatic restart**
     while someone is signed in; **hibernation off** on a PC (frees `hiberfil.sys`); **no network while
-    asleep on battery** on a laptop.
+    asleep on battery** on a laptop;
+  - **monitors on their highest refresh rate** (a 144 / 165 Hz monitor often comes set to 60 Hz) — on a PC,
+    at the very end: without the real GPU driver Windows only offers 60 Hz, and that driver often arrives from
+    Windows Update during the run (if a screen stayed at 60 Hz, run the script again once the driver is in).
 
   Fixed in v1.6.0: Activity History no longer breaks the clipboard history (Win+V), Get Help stays
   (the Settings troubleshooters need it), "ConsumerFeatures" now also works on Pro. Details:
   [`docs/2026-07-11-win11-tweaks-design.md`](docs/2026-07-11-win11-tweaks-design.md).
 - Shows the **MSUHost banner**, asks **`Continue? (Y/n)`**, then two small menus (one option per line,
   answered with `Select [1/2]`). **`Is this a PC or a Laptop?`** — `[1] PC` / `[2] Laptop`.
-  On a laptop the **Ultimate Performance** power plan is skipped (it keeps the CPU from idling —
-  heat and battery drain) and **NZXT CAM** isn't installed (it's for desktop NZXT coolers/cases).
+  On a laptop the power plan is **Ultimate on the charger, Balanced on battery** (plain Ultimate would
+  keep the CPU from idling on battery), hibernation and the panel's refresh rate stay as they are, and
+  **NZXT CAM** isn't installed (it's for desktop NZXT coolers/cases).
 - Then **`[1] Gele, is that you?`** / **`[2] New user`**. `1`: the full app set, as always. `2`: one **`(Y/n)`**
   question per app (Enter = yes) before anything is downloaded; after the last answer the run goes on
   by itself and installs only the picked apps (the rest show as SKIPPED "not selected"). Visual C++,
@@ -136,7 +141,7 @@ default Windows 11 shell use; PowerShell 7 has an open bug where Ctrl+C can skip
 | `-DryRun` | Log what it WOULD do, change **nothing**. Run this first. |
 | (none) | Actually apply the tweaks + install the apps. |
 | `-Detailed` | Verbose console output (the log file is always full). |
-| `-Machine PC\|Laptop` | Skip the "PC or Laptop?" question (`Laptop` skips Ultimate Performance, hibernation off and NZXT CAM; `PC` skips the battery-sleep tweak). |
+| `-Machine PC\|Laptop` | Skip the "PC or Laptop?" question (`Laptop`: Ultimate only on the charger, keeps hibernation and the panel's refresh rate, no NZXT CAM; `PC`: plain Ultimate, no battery tweaks). |
 | `-Reboot` | Reboot 15s after finishing (cancel with Ctrl+C). |
 | `-LogDir <path>` | Different folder for the log (default: the script's folder). |
 

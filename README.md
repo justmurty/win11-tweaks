@@ -7,11 +7,45 @@ console **and** a file so the run can be reviewed afterwards.
 
 ## What it does
 
-- **35 tweaks** — 25 standard (Essential + Advanced + Customize Preferences toggles) + 10
+- **51 tweaks** — 25 standard (Essential + Advanced + Customize Preferences toggles) + 26
   custom (shortcut-arrow off, Spotlight off + default wallpaper, Ultimate Performance (PC only),
   **Memory Integrity / VBS off** for gaming, mouse acceleration off, DNS → Cloudflare,
   Explorer → This PC, taskbar cleanup (Search / Task view / Widgets / Chat / Resume off),
-  **web/Bing + Store search in Start off**, remove the Edge desktop shortcut). Details:
+  **web/Bing, Store, highlights and cloud results in Start search off**, remove the Edge desktop
+  shortcut, and since v1.6.0:
+  - **tips, suggestions and ads off** — Start (tips / promoted apps, account nags, the phone panel),
+    "Let's finish setting up your device", the welcome page after updates, suggestions in Settings,
+    ad and backup-nag notifications, OneDrive banners in Explorer, feedback surveys, the Settings
+    **Home page** (Game Pass / Microsoft 365 cards; Settings opens on System);
+  - **Start's pinned ads cleared** (an empty Start layout — once per profile, a re-run keeps your pins);
+  - **lock screen** without Spotlight pictures, fun facts or widgets;
+  - **more apps removed** — Widgets (the whole app, not just the button), Phone Link + Cross Device,
+    dead Microsoft apps (Cortana, Maps, Mail and Calendar, Skype, 3D Viewer, Mixed Reality Portal, the old
+    Xbox Console Companion), and on the **first run only** promo apps (Spotify, Disney+, TikTok,
+    Instagram, Facebook, LinkedIn, Candy Crush, Prime Video, Family Safety, Movies & TV) — a re-run
+    leaves Store apps you installed since alone; **OEM trialware** Store apps (McAfee, Dropbox and
+    Booking.com promos, HP / Dell / ASUS promo apps — hardware tools stay); desktop McAfee / Norton /
+    ExpressVPN have no silent uninstall, so the summary lists them WARN with the tool that removes them;
+  - removed apps **stay removed** (Windows Update's reinstall entries for the new Outlook, Dev Home and
+    Cross Device are deleted);
+  - **old components removed** — Steps Recorder, Math Recognizer, Internet Explorer mode, PowerShell ISE,
+    Print Management, Work Folders, Windows Media Player Legacy (kept when it is the only video player),
+    and **VBScript** at the very end, after the installs (command-line activation with `slmgr.vbs` needs
+    it — activate in Settings, or add it back under Optional features);
+  - **Edge** doesn't preload or run after it's closed, downloads no local AI model, no news / promo
+    tabs / default-browser and sign-in nags / sidebar;
+  - **rarely used services to Manual** — Fax, Downloaded Maps Manager, Retail Demo, Phone Service, Mobile
+    Hotspot, Geolocation, Parental Controls, Assigned Access Manager, Windows Insider, Payments and NFC,
+    Wallet, Distributed Link Tracking, WAP Push, Smart Card, Remote Desktop (+ Configuration, UserMode
+    Port Redirector), Telephony, TCP/IP NetBIOS Helper; **Disabled**: Connected User Experiences and
+    Telemetry, Routing and Remote Access (a service that is Disabled is never raised to Manual);
+  - **Copilot** "share" button on taskbar previews and Click to Do off; **Windows Error Reporting** off;
+    the **Sticky / Filter / Toggle Keys** pop-ups (5× Shift in a game) off; **no automatic restart**
+    while someone is signed in; **hibernation off** on a PC (frees `hiberfil.sys`); **no network while
+    asleep on battery** on a laptop.
+
+  Fixed in v1.6.0: Activity History no longer breaks the clipboard history (Win+V), Get Help stays
+  (the Settings troubleshooters need it), "ConsumerFeatures" now also works on Pro. Details:
   [`docs/2026-07-11-win11-tweaks-design.md`](docs/2026-07-11-win11-tweaks-design.md).
 - Shows the **MSUHost banner**, asks **`Continue? (Y/n)`**, then two small menus (one option per line,
   answered with `Select [1/2]`). **`Is this a PC or a Laptop?`** — `[1] PC` / `[2] Laptop`.
@@ -21,7 +55,9 @@ console **and** a file so the run can be reviewed afterwards.
   question per app (Enter = yes) before anything is downloaded; after the last answer the run goes on
   by itself and installs only the picked apps (the rest show as SKIPPED "not selected"). Visual C++,
   DirectX and .NET 3.5 are always installed. NVIDIA App is only offered with an NVIDIA card, Alienware
-  Command Center only on Alienware / Dell G hardware. Tweaks are the same for both.
+  Command Center only on Alienware / Dell G hardware. Then **`Keep these Windows apps?`** — Paint and
+  Media Player (Enter keeps them, `n` removes them; Gele isn't asked — they go). Otherwise the tweaks
+  are the same for both.
 - Then the **install phase**: **12 Visual C++ redists** + **15 winget apps**
   (incl. VLC, Lightshot, TurboTop, WinRAR; NZXT CAM on a PC only) + **6 direct-download**
   (**Google Chrome**, **NVIDIA App** only if an NVIDIA GPU is present, **Bitwarden**, **Parsec**,
@@ -100,7 +136,7 @@ default Windows 11 shell use; PowerShell 7 has an open bug where Ctrl+C can skip
 | `-DryRun` | Log what it WOULD do, change **nothing**. Run this first. |
 | (none) | Actually apply the tweaks + install the apps. |
 | `-Detailed` | Verbose console output (the log file is always full). |
-| `-Machine PC\|Laptop` | Skip the "PC or Laptop?" question (`Laptop` skips Ultimate Performance and NZXT CAM). |
+| `-Machine PC\|Laptop` | Skip the "PC or Laptop?" question (`Laptop` skips Ultimate Performance, hibernation off and NZXT CAM; `PC` skips the battery-sleep tweak). |
 | `-Reboot` | Reboot 15s after finishing (cancel with Ctrl+C). |
 | `-LogDir <path>` | Different folder for the log (default: the script's folder). |
 
@@ -125,7 +161,9 @@ New user automatically; if everyone must get it without being asked, also add it
   calling it FAILED. Battle.net's setup finishes after winget has stopped waiting for it (winget
   says "Installation abandoned"), so in that case the script gives it up to 5 minutes to land.
 - **No undo and no restore point** — if you want to roll back, take a snapshot/backup yourself
-  before the real run.
+  before the real run. The script remembers one thing on the PC: `HKLM\SOFTWARE\win11-tweaks`
+  `PromoAppsRemoved` (the date the promo apps went — later runs leave Store apps alone). The old Start
+  layout is kept as `start2.bin.win11-tweaks.bak` next to the new one.
 - **winget needs an interactive session** — run via `Run-Win11Tweaks.bat` (double-click) or the
   one-liner in a PowerShell window on the PC itself, not over SSH/remoting (winget fails with
   `0x8A15000F` otherwise).

@@ -6,7 +6,7 @@
     console AND a file so the run can be reviewed afterwards.
 
 .DESCRIPTION
-    The 35 tweaks (25 standard + 10 custom) and the install list are a fixed, curated set
+    The 51 tweaks (25 standard + 26 custom) and the install list are a fixed, curated set
     (see docs/2026-07-11-win11-tweaks-design.md). Only the ON toggles / checked items are
     applied; nothing else is touched.
     The script makes NO restore point and does NOT reboot unless -Reboot is given.
@@ -19,9 +19,9 @@
 
 .PARAMETER Machine
     'PC' or 'Laptop'. Skips the interactive "PC or Laptop?" question at startup. A laptop skips
-    the PC-only items: the Ultimate Performance power plan and NZXT CAM. (Alienware Command Center
-    goes by the actual hardware, not by this answer.) If omitted: ask interactively, or default
-    to 'PC' when non-interactive.
+    the PC-only items: the Ultimate Performance power plan, hibernation off and NZXT CAM; a PC skips
+    the laptop-only "no network while asleep on battery". (Alienware Command Center goes by the actual
+    hardware, not by this answer.) If omitted: ask interactively, or default to 'PC' when non-interactive.
 
 .PARAMETER LogDir
     Directory for the log file. Default: the script's own folder (fallback: Desktop
@@ -61,6 +61,8 @@ $script:DotNet35Proc         = $null   # background DISM process for .NET 3.5 (s
 $script:PinHelper            = $null   # Pin-Taskbar helper path (kept after Invoke-TaskbarPins for the Chrome pin)
 $script:ChromePinned         = $false  # set by Add-ChromeTaskbarPin (right after Chrome installs) - Main refreshes the taskbar if true
 $script:NotSelected          = @{}     # apps a "New user" said n to (winget ID / direct-app Name / vendor Id) - the install phase skips them
+$script:KeepApps             = @{}     # built-in apps a "New user" keeps (appx name -> label) - the app removal leaves them
+$script:SettingsPagesHidden  = @()     # Settings pages hidden so far in this run (SettingsPageVisibility is one merged string)
 $script:ConsoleModeSaved     = $null   # console input mode before Set-QuickEdit turned QuickEdit off (put back at the end)
 $script:Results              = [System.Collections.Generic.List[object]]::new()
 
@@ -196,17 +198,127 @@ function Set-Svc {
 }
 
 function Remove-Appx {
+    # Remove a Store app for every user + its provisioned copy (so new accounts don't get it). $Name may hold
+    # wildcards. Checked afterwards: a package Windows kept is a WARN, not a silent "removed".
     param([string]$Name, [string]$Id = '')
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would remove appx '$Name' (+ provisioned)" $Id; return }
     try {
-        Get-AppxPackage $Name -AllUsers -ErrorAction SilentlyContinue | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-        Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -like $Name } |
-            Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Out-Null
-        Write-Log DEBUG "removed appx '$Name'" $Id
+        $had = @(Get-AppxPackage $Name -AllUsers -ErrorAction SilentlyContinue)
+        if ($had) { $had | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue }
+        $prov = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like $Name })
+        foreach ($p in $prov) { Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -ErrorAction SilentlyContinue | Out-Null }
+        if (-not ($had -or $prov)) { Write-Log DEBUG "appx '$Name' not installed" $Id; return }
+        if (Get-AppxPackage $Name -ErrorAction SilentlyContinue) { Write-Log WARN "appx '$Name' is still installed - Windows did not remove it" $Id }
+        else { Write-Log DEBUG "removed appx '$Name'" $Id }
     } catch {
         Write-Log WARN "appx '$Name' failed: $($_.Exception.Message)" $Id
     }
+}
+
+function Get-RegValue {
+    # One registry value, or $null when the key or value isn't there.
+    param([string]$Path, [string]$Name)
+    try { return (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop).$Name } catch { return $null }
+}
+
+function Remove-RegKey {
+    # Delete a registry key with everything under it (DryRun-aware; a missing key is fine).
+    param([string]$Path, [string]$Id = '')
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would delete $Path" $Id; return }
+    if (-not (Test-Path -LiteralPath $Path)) { Write-Log DEBUG "$Path not there - nothing to delete" $Id; return }
+    try { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop; Write-Log DEBUG "deleted $Path" $Id }
+    catch { Write-Log WARN "could not delete ${Path}: $($_.Exception.Message)" $Id }
+}
+
+function Add-SettingsPageHidden {
+    # Hide one Settings page with the machine policy SettingsPageVisibility. It is ONE string for every page
+    # ("hide:aicomponents;home"), so this merges: the pages already listed + the ones hidden earlier in this run
+    # (in a DryRun nothing is written in between) + this one. A "showonly:" list is someone else's policy - left alone.
+    param([string]$Page, [string]$Id = '')
+    $path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+    $cur = [string](Get-RegValue -Path $path -Name 'SettingsPageVisibility')
+    if ($cur.Trim() -and $cur -notmatch '^\s*hide:') {
+        Write-Log WARN ("SettingsPageVisibility is '{0}' (not a hide: list) - left as is, '{1}' not hidden" -f $cur, $Page) $Id; return
+    }
+    $pages = [System.Collections.Generic.List[string]]::new()
+    foreach ($p in @(($cur -replace '^\s*hide:', '') -split ';') + @($script:SettingsPagesHidden) + @($Page)) {
+        $p = "$p".Trim()
+        if ($p -and -not ($pages -contains $p)) { $pages.Add($p) }
+    }
+    $script:SettingsPagesHidden = @($pages)
+    Set-Reg -Id $Id -Path $path -Name 'SettingsPageVisibility' -Type String -Value ('hide:' + ($pages -join ';'))
+}
+
+function Remove-WinCapability {
+    # Remove an optional Windows capability ("Name~~~~version") if it is installed. They come back from
+    # Settings > System > Optional features. Logged at INFO: each one takes a while and the console must not look stuck.
+    param([string]$Name, [string]$Label, [string]$Id = '')
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would remove capability $Name ($Label)" $Id; return }
+    try {
+        $caps = @(Get-WindowsCapability -Online -Name "$Name~~~~*" -ErrorAction Stop | Where-Object { "$($_.State)" -eq 'Installed' })
+        if (-not $caps) { Write-Log DEBUG "$Label not installed - nothing to remove" $Id; return }
+        Write-Log INFO "removing $Label" $Id
+        foreach ($c in $caps) { $null = Remove-WindowsCapability -Online -Name $c.Name -ErrorAction Stop }
+        Write-Log DEBUG "removed $Label" $Id
+    } catch { Write-Log WARN "$Label could not be removed: $($_.Exception.Message)" $Id }
+}
+
+function Disable-WinFeature {
+    # Turn a Windows optional feature off (like "Turn Windows features on or off"), if it is on. No reboot.
+    param([string]$Name, [string]$Label, [string]$Id = '')
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would disable feature $Name ($Label)" $Id; return }
+    try {
+        $f = Get-WindowsOptionalFeature -Online -FeatureName $Name -ErrorAction SilentlyContinue
+        if (-not $f -or "$($f.State)" -ne 'Enabled') { Write-Log DEBUG "$Label not enabled - nothing to do" $Id; return }
+        Write-Log INFO "removing $Label" $Id
+        $null = Disable-WindowsOptionalFeature -Online -FeatureName $Name -NoRestart -ErrorAction Stop
+        Write-Log DEBUG "disabled $Label" $Id
+    } catch { Write-Log WARN "$Label could not be turned off: $($_.Exception.Message)" $Id }
+}
+
+function Get-InstalledPrograms {
+    # DisplayName of every desktop program in Add/Remove Programs (machine 64/32-bit + this user).
+    $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    foreach ($k in $keys) { Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | ForEach-Object { [string]$_.DisplayName } }
+}
+
+function Get-DefaultProfilePath {
+    # The profile new accounts are copied from (normally C:\Users\Default).
+    $p = Get-RegValue -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -Name 'Default'
+    if ($p) { return [Environment]::ExpandEnvironmentVariables([string]$p) }
+    return (Join-Path $env:SystemDrive 'Users\Default')
+}
+
+function Clear-StartPins {
+    # A fresh Windows pins ads to Start (Spotify, LinkedIn, games...) that install on click. Replace the Start layout
+    # (start2.bin) with an empty one - for this user and for accounts created later (Default profile) - then restart
+    # Start so it reads the file. ONCE per profile: the old file is saved as start2.bin.win11-tweaks.bak (an empty
+    # .bak if there was none), and a profile that has that file already is left alone - a re-run must not wipe
+    # the pins the user made since.
+    param([string]$Id = '')
+    $local = 'Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\LocalState'
+    $dirs = @((Join-Path $env:LOCALAPPDATA $local), (Join-Path (Get-DefaultProfilePath) "AppData\Local\$local"))
+    $blank = [Convert]::FromBase64String($script:StartBlankB64)
+    $changed = 0
+    foreach ($d in $dirs) {
+        $bin = Join-Path $d 'start2.bin'; $bak = Join-Path $d 'start2.bin.win11-tweaks.bak'
+        if (Test-Path -LiteralPath $bak) { Write-Log DEBUG "Start pins in $d were cleared on an earlier run - leaving them alone" $Id; continue }
+        $null = New-Item -ItemType Directory -Path $d -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $bin) { Copy-Item -LiteralPath $bin -Destination $bak -Force -ErrorAction Stop }
+        else { [IO.File]::WriteAllBytes($bak, [byte[]]@()) }
+        [IO.File]::WriteAllBytes($bin, $blank)
+        Write-Log DEBUG "empty Start layout written to $bin (the old one: $bak)" $Id
+        $changed++
+    }
+    # killed, not closed: a clean exit could save the old layout from memory over the new file. Windows restarts it.
+    if ($changed) { Get-Process StartMenuExperienceHost -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
+}
+
+function Test-KeepLegacyPlayer {
+    # Windows Media Player Legacy is the last video player on the PC when a New user said n to VLC AND to keeping
+    # Media Player - then it stays. (Gele always gets VLC.)
+    return ($script:NotSelected.ContainsKey('VideoLAN.VLC') -and -not $script:KeepApps.ContainsKey('Microsoft.ZuneMusic'))
 }
 
 function Invoke-Step {
@@ -427,8 +539,9 @@ function Enable-Feature {
 }
 
 # --------------------------------------------------------------------------------------
-#  The tweaks - 35 total: 25 standard Win11 tweaks (values verbatim) + 10 custom at the
-#  end. Toggles apply their ON value only. No restore point (removed per user request).
+#  The tweaks - 51 total: 25 standard Win11 tweaks (values verbatim, except where a comment
+#  says why) + 26 custom at the end. Toggles apply their ON value only. No restore point
+#  (removed per user request). A tweak with Late=$true runs after the installs (Main).
 # --------------------------------------------------------------------------------------
 $script:Tweaks = @(
 
@@ -479,14 +592,22 @@ $script:Tweaks = @(
   # Activity History --------------------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksActivity'; Content='Activity History - Disable'; Category='Essential'; Apply={
       $id='WPFTweaksActivity'; $p='HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
-      Set-Reg -Id $id -Path $p -Name 'EnableActivityFeed'    -Type DWord -Value '0'
+      # EnableActivityFeed stays 1: 0 can break the clipboard history (Win+V) - WinUtil moved to 1 as well (PR #5035).
+      # Publish/Upload = 0 already keep the activity history from being saved or sent.
+      Set-Reg -Id $id -Path $p -Name 'EnableActivityFeed'    -Type DWord -Value '1'
       Set-Reg -Id $id -Path $p -Name 'PublishUserActivities' -Type DWord -Value '0'
       Set-Reg -Id $id -Path $p -Name 'UploadUserActivities'  -Type DWord -Value '0'
   }}
 
   # ConsumerFeatures ---------------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksConsumerFeatures'; Content='ConsumerFeatures - Disable'; Category='Essential'; Apply={
-      Set-Reg -Id 'WPFTweaksConsumerFeatures' -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableWindowsConsumerFeatures' -Type DWord -Value '1'
+      $id='WPFTweaksConsumerFeatures'; $cdm='HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
+      # The policy only works on Enterprise / Education. On Pro and Home the "suggested" apps and games that Windows
+      # installs by itself are stopped by these three (all 1 on a fresh 25H2).
+      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableWindowsConsumerFeatures' -Type DWord -Value '1'
+      Set-Reg -Id $id -Path $cdm -Name 'SilentInstalledAppsEnabled' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $cdm -Name 'PreInstalledAppsEnabled'    -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $cdm -Name 'OemPreInstalledAppsEnabled' -Type DWord -Value '0'
   }}
 
   # Delivery Optimization ----------------------------------------------------------
@@ -555,7 +676,7 @@ $script:Tweaks = @(
       Invoke-Step -Id $id -Description 'disable telemetry services + Defender sample submission' -Action {
           Set-MpPreference -SubmitSamplesConsent 2 -ErrorAction SilentlyContinue
           Set-Service -Name diagtrack -StartupType Disabled -ErrorAction SilentlyContinue
-          Set-Service -Name wermgr    -StartupType Disabled -ErrorAction SilentlyContinue
+          # (no "wermgr" line: that is not a service, it did nothing - Windows Error Reporting has its own tweak)
           [Environment]::SetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', '1', 'Machine')
           Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Siuf\Rules' -Name PeriodInNanoSeconds -ErrorAction SilentlyContinue
       }
@@ -572,15 +693,19 @@ $script:Tweaks = @(
   # Unwanted Pre-Installed Apps ---------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksDeBloat'; Content='Unwanted Pre-Installed Apps - Remove'; Category='Essential'; Apply={
       $id='WPFTweaksDeBloat'
+      # (Microsoft.GetHelp is NOT removed: the troubleshooters in Settings > System > Troubleshoot open through it.)
       $apps = @(
           'Microsoft.WindowsFeedbackHub','Microsoft.BingNews','Microsoft.BingSearch',
           'Microsoft.BingWeather','Clipchamp.Clipchamp','Microsoft.Todos','Microsoft.PowerAutomateDesktop',
           'Microsoft.MicrosoftSolitaireCollection','Microsoft.WindowsSoundRecorder','Microsoft.MicrosoftStickyNotes',
           'Microsoft.Windows.DevHome','Microsoft.Paint','Microsoft.OutlookForWindows','Microsoft.WindowsAlarms',
-          'Microsoft.StartExperiencesApp','Microsoft.GetHelp','Microsoft.ZuneMusic',
+          'Microsoft.StartExperiencesApp','Microsoft.ZuneMusic',
           'MicrosoftCorporationII.QuickAssist','MSTeams'
       )
-      foreach ($a in $apps) { Remove-Appx -Id $id -Name $a }
+      foreach ($a in $apps) {
+          if ($script:KeepApps.ContainsKey($a)) { Write-Log INFO ("Keeping {0} (the New user wants it)" -f $script:KeepApps[$a]) $id; continue }
+          Remove-Appx -Id $id -Name $a
+      }
       Invoke-Step -Id $id -Description 'uninstall classic Teams' -Action {
           $t = "$Env:LocalAppData\Microsoft\Teams\Update.exe"
           if (Test-Path $t) {
@@ -615,6 +740,24 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path $e -Name 'EdgeAssetDeliveryServiceEnabled' -Type DWord -Value '0'
       Set-Reg -Id $id -Path $e -Name 'WalletDonationEnabled' -Type DWord -Value '0'
       Set-Reg -Id $id -Path $e -Name 'DefaultBrowserSettingsCampaignEnabled' -Type DWord -Value '0'
+      # v1.6.0 (Win11Debloat / privacy.sexy): Edge does not preload at sign-in or keep running after it's closed,
+      # downloads no local AI model, and shows no news, promo tabs, "make me default" / sign-in nags, Acrobat
+      # button, Follow, sidebar (not for Microsoft-account profiles), Copilot page access or experiments.
+      Set-Reg -Id $id -Path $e -Name 'StartupBoostEnabled' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $e -Name 'BackgroundModeEnabled' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $e -Name 'GenAILocalFoundationalModelSettings' -Type DWord -Value '1'
+      Set-Reg -Id $id -Path $e -Name 'NewTabPageContentEnabled' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $e -Name 'NewTabPageHideDefaultTopSites' -Type DWord -Value '1'
+      Set-Reg -Id $id -Path $e -Name 'PromotionalTabsEnabled' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $e -Name 'DefaultBrowserSettingEnabled' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $e -Name 'SpotlightExperiencesAndRecommendationsEnabled' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $e -Name 'ShowAcrobatSubscriptionButton' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $e -Name 'EdgeFollowEnabled' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $e -Name 'SignInCtaOnNtpEnabled' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $e -Name 'TabServicesEnabled' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $e -Name 'HubsSidebarEnabled' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $e -Name 'CopilotPageContext' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $e -Name 'ExperimentationAndConfigurationServiceControl' -Type DWord -Value '0'
   }}
 
   # Microsoft OneDrive - Remove ---------------------------------------------------
@@ -656,7 +799,7 @@ $script:Tweaks = @(
   # Windows AI - Disable And Remove -----------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksWindowsAI'; Content='Windows AI - Disable And Remove'; Category='Advanced'; Apply={
       $id='WPFTweaksWindowsAI'
-      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name 'SettingsPageVisibility' -Type String -Value 'hide:aicomponents'
+      Add-SettingsPageHidden -Id $id -Page 'aicomponents'   # merged with the Settings Home toggle's "home" - one string
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\WindowsNotepad' -Name 'DisableAIFeatures' -Type DWord -Value '1'
       # Official Recall GP ("Turn off saving snapshots for Windows") - disables Recall instantly via registry
       # (fast + idempotent), independent of the slow DISM feature removal below.
@@ -718,8 +861,12 @@ $script:Tweaks = @(
   }}
 
   # Settings Home Page (toggle ON) ------------------------------------------------
-  [pscustomobject]@{ Id='WPFToggleHideSettingsHome'; Content='Settings Home Page'; Category='Toggle'; Apply={
-      Set-Reg -Id 'WPFToggleHideSettingsHome' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name 'SettingsPageVisibility' -Type String -Value 'show:home'
+  [pscustomobject]@{ Id='WPFToggleHideSettingsHome'; Content='Settings Home Page - Hide'; Category='Toggle'; Apply={
+      $id='WPFToggleHideSettingsHome'
+      # Home is the page with the Game Pass / Microsoft 365 / OneDrive cards; Settings then opens on System. This used
+      # to write "show:home" to HKCU - not a valid prefix, it did nothing - so that value is cleaned up.
+      Add-SettingsPageHidden -Id $id -Page 'home'
+      Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name 'SettingsPageVisibility' -Type String -Value '<RemoveEntry>'
   }}
 
   # Start Menu Recommendations (toggle ON) ---------------------------------------
@@ -842,7 +989,7 @@ $script:Tweaks = @(
   # On Win11 24H2/25H2 (build 26200) the reliable switch is the Explorer policy DisableSearchBoxSuggestions=1
   # (removes web suggestions + the Copilot search button); the Windows Search + Bing keys reinforce it so
   # web results don't come back via the connected-search path.
-  [pscustomobject]@{ Id='CustomDisableWebSearch'; Content='Search - disable web/Bing + Store results in Start'; Category='Custom'; Apply={
+  [pscustomobject]@{ Id='CustomDisableWebSearch'; Content='Search - no web/Bing, Store, highlights or cloud results'; Category='Custom'; Apply={
       $id='CustomDisableWebSearch'
       Set-Reg -Id $id -Path 'HKCU:\Software\Policies\Microsoft\Windows\Explorer'         -Name 'DisableSearchBoxSuggestions' -Type DWord -Value '1'
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'   -Name 'DisableWebSearch'            -Type DWord -Value '1'
@@ -851,6 +998,10 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search'     -Name 'CortanaConsent'              -Type DWord -Value '0'
       # no Microsoft Store app suggestions in Start search (Settings > Privacy > Search > Show suggested results > Microsoft Store)
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings' -Name 'IsStoreSuggestionsEnabled' -Type DWord -Value '0'
+      # no "search highlights" (Bing doodles, trending topics) and no results from the Microsoft account's
+      # OneDrive / Outlook - the documented machine policies, not the per-user keys the UCPD driver guards
+      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'   -Name 'EnableDynamicContentInWSB'   -Type DWord -Value '0'
+      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'   -Name 'AllowCloudSearch'            -Type DWord -Value '0'
       $script:NeedExplorerRestart = $true
   }}
 
@@ -862,6 +1013,224 @@ $script:Tweaks = @(
           }
       }
       $script:NeedExplorerRestart = $true
+  }}
+
+  # ---- v1.6.0: the picks from the 2026-09-27 bloat research (numbers = the pick page) ----------------------
+  # Start: no tips / promoted apps in Recommended (8), no account nags on the profile icon + in Settings (9),
+  # no phone panel next to Start (10). Recommended itself stays - the Start Menu Recommendations toggle shows it.
+  [pscustomobject]@{ Id='CustomStartCleanup'; Content='Start - no tips, ads, account nags or phone panel'; Category='Custom'; Apply={
+      $id='CustomStartCleanup'; $adv='HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+      $cdm='HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
+      Set-Reg -Id $id -Path $adv -Name 'Start_IrisRecommendations' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $cdm -Name 'SystemPaneSuggestionsEnabled' -Type DWord -Value '0'      # the older values for
+      Set-Reg -Id $id -Path $cdm -Name 'SubscribedContent-338388Enabled' -Type DWord -Value '0'   # the same suggestions
+      Set-Reg -Id $id -Path $adv -Name 'Start_AccountNotifications' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\SystemSettings\AccountNotifications' -Name 'EnableAccountNotifications' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Start\Companions\Microsoft.YourPhone_8wekyb3d8bbwe' -Name 'IsEnabled' -Type DWord -Value '0'
+      $script:NeedExplorerRestart = $true
+  }}
+
+  # Start: the ads pinned to a fresh Start (12) - an empty Start layout, once per profile (see Clear-StartPins)
+  [pscustomobject]@{ Id='CustomStartPins'; Content='Start - clear the pinned ads (first run only)'; Category='Custom'; Apply={
+      $id='CustomStartPins'
+      Invoke-Step -Id $id -Description 'empty Start layout (start2.bin) for this user and for new accounts' -Action { Clear-StartPins -Id $id }
+      $script:NeedExplorerRestart = $true
+  }}
+
+  # Tips, suggestions and ads all over Windows (14-19, 21, 25) - nothing stops working without them
+  [pscustomobject]@{ Id='CustomNagsOff'; Content='Windows tips, suggestions and ads - Disable'; Category='Custom'; Apply={
+      $id='CustomNagsOff'; $cdm='HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
+      Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement' -Name 'ScoobeSystemSettingEnabled' -Type DWord -Value '0'   # "Let's finish setting up your device"
+      Set-Reg -Id $id -Path $cdm -Name 'SubscribedContent-310093Enabled' -Type DWord -Value '0'   # welcome experience after updates
+      Set-Reg -Id $id -Path $cdm -Name 'SubscribedContent-338389Enabled' -Type DWord -Value '0'   # tips and suggestions
+      Set-Reg -Id $id -Path $cdm -Name 'SoftLandingEnabled' -Type DWord -Value '0'
+      foreach ($n in '338393', '353694', '353696', '353698') {                                      # suggested content in Settings
+          Set-Reg -Id $id -Path $cdm -Name "SubscribedContent-${n}Enabled" -Type DWord -Value '0'
+      }
+      foreach ($t in 'Windows.SystemToast.Suggested', 'Windows.SystemToast.BackupReminder', 'Windows.ActionCenter.SmartOptOut') {   # ad / backup-nag toasts
+          Set-Reg -Id $id -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\$t" -Name 'Enabled' -Type DWord -Value '0'
+      }
+      Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'ShowSyncProviderNotifications' -Type DWord -Value '0'   # OneDrive banners in Explorer
+      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' -Name 'DoNotShowFeedbackNotifications' -Type DWord -Value '1'   # feedback surveys, every account
+      # Microsoft 365 cards in Settings - officially an Enterprise/Education policy, may do nothing on Pro
+      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableConsumerAccountStateContent' -Type DWord -Value '1'
+  }}
+
+  # Lock screen (26-28): no Bing pictures (the desktop Spotlight is off already), no fun facts / tips, no weather-
+  # and-stocks widgets (the policy works on Pro in the EEA; the Widgets app is removed below as well)
+  [pscustomobject]@{ Id='CustomLockScreen'; Content='Lock screen - no Spotlight, tips or widgets'; Category='Custom'; Apply={
+      $id='CustomLockScreen'; $cdm='HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
+      $ls='HKCU:\Software\Microsoft\Windows\CurrentVersion\Lock Screen'
+      Set-Reg -Id $id -Path $cdm -Name 'RotatingLockScreenEnabled' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $ls  -Name 'SlideshowEnabled' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $cdm -Name 'RotatingLockScreenOverlayEnabled' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $cdm -Name 'SubscribedContent-338387Enabled' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' -Name 'DisableWidgetsOnLockScreen' -Type DWord -Value '1'
+      Set-Reg -Id $id -Path $ls  -Name 'LockScreenWidgetsEnabled' -Type DWord -Value '0'
+  }}
+
+  # Copilot leftovers (23-24): the "share with Copilot" button on taskbar window previews; Click to Do (Copilot+
+  # PCs only - the policy does nothing elsewhere)
+  [pscustomobject]@{ Id='CustomCopilotBits'; Content='Copilot - no taskbar sharing, no Click to Do'; Category='Custom'; Apply={
+      $id='CustomCopilotBits'
+      Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'TaskbarSn' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path 'HKCU:\Software\Policies\Microsoft\Windows\WindowsAI' -Name 'DisableClickToDo' -Type DWord -Value '1'
+      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' -Name 'DisableClickToDo' -Type DWord -Value '1'
+      $script:NeedExplorerRestart = $true
+  }}
+
+  # Windows Error Reporting (53) - crash reports to Microsoft off: policy + service + its queue task. Local crash
+  # dumps keep working. (Replaces the old "wermgr" line, which did nothing.)
+  [pscustomobject]@{ Id='CustomWerOff'; Content='Windows Error Reporting - Disable'; Category='Custom'; Apply={
+      $id='CustomWerOff'
+      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting' -Name 'Disabled' -Type DWord -Value '1'
+      Set-Svc -Id $id -Name 'WerSvc' -StartupType 'Disabled' -OriginalType 'Manual'
+      Invoke-Step -Id $id -Description 'disable the Windows Error Reporting task QueueReporting' -Action {
+          $t = Get-ScheduledTask -TaskPath '\Microsoft\Windows\Windows Error Reporting\' -TaskName 'QueueReporting' -ErrorAction SilentlyContinue
+          if ($t -and "$($t.State)" -ne 'Disabled') { $null = $t | Disable-ScheduledTask -ErrorAction Stop }
+      }
+  }}
+
+  # Rarely used services (superuser's list, 2026-09-27): Manual - they still start when something needs them -
+  # and two Disabled. Most are Manual on a fresh 25H2 already (then nothing changes); a service that is Disabled
+  # (Geolocation, by the Location tweak; Routing and Remote Access, by default) is never raised back to Manual.
+  [pscustomobject]@{ Id='CustomServicesManual'; Content='Services - rarely used ones to Manual'; Category='Custom'; Apply={
+      $id='CustomServicesManual'
+      $svcs = [ordered]@{
+          'Fax'='Manual'; 'MapsBroker'='Manual'; 'RetailDemo'='Manual'; 'PhoneSvc'='Manual'; 'icssvc'='Manual'   # Downloaded Maps Manager, Phone Service, Mobile Hotspot
+          'lfsvc'='Manual'; 'WpcMonSvc'='Manual'; 'AssignedAccessManagerSvc'='Manual'; 'wisvc'='Manual'          # Geolocation, Parental Controls, Windows Insider Service
+          'SEMgrSvc'='Manual'; 'WalletService'='Manual'; 'TrkWks'='Manual'; 'DiagTrack'='Disabled'              # Payments and NFC, Distributed Link Tracking, Connected User Experiences and Telemetry
+          'dmwappushservice'='Manual'; 'SCardSvr'='Manual'; 'TermService'='Manual'; 'SessionEnv'='Manual'        # WAP Push Message Routing, Smart Card, Remote Desktop (+ Configuration)
+          'UmRdpService'='Manual'; 'RemoteAccess'='Disabled'; 'TapiSrv'='Manual'; 'lmhosts'='Manual'             # RDP UserMode Port Redirector, Routing and Remote Access, Telephony, TCP/IP NetBIOS Helper
+      }
+      foreach ($name in $svcs.Keys) {
+          $want = $svcs[$name]
+          $s = Get-Service -Name $name -ErrorAction SilentlyContinue
+          if (-not $s) { Write-Log DEBUG "service $name not present on this system; skipping" $id; continue }
+          $now = "$($s.StartType)"
+          if ($now -eq $want) { Write-Log DEBUG "service $name already $want" $id; continue }
+          if ($want -eq 'Manual' -and $now -eq 'Disabled') { Write-Log DEBUG "service $name is Disabled - left off" $id; continue }
+          Set-Svc -Id $id -Name $name -StartupType $want
+      }
+  }}
+
+  # Sticky / Filter / Toggle Keys (65): 5x Shift (or holding right Shift, or Num Lock for 5 s) in a game pops a
+  # dialog that throws you to the desktop. Clear only the "shortcut active" bit (4) - every other accessibility
+  # setting stays; the features themselves stay in Settings > Accessibility. Applies at the next sign-in.
+  [pscustomobject]@{ Id='CustomStickyKeysOff'; Content='Sticky / Filter / Toggle Keys shortcuts - Disable'; Category='Custom'; Apply={
+      $id='CustomStickyKeysOff'
+      foreach ($k in @(@('StickyKeys', 510), @('Keyboard Response', 126), @('ToggleKeys', 62))) {   # Windows' defaults
+          $p = "HKCU:\Control Panel\Accessibility\$($k[0])"
+          $cur = 0; if (-not [int]::TryParse([string](Get-RegValue -Path $p -Name 'Flags'), [ref]$cur)) { $cur = $k[1] }
+          $new = $cur -band (-bnot 4)
+          if ($new -eq $cur) { Write-Log DEBUG "$($k[0]) shortcut already off" $id; continue }
+          Set-Reg -Id $id -Path $p -Name 'Flags' -Type String -Value ([string]$new)
+      }
+  }}
+
+  # Windows Update restarts (73): never on its own while someone is signed in - it asks instead
+  [pscustomobject]@{ Id='CustomNoAutoReboot'; Content='Windows Update - no auto-restart while signed in'; Category='Custom'; Apply={
+      Set-Reg -Id 'CustomNoAutoReboot' -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Name 'NoAutoRebootWithLoggedOnUsers' -Type DWord -Value '1'
+  }}
+
+  # Laptop asleep on battery (75): no network in Modern Standby - no heat or drain in the bag; mail and
+  # notifications arrive after it wakes. The machine policy (HKLM); plugged in (AC) is left as it is.
+  [pscustomobject]@{ Id='CustomStandbyNoNetBattery'; Content='Sleep on battery - no network'; Category='Custom'; Machine='Laptop'; Apply={
+      Set-Reg -Id 'CustomStandbyNoNetBattery' -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\f15576e8-98b7-4186-b944-eafa664402d9' -Name 'DCSettingIndex' -Type DWord -Value '0'
+  }}
+
+  # Hibernation (70) - PC only: frees hiberfil.sys (~40% of RAM) and turns Fast Startup off with it. A laptop
+  # keeps it: Modern Standby hibernates on low battery instead of dying.
+  [pscustomobject]@{ Id='CustomHibernateOff'; Content='Hibernation - Disable (frees hiberfil.sys)'; Category='Custom'; Machine='PC'; Apply={
+      Invoke-Step -Id 'CustomHibernateOff' -Description 'powercfg /hibernate off' -Action {
+          $out = & powercfg.exe /hibernate off 2>&1
+          if ($LASTEXITCODE -ne 0) { throw ("powercfg exit code {0}: {1}" -f $LASTEXITCODE, (@($out) -join ' ').Trim()) }
+      }
+  }}
+
+  # More pre-installed apps (35-37, 41). Every run: Widgets (the Web Experience Pack + its runtime - the button was
+  # only hidden before), Phone Link + Cross Device, and dead Microsoft apps that OEM / older images still carry.
+  # The Xbox app, Game Bar and the Xbox sign-in parts stay (Game Pass, Minecraft, AMD X3D scheduling).
+  # FIRST run only: promo apps a user may install on purpose later (Spotify, TikTok...) - a re-run leaves them.
+  [pscustomobject]@{ Id='CustomRemoveMoreApps'; Content='More pre-installed apps - Remove (Widgets, Phone Link, promos)'; Category='Custom'; Apply={
+      $id='CustomRemoveMoreApps'
+      $always = @(
+          'MicrosoftWindows.Client.WebExperience','Microsoft.WidgetsPlatformRuntime','Microsoft.YourPhone','MicrosoftWindows.CrossDevice',
+          'Microsoft.549981C3F5F10','Microsoft.WindowsMaps','microsoft.windowscommunicationsapps','Microsoft.SkypeApp',
+          'Microsoft.Microsoft3DViewer','Microsoft.MixedReality.Portal','Microsoft.XboxApp'   # Cortana, Maps, Mail and Calendar, Skype, 3D Viewer, MR Portal, old Xbox Console Companion
+      )
+      foreach ($a in $always) { Remove-Appx -Id $id -Name $a }
+      $promo = @(
+          'SpotifyAB.SpotifyMusic','Disney.37853FC22B2CE','BytedancePte.Ltd.TikTok','Facebook.Instagram','FACEBOOK.FACEBOOK','*LinkedInforWindows*',
+          'king.com.CandyCrushSaga','king.com.CandyCrushSodaSaga','king.com.BubbleWitch3Saga','AmazonVideo.PrimeVideo',
+          'MicrosoftCorporationII.MicrosoftFamily','Microsoft.ZuneVideo'   # Family Safety, Movies & TV
+      )
+      $done = Get-RegValue -Path $script:StateKey -Name 'PromoAppsRemoved'
+      if ($done) { Write-Log INFO ("Promo apps were removed on {0} - leaving Store apps installed since then alone" -f $done) $id }
+      else {
+          foreach ($a in $promo) { Remove-Appx -Id $id -Name $a }
+          Set-Reg -Id $id -Path $script:StateKey -Name 'PromoAppsRemoved' -Type String -Value (Get-Date -Format 'yyyy-MM-dd')
+      }
+  }}
+
+  # OEM trialware (76), any machine: the Store-app promos makers preinstall - exact names only. Hardware tools stay
+  # (MyASUS, Armoury Crate, Lenovo Vantage, HP System Information / Power Manager, Dell SupportAssist / Power
+  # Manager, Alienware Command Center). Desktop trialware (McAfee, Norton, ExpressVPN) has no silent uninstall -
+  # it's listed WARN in the summary with the vendor's own removal tool, instead of hanging on its dialog.
+  [pscustomobject]@{ Id='CustomOemTrialware'; Content='OEM trialware - Remove'; Category='Custom'; Apply={
+      $id='CustomOemTrialware'
+      $apps = @(
+          '5A894077.McAfeeSecurity','C27EB4BA.DropboxOEM','PricelinePartnerNetwork.Booking.com*','Amazon.com.Amazon',
+          'AD2F1837.HPJumpStarts','AD2F1837.HPWelcome','AD2F1837.HPRegistration','AD2F1837.HPConnectedMusic','AD2F1837.HPConnectedPhotopoweredbySnapfish',
+          'DellInc.PartnerPromo','DellInc.DellCustomerConnect','DellInc.DellMobileConnect','B9ECED6F.ASUSGIFTBOX'
+      )
+      foreach ($a in $apps) { Remove-Appx -Id $id -Name $a }
+      $tools = [ordered]@{
+          'McAfee*'     = "McAfee's MCPR tool (mcafee.com/support/s/article/000002766)"
+          'Norton*'     = 'the Norton Remove and Reinstall tool, "Remove only" (support.norton.com/sp/en/us/home/current/solutions/v60392881)'
+          'ExpressVPN*' = 'Settings > Apps > Installed apps'
+      }
+      $installed = @(Get-InstalledPrograms)
+      foreach ($pat in $tools.Keys) {
+          foreach ($n in @($installed | Where-Object { $_ -like $pat } | Sort-Object -Unique)) {
+              Write-Log INFO ("found {0} - not removed automatically, use {1}" -f $n, $tools[$pat]) $id
+              $script:Results.Add([pscustomobject]@{ Phase='Tweak'; Id="Trialware.$n"; Content=("{0} - remove with {1}" -f $n, $tools[$pat]); Status='WARN'; Detail='' })
+          }
+      }
+  }}
+
+  # Removed apps coming back (62): Windows Update's OOBE scheduler reinstalls the new Outlook and Dev Home - delete
+  # those entries. Cross Device's too, but only once Cross Device is really gone.
+  [pscustomobject]@{ Id='CustomNoReinstall'; Content='Removed apps - stop Windows reinstalling them'; Category='Custom'; Apply={
+      $id='CustomNoReinstall'; $base='HKLM:\SOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe'
+      $keys = @('OutlookUpdate', 'DevHomeUpdate')
+      if (-not $script:DryRun -and -not (Get-AppxPackage 'MicrosoftWindows.CrossDevice' -AllUsers -ErrorAction SilentlyContinue)) { $keys += 'CrossDeviceUpdate' }
+      foreach ($k in $keys) { Remove-RegKey -Id $id -Path "$base\$k" }
+  }}
+
+  # Old Windows components nobody uses at home (42-47, 50) - they come back from Settings > System > Optional
+  # features. Windows Media Player Legacy stays when it's the last video player (see Test-KeepLegacyPlayer).
+  [pscustomobject]@{ Id='CustomRemoveComponents'; Content='Old Windows components - Remove (Steps Recorder, IE mode...)'; Category='Custom'; Apply={
+      $id='CustomRemoveComponents'
+      Remove-WinCapability -Id $id -Name 'App.StepsRecorder' -Label 'Steps Recorder'
+      Remove-WinCapability -Id $id -Name 'MathRecognizer' -Label 'Math Recognizer'
+      Remove-WinCapability -Id $id -Name 'Browser.InternetExplorer' -Label 'Internet Explorer mode'
+      Remove-WinCapability -Id $id -Name 'Microsoft.Windows.PowerShell.ISE' -Label 'PowerShell ISE'
+      Remove-WinCapability -Id $id -Name 'Print.Management.Console' -Label 'Print Management'
+      Disable-WinFeature   -Id $id -Name 'WorkFolders-Client' -Label 'Work Folders'
+      if (Test-KeepLegacyPlayer) {
+          Write-Log INFO 'Keeping Windows Media Player Legacy - no VLC and no Media Player, it is the only video player left' $id
+      } else {
+          Remove-WinCapability -Id $id -Name 'Media.WindowsMediaPlayer' -Label 'Windows Media Player Legacy'
+          Disable-WinFeature   -Id $id -Name 'WindowsMediaPlayer' -Label 'Windows Media Player Legacy (feature)'
+      }
+  }}
+
+  # VBScript (51) - deprecated, Microsoft is phasing it out. LATE: removed after the app installs, in case an
+  # installer still runs a .vbs step. Command-line activation (slmgr.vbs, Office's ospp.vbs) needs it - activate
+  # in Settings, or add it back in Settings > System > Optional features.
+  [pscustomobject]@{ Id='CustomRemoveVBScript'; Content='VBScript - Remove (after the installs)'; Category='Custom'; Late=$true; Apply={
+      Remove-WinCapability -Id 'CustomRemoveVBScript' -Name 'VBSCRIPT' -Label 'VBScript'
   }}
 )
 
@@ -903,6 +1272,14 @@ $script:AppMachine = @{
 # Runtimes in $script:AppsToInstall: installed for EVERY user - never offered in the "New user" app questions
 # (games and apps need them; the Visual C++ redists and .NET 3.5 aren't in the app lists at all).
 $script:RuntimeApps = @('Microsoft.DirectX')
+# Built-in apps the "Unwanted Pre-Installed Apps" tweak removes that a New user may keep instead - asked after the
+# install questions (Enter = keep). Gele isn't asked: they go, as always. Keyed by appx name -> label.
+$script:NewUserKeepApps = [ordered]@{ 'Microsoft.Paint' = 'Paint'; 'Microsoft.ZuneMusic' = 'Media Player' }
+# What the script remembers between runs on this PC (only: the date the promo apps were removed - see CustomRemoveMoreApps).
+$script:StateKey = 'HKLM:\SOFTWARE\win11-tweaks'
+# The empty Start layout Clear-StartPins writes (start2.bin, 972 bytes, sha256 2378a237...81ee65). From Win11Debloat
+# (Assets/Start/start2.bin, MIT License, Copyright (c) 2020 Raphire).
+$script:StartBlankB64 = '4nrhSwH8TRucAIEL3m5RhU5aX0cAW7FJilySr5CE+V6aoBj7A+HZAaADAABc9u55LN8F4borYyXEGl8Q5+RZ+qERszeqUhhZXDvcjTF6rgdprauITLqPgMVMbSZbRsLN/O5uMjSLEr6nWYIwsMJkZMnZyZrhR3PugUhUKOYDqwySCY6/CPkL/Ooz/5j2R2hwWRGqc7ZsJxDFM1DWofjUiGjDUny+Y8UjowknQVaPYao0PC4bygKEbeZqCqRvSgPalSc53OFqCh2FHydzl09fChaos385QvF40EDEgSO8U9/dntAeNULwuuZBi7BkWSIOmWN1l4e+TZbtSJXwn+EINAJhRHyCSNeku21dsw+cMoLorMKnRmhJMLvE+CCdgNKIaPo/Krizva1+bMsI8bSkV/CxaCTLXodb/NuBYCsIHY1sTvbwSBRNMPvccw43RJCUKZRkBLkCVfW24ANbLfHXofHDMLxxFNUpBPSgzGHnueHknECcf6J4HCFBqzvSH1TjQ3S6J8tq2yaQ+jFNkxGRMushdXNNiTNjDFYMJNvgRL2lu63NPE+Cxy+IKC1NdKLweFdOGZr2mvKAw7t/fxmCTieUgLkegDomZbHL6anjy4SkjSCnfTBUNtxc0X3VJiha4wq/ArRrTtVnzcUcX+CI4BNTicx+X2eXugI+EHKjgaQS7fXHqQGEUMUeHMCXlgWUZ5kE3LFTjVifyVIGqYNDuqt7T9l7DWByiuRariySa7tiN1gA2ALKYlRsjsQL7xpxHnT1hi/9b+UuyC46cYQaDUcKDc4BGReJP2gDIyZfudLpgUPc7YfH9doiMcWimSylbKFtsI3Mfo0HONxet5XjzjDoziduYk2dFoFfz19uaRcOHtASKzaGdtk6RC+Tm4BbU/7PlbvHEKJZ720AxOQkzU9U8RWAHHsPUVfWzYoQc2dN8OQ/JlUAqe8+PI05ST4m3LoUpBKB+oU0H84aet5etGpIi4CthvazGencFObWJWNRzxk9BXIX2YoAdXB8b7JFwlxVdhgzZK0zkkrzSSmX9iJcNoi6Tp+RtnljzLTAv6xh8gwytIW5F2e5sVh7aiqo4sji0aE+ToqyNPV7eE9Idi2ZNeEbnJ9LX127uOl5jB280hs0caXLUrYiR15+Y31wtlD8JVeTDxDDac6v+e3C4VX+28mg9bYQ7NGYXZc7yZANC/nWTn+/hkTZUvR0gi+PUz4o/DSdKzbvVCAlqdjArcKkWW4r/WKUSLskoOKRPxdNLPVBl2S6blje4LvBzulpeHWubXWfCW4ILuOI'
 # Per-app install location for packages whose winget manifest REQUIRES one (otherwise
 # winget prompts "Specify the install root:" and blocks the run). Add IDs here as needed.
 $script:AppLocations = @{
@@ -1035,7 +1412,10 @@ function Write-Banner {
 }
 
 function Invoke-Tweaks {
+    # The tweak phase runs every tweak except the Late ones; -Late runs only those (Main, after the installs).
+    param([switch]$Late)
     foreach ($t in $script:Tweaks) {
+        if ([bool]$t.Late -ne [bool]$Late) { continue }
         if ($t.Machine -and $t.Machine -ne $script:MachineType) {   # e.g. Ultimate Performance is PC only
             Write-Log INFO ("Skipping {0} ({1} only)" -f $t.Content, $t.Machine) $t.Id
             $script:Results.Add([pscustomobject]@{ Phase='Tweak'; Id=$t.Id; Content=$t.Content; Status='SKIPPED'; Detail="$($t.Machine) only" })
@@ -1508,7 +1888,7 @@ function Show-Intro {
             return
         }
     }
-    # Machine type - a laptop skips the PC-only items (Ultimate Performance, NZXT CAM). (Alienware Command
+    # Machine type - a laptop skips the PC-only items (Ultimate Performance, hibernation off, NZXT CAM). (Alienware Command
     # Center goes by the actual hardware instead - see Invoke-InstallPhase.)
     if ($Machine -eq 'PC' -or $Machine -eq 'Laptop') {
         $script:MachineType = if ($Machine -eq 'Laptop') { 'Laptop' } else { 'PC' }
@@ -1526,8 +1906,12 @@ function Show-Intro {
         if ($newUser) { $sel = Read-AppSelection }
     }
     Write-Log INFO ("Machine type: {0}" -f $script:MachineType)
-    if ($newUser) { Write-Log INFO ("User: New user - {0} of {1} apps selected" -f $sel.Picked, $sel.Asked) }
-    else          { Write-Log INFO "User: Gele - installing all apps" }
+    if ($newUser) {
+        $kept = @($script:NewUserKeepApps.Keys | Where-Object { $script:KeepApps.ContainsKey($_) } | ForEach-Object { $script:NewUserKeepApps[$_] })
+        $keeps = if ($kept) { ', keeps ' + ($kept -join ' + ') } else { '' }
+        Write-Log INFO ("User: New user - {0} of {1} apps selected{2}" -f $sel.Picked, $sel.Asked, $keeps)
+    }
+    else { Write-Log INFO "User: Gele - installing all apps" }
 }
 
 function Read-Choice {
@@ -1583,6 +1967,14 @@ function Read-AppSelection {
         $ans = Read-Host ("    {0,-26}(Y/n)" -f $c.Name)
         if ($ans -match '^\s*(n|no)\s*$') { $script:NotSelected[$c.Key] = 'not selected'; $no++ }
     }
+    # Built-in apps the script would remove (Gele never gets asked - they go): Enter keeps them, n removes them.
+    Write-Host ""
+    Write-Host "  Keep these Windows apps? - Enter = yes, n = no." -ForegroundColor Yellow
+    Write-Host ""
+    foreach ($k in $script:NewUserKeepApps.Keys) {
+        $ans = Read-Host ("    {0,-26}(Y/n)" -f $script:NewUserKeepApps[$k])
+        if ($ans -notmatch '^\s*(n|no)\s*$') { $script:KeepApps[$k] = $script:NewUserKeepApps[$k] }
+    }
     Write-Host ""
     # A direct app that wasn't offered (its gate failed - e.g. no NVIDIA driver yet) must not install later
     # either: the install phase checks the gate again, and Windows Update can add the NVIDIA driver mid-run.
@@ -1608,6 +2000,7 @@ try {
     Invoke-InstallPhase       # apps + per-app desktop icons (Chrome is pinned right after it installs, inside this)
     if ($script:ChromePinned -and -not $script:DryRun) { Update-Explorer -Action restart }   # refresh the taskbar to show the Chrome pin
     Enable-DotNetFeatures     # finish .NET 3.5 (usually already done) + .NET 4
+    Invoke-Tweaks -Late       # last: what must wait until the installers are done (VBScript) - DISM is free again here
     $script:RunFinished = $true
 }
 finally {

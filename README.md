@@ -188,6 +188,8 @@ New user automatically; if everyone must get it without being asked, also add it
   On a normal connection this is seconds; on a WU-throttled box it can take ~30 min. Ctrl+C stops
   the script there (the summary is still written — see [The log](#the-log)), and .NET 3.5 keeps
   installing in the background (`/NoRestart`, so no surprise reboot — just don't reboot until
-  it's done). When Windows is already waiting for a restart (a Windows update, or the components
-  an earlier run removed), it installs .NET 3.5 but finishes it only at that restart: the run then
-  says `Done! (finishes at the next restart)` and ends with "Restart the PC to finish".
+  it's done). The last steps (old components, refresh rate, VBScript) come after that wait, so
+  after a Ctrl+C there run the script again once .NET 3.5 is done. When Windows is already
+  waiting for a restart (a Windows update, or the components an earlier run removed), it installs
+  .NET 3.5 but finishes it only at that restart: the run then says
+  `Done! (finishes at the next restart)` and ends with "Restart the PC to finish".

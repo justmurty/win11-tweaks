@@ -2438,7 +2438,8 @@ finally {
     if ($script:RunStarted) {
         if (-not $script:RunFinished) {
             Write-Host ''   # end the line - Ctrl+C can land mid-heartbeat (.NET 3.5 wait), which never printed its newline
-            Write-Log WARN "Stopped early - this summary only covers what ran."
+            # e.g. Ctrl+C in the .NET 3.5 wait: the last steps (old components, refresh rate, VBScript) come after it
+            Write-Log WARN "Stopped early - this summary only covers what ran. Run the script again to finish the rest."
         }
         Write-Summary
         Write-Log INFO ("=========== WIN11-TWEAKS {0} ===========" -f $(if ($script:RunFinished) { 'DONE' } else { 'STOPPED' }))

@@ -46,7 +46,8 @@ irm https://gitlab.msuhost.com/superuser/win11-tweaks/-/raw/main/Invoke-Win11Twe
 ```
 
 This downloads and runs the latest script directly. If the window isn't elevated, the script
-asks for admin rights (UAC) and re-launches itself in a new elevated window.
+asks for admin rights (UAC), saves itself to `%LOCALAPPDATA%\win11-tweaks\` and re-launches
+that copy in a new elevated window. (Open PowerShell as Administrator to skip the UAC prompt.)
 
 ### 2) Download + double-click
 

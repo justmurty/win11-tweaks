@@ -67,7 +67,7 @@ $script:Results              = [System.Collections.Generic.List[object]]::new()
 # --------------------------------------------------------------------------------------
 # Self-elevate to Administrator (the script edits HKLM + services). Works BOTH when run from a file
 # (.bat / -File) AND via the `irm <url> | iex` one-liner - in the one-liner case there is no local
-# file to re-run, so the elevated instance re-fetches the script from its known raw URL.
+# file to re-run, so the script is saved to a file from its known raw URL and THAT file is relaunched.
 $SelfUrl = 'https://gitlab.msuhost.com/superuser/win11-tweaks/-/raw/main/Invoke-Win11Tweaks.ps1'
 $isAdmin = ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -79,20 +79,30 @@ if (-not $isAdmin) {
         if (-not $psExe) { $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" }
         if ($PSCommandPath) {
             # running from a file -> relaunch the file elevated, forwarding the same parameters
+            $scriptFile = $PSCommandPath
             $fwd = foreach ($k in $PSBoundParameters.Keys) {
                 $v = $PSBoundParameters[$k]
                 if ($v -is [System.Management.Automation.SwitchParameter]) { if ($v.IsPresent) { "-$k" } }
                 else { "-$k"; ('"{0}"' -f $v) }
             }
-            $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-NoExit','-File',('"{0}"' -f $PSCommandPath)) + $fwd
         } else {
-            # running via `irm | iex` (no file) -> re-fetch from the raw URL in the elevated instance
-            $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-NoExit','-Command',"irm $SelfUrl | iex")
+            # running via `irm | iex` (no file) -> save the script to a file and relaunch THAT. NOT a new
+            # PowerShell with the download-and-run command on its command line: that's exactly what malware
+            # does, and Microsoft Defender's ML blocks it as a threat (typed at a prompt it's fine - spawned
+            # it isn't). Outside TEMP, which the "Temporary Files" tweak empties; the log stays on the Desktop.
+            $dir = Join-Path $env:LOCALAPPDATA 'win11-tweaks'
+            $null = New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop
+            $scriptFile = Join-Path $dir 'Invoke-Win11Tweaks.ps1'
+            Invoke-WebRequest -Uri $SelfUrl -OutFile $scriptFile -UseBasicParsing -ErrorAction Stop
+            $fwd = @('-LogDir', ('"{0}"' -f [Environment]::GetFolderPath('Desktop')))
         }
+        $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-NoExit','-File',('"{0}"' -f $scriptFile)) + $fwd
         Start-Process -FilePath $psExe -Verb RunAs -ArgumentList $argList
         exit   # elevated instance launched -> close THIS original (non-admin) window
     } catch {
-        Write-Host "Elevation was cancelled or failed. Please run this in an elevated PowerShell." -ForegroundColor Red
+        # the real reason: UAC answered "No", or the antivirus blocked it, or the download failed
+        Write-Host ("Could not relaunch elevated: {0}" -f $_.Exception.Message) -ForegroundColor Red
+        Write-Host "Open PowerShell as Administrator and run it there." -ForegroundColor Red
         return   # keep this window open so the message is visible
     }
 }

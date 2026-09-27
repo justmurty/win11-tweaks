@@ -32,7 +32,8 @@ console **and** a file so the run can be reviewed afterwards.
   - **old components removed** — Steps Recorder, Math Recognizer, Internet Explorer mode, PowerShell ISE,
     Print Management, Work Folders, Windows Media Player Legacy (kept when it is the only video player),
     and **VBScript** at the very end, after the installs (command-line activation with `slmgr.vbs` needs
-    it — activate in Settings, or add it back under Optional features);
+    it — activate in Settings, or add it back under Optional features; **kept on AMD machines**: AMD's
+    chipset installer runs a VBScript);
   - **Edge** doesn't preload or run after it's closed, downloads no local AI model, no news / promo
     tabs / default-browser and sign-in nags / sidebar;
   - **rarely used services to Manual** — Fax, Downloaded Maps Manager, Retail Demo, Phone Service, Mobile
@@ -45,8 +46,10 @@ console **and** a file so the run can be reviewed afterwards.
     while someone is signed in; **hibernation off** on a PC (frees `hiberfil.sys`); **no network while
     asleep on battery** on a laptop;
   - **monitors on their highest refresh rate** (a 144 / 165 Hz monitor often comes set to 60 Hz) — on a PC,
-    at the very end: without the real GPU driver Windows only offers 60 Hz, and that driver often arrives from
-    Windows Update during the run (if a screen stayed at 60 Hz, run the script again once the driver is in).
+    over **DisplayPort** (an HDMI screen is only logged with what it could do: an older cable, a KVM or an
+    adapter can fail at a rate Windows lists and leave the screen black), at the very end: without the real
+    GPU driver Windows only offers 60 Hz, and that driver often arrives during the run (if a screen stayed at
+    60 Hz, run the script again once the driver is in).
 
   Fixed in v1.6.0: Activity History no longer breaks the clipboard history (Win+V), Get Help stays
   (the Settings troubleshooters need it), "ConsumerFeatures" now also works on Pro. Details:
@@ -65,8 +68,12 @@ console **and** a file so the run can be reviewed afterwards.
   are the same for both.
 - Then the **install phase**: **12 Visual C++ redists** + **15 winget apps**
   (incl. VLC, Lightshot, TurboTop, WinRAR; NZXT CAM on a PC only) + **6 direct-download**
-  (**Google Chrome**, **NVIDIA App** only if an NVIDIA GPU is present, **Bitwarden**, **Parsec**,
-  **Google Play Games**, **FL Studio**) + **Alienware Command Center**, installed only on
+  (**Google Chrome**, **NVIDIA App** only if an NVIDIA GPU is present — found by its PCI ID, so also
+  before its driver is in, **Bitwarden**, **Parsec**, **Google Play Games**, **FL Studio**) + on a PC the
+  **drivers from the maker's own site** (not Windows Update), picked by the hardware: **AMD Chipset
+  Software** on a Ryzen board, **Intel Chipset Device Software** on an Intel one, **AMD Software:
+  Adrenalin** with a Radeon card (every download must carry the vendor's signature or it isn't run; a
+  laptop keeps its maker's drivers) + **Alienware Command Center**, installed only on
   Alienware / Dell G-series hardware, desktop or laptop (a New user is asked). It also applies the
   **WinRAR license** and enables **.NET 3.5**
   (incl. 2.0/3.0) **and .NET 4** via DISM (like "Turn Windows features on/off").

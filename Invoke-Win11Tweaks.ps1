@@ -2,7 +2,8 @@
 <#
 .SYNOPSIS
     Applies a fixed set of Windows 11 tweaks, then installs a defined application set via
-    winget (plus Visual C++ redists and .NET features). No GUI. Logs everything to the
+    winget (plus Visual C++ redists, .NET features and, on a PC, the chipset / Radeon drivers from
+    the maker's own site). No GUI. Logs everything to the
     console AND a file so the run can be reviewed afterwards.
 
 .DESCRIPTION
@@ -332,13 +333,15 @@ function Clear-StartPins {
 }
 
 function Initialize-NativeW11T {
-    # Screen modes (user32) and power-plan values (powrprof) for the refresh-rate and laptop-power tweaks. Once per session.
-    if ('W11T.Power' -as [type]) { return }
+    # Screen modes (user32) and power-plan values (powrprof) for the refresh-rate and laptop-power tweaks. Compiled once
+    # per PowerShell session and KEPT there: when this C# changes, bump the namespace (W11T2 -> W11T3), or a second run in
+    # the same window would quietly use the old copy.
+    if ('W11T2.Power' -as [type]) { return }
     Add-Type -ErrorAction Stop -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
-namespace W11T {
+namespace W11T2 {
     public static class Display {
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         public struct DEVMODE {
@@ -365,8 +368,8 @@ namespace W11T {
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool EnumDisplaySettings(string device, int mode, ref DEVMODE dm);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int ChangeDisplaySettingsEx(string device, ref DEVMODE dm, IntPtr hwnd, int flags, IntPtr param);
 
-        // "device|monitor|current Hz|highest Hz" per screen on the desktop. Highest = among the modes Windows lists for
-        // that monitor (only modes it reports) at the CURRENT resolution and colour depth, not interlaced.
+        // "device|monitor|current Hz|highest Hz|monitor interface path" per screen on the desktop. Highest = among the modes
+        // Windows lists for that monitor (only modes it reports) at the CURRENT resolution and colour depth, not interlaced.
         public static string[] List() {
             List<string> res = new List<string>();
             for (int i = 0; ; i++) {
@@ -382,8 +385,8 @@ namespace W11T {
                         && (m.dmDisplayFlags & 2) == 0 && m.dmDisplayFrequency > best) best = m.dmDisplayFrequency;
                 }
                 DISPLAY_DEVICE mon = new DISPLAY_DEVICE(); mon.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
-                string name = EnumDisplayDevices(dd.DeviceName, 0, ref mon, 0) ? mon.DeviceString : dd.DeviceString;
-                res.Add(dd.DeviceName + "|" + name + "|" + cur.dmDisplayFrequency + "|" + best);
+                bool hasMon = EnumDisplayDevices(dd.DeviceName, 0, ref mon, 1);            // EDD_GET_DEVICE_INTERFACE_NAME
+                res.Add(dd.DeviceName + "|" + (hasMon ? mon.DeviceString : dd.DeviceString) + "|" + cur.dmDisplayFrequency + "|" + best + "|" + (hasMon ? mon.DeviceID : ""));
             }
             return res.ToArray();
         }
@@ -393,8 +396,8 @@ namespace W11T {
             if (!EnumDisplaySettings(device, -1, ref dm)) return -5;
             dm.dmDisplayFrequency = hz; dm.dmFields = 0x400000;                           // DM_DISPLAYFREQUENCY
             int rc = ChangeDisplaySettingsEx(device, ref dm, IntPtr.Zero, 2, IntPtr.Zero);  // CDS_TEST
-            if (rc != 0) return rc;
-            return ChangeDisplaySettingsEx(device, ref dm, IntPtr.Zero, 1, IntPtr.Zero);   // CDS_UPDATEREGISTRY
+            if (rc != 0 && rc != 1) return rc;                                            // 1 = fine, after a restart
+            return ChangeDisplaySettingsEx(device, ref dm, IntPtr.Zero, 1, IntPtr.Zero);   // CDS_UPDATEREGISTRY - saved
         }
     }
     public static class Power {
@@ -425,12 +428,28 @@ namespace W11T {
 '@
 }
 
+function Get-MonitorLinks {
+    # How each monitor is connected, from WMI: monitor instance ("DISPLAY\MSI3CB1\5&2E2A4B5&0&UID4353") -> 'DisplayPort',
+    # 'HDMI', 'DVI', 'VGA', 'internal' or 'other'. (USB-C and Thunderbolt screens count as DisplayPort.)
+    $map = @{}
+    foreach ($c in @(Get-CimInstance -Namespace 'root\wmi' -ClassName 'WmiMonitorConnectionParams' -ErrorAction SilentlyContinue)) {
+        $link = switch ([int64]$c.VideoOutputTechnology) { 10 { 'DisplayPort' } 11 { 'DisplayPort' } 5 { 'HDMI' } 4 { 'DVI' } 0 { 'VGA' } 2147483648 { 'internal' } default { 'other' } }
+        $map[([string]$c.InstanceName -replace '_\d+$', '').ToUpperInvariant()] = $link
+    }
+    return $map
+}
+
 function Get-DisplayRates {
-    # Every screen on the desktop: device, monitor name, current Hz, highest Hz Windows offers at the current resolution.
+    # Every screen on the desktop: device, monitor name, current Hz, highest Hz Windows offers at the current resolution,
+    # and how it is connected (Link).
     Initialize-NativeW11T
-    foreach ($l in [W11T.Display]::List()) {
+    $links = Get-MonitorLinks
+    foreach ($l in [W11T2.Display]::List()) {
         $p = $l -split '\|'
-        [pscustomobject]@{ Device = $p[0]; Name = $p[1]; Hz = [int]$p[2]; MaxHz = [int]$p[3] }
+        # interface path "\\?\DISPLAY#MSI3CB1#5&2e2a4b5&0&UID4353#{e6f07b5f-...}" -> WMI instance "DISPLAY\MSI3CB1\5&2E2A4B5&0&UID4353"
+        $key = (($p[4] -replace '^\\\\\?\\', '') -replace '#\{[^}]*\}$', '' -replace '#', '\').ToUpperInvariant()
+        $link = if ($key -and $links.ContainsKey($key)) { $links[$key] } else { 'unknown' }
+        [pscustomobject]@{ Device = $p[0]; Name = $p[1]; Hz = [int]$p[2]; MaxHz = [int]$p[3]; Link = $link }
     }
 }
 
@@ -438,16 +457,32 @@ function Set-DisplayRate {
     # One screen to $Hz (tested, then saved); returns Windows' DISP_CHANGE code (0 = done, 1 = after a restart).
     param([string]$Device, [int]$Hz)
     Initialize-NativeW11T
-    return [W11T.Display]::SetRate($Device, $Hz)
+    return [W11T2.Display]::SetRate($Device, $Hz)
+}
+
+function Test-ScreenLocked {
+    # The lock screen is up (Win+L) in this session - Windows then refuses display changes from the desktop.
+    $me = (Get-Process -Id $PID).SessionId
+    return [bool](Get-Process LogonUI -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $me })
 }
 
 function Set-MaxRefreshRate {
     # A 144 / 165 Hz monitor often comes set to 60 Hz: every screen to the highest refresh rate Windows offers for it at
-    # its current resolution. Only modes the monitor reports are listed, and each switch is tested before it is saved.
+    # its current resolution (only modes the monitor reports; each switch is tested before it is saved). DisplayPort
+    # only: over HDMI an older cable, a KVM or an adapter can fail at a rate Windows lists - the screen goes black and
+    # nobody is there to put it back - so an HDMI screen is only logged with what it could do.
     param([string]$Id = '')
+    if (Test-ScreenLocked) {
+        Write-Log WARN 'Refresh rate not changed: the screen was locked - run the script again at an unlocked screen, or set it in Settings > Display > Advanced display' $Id
+        return
+    }
     foreach ($d in @(Get-DisplayRates)) {
         $label = if ($d.Name) { $d.Name } else { $d.Device }
         if ($d.MaxHz -le $d.Hz) { Write-Log DEBUG ("{0}: already at its highest refresh rate ({1} Hz)" -f $label, $d.Hz) $Id; continue }
+        if ($d.Link -ne 'DisplayPort') {
+            Write-Log INFO ("{0} ({1}): up to {2} Hz is available - left at {3} Hz; set it in Settings > System > Display > Advanced display if the cable is up to it" -f $label, $d.Link, $d.MaxHz, $d.Hz) $Id
+            continue
+        }
         $rc = Set-DisplayRate -Device $d.Device -Hz $d.MaxHz
         if ($rc -eq 0 -or $rc -eq 1) { Write-Log INFO ("{0}: {1} Hz -> {2} Hz{3}" -f $label, $d.Hz, $d.MaxHz, $(if ($rc -eq 1) { ' (after a restart)' })) $Id }
         else { Write-Log WARN ("{0}: could not switch to {1} Hz (Windows answered {2}) - it stays at {3} Hz" -f $label, $d.MaxHz, $rc, $d.Hz) $Id }
@@ -458,25 +493,86 @@ function Copy-PowerDcValues {
     # Every battery (DC) value of plan $From into plan $To (GUIDs); returns how many were copied.
     param([string]$From, [string]$To)
     Initialize-NativeW11T
-    return [W11T.Power]::CopyDc([guid]$From, [guid]$To)
+    return [W11T2.Power]::CopyDc([guid]$From, [guid]$To)
+}
+
+function Find-PowerPlan {
+    # A plan this script made on an earlier run: the GUID remembered under $script:StateKey (works in every Windows
+    # language, and for a plan powercfg -list doesn't show), else a plan listed with exactly this name.
+    param([string]$StateName, [string]$Name)
+    $g = [string](Get-RegValue -Path $script:StateKey -Name $StateName)
+    if ($g) { $null = powercfg -query $g 2>&1; if ($LASTEXITCODE -eq 0) { return $g } }
+    if ($Name) {
+        $m = [regex]::Match((powercfg -list | Out-String), ('(?i)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*\(' + [regex]::Escape($Name) + '\)'))
+        if ($m.Success) { return $m.Groups[1].Value }
+    }
+    return $null
+}
+
+function New-PowerPlanCopy {
+    # powercfg -duplicatescheme: the NEW plan's GUID, or $null when Windows refuses (Ultimate on a Modern Standby laptop).
+    param([string]$From)
+    $out = (powercfg -duplicatescheme $From 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $m = [regex]::Match($out, '(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+    if ($m.Success) { return $m.Value }
+    return $null
+}
+
+function Set-UltimateAcValues {
+    # Ultimate Performance's plugged-in (AC) values, for a plan made from Balanced: the CPU never below 100%, no core
+    # parking, aggressive boost, performance first; no sleep, hibernate, disk, USB or PCIe power saving on the charger.
+    param([string]$Plan)
+    $v = @(
+        @('54533251-82be-4824-96c1-47b60b740d00', '893dee8e-2bef-41e0-89c6-b55d0929964c', 100),   # processor minimum state
+        @('54533251-82be-4824-96c1-47b60b740d00', '0cc5b647-c1df-4637-891a-dec35c318583', 100),   # core parking: minimum cores
+        @('54533251-82be-4824-96c1-47b60b740d00', 'be337238-0d82-4146-a960-4f3749d470c7', 2),     # boost mode: aggressive
+        @('54533251-82be-4824-96c1-47b60b740d00', '36687f9e-e3a5-4dbf-b1dc-15eb381c6863', 0),     # energy performance preference
+        @('238c9fa8-0aad-41ed-83f4-97be242c8f20', '29f6c1db-86da-48c5-9fdb-f2b67b1f44da', 0),     # sleep after: never
+        @('238c9fa8-0aad-41ed-83f4-97be242c8f20', '9d7815a6-7ee4-497e-8888-515a05f02364', 0),     # hibernate after: never
+        @('0012ee47-9041-4b5d-9b77-535fba8b1442', '6738e2c4-e8a5-4a42-b16a-e040e769756e', 0),     # turn off the disk: never
+        @('2a737441-1930-4402-8d77-b2bebba308a3', '48e6b7a6-50f5-4782-a5d4-53bb8f07e226', 0),     # USB selective suspend: off
+        @('501a4d13-42af-4429-9fd1-a8218c268e20', 'ee12f906-d277-404b-b6da-e5fa1a576df5', 0)      # PCI Express link power saving: off
+    )
+    foreach ($x in $v) { $null = powercfg -setacvalueindex $Plan $x[0] $x[1] $x[2] }
+}
+
+function Set-PcPowerPlan {
+    # PC: the Ultimate Performance plan, active. The copy made on an earlier run is reused - remembered by GUID, so it is
+    # found in any Windows language (the English name is the fallback for copies made by older versions).
+    param([string]$Id = '')
+    $ultimate = 'e9a42b02-d5df-448d-aa00-03f14749eb61'
+    $guid = Find-PowerPlan -StateName 'PcPowerPlan' -Name 'Ultimate Performance'
+    if (-not $guid) { $guid = New-PowerPlanCopy -From $ultimate }
+    if ($guid) { Set-Reg -Id $Id -Path $script:StateKey -Name 'PcPowerPlan' -Type String -Value $guid }
+    else { $guid = $ultimate }   # last resort: the template itself (it often won't activate)
+    $null = powercfg -setactive $guid
+    Write-Log DEBUG ("active scheme -> {0}" -f ((powercfg -getactivescheme | Out-String).Trim())) $Id
 }
 
 function Set-LaptopPowerPlan {
     # Laptop: ONE plan that is Ultimate Performance on the charger and Balanced on battery - a copy of Ultimate
-    # Performance whose battery (DC) values are Balanced's, so Windows switches by itself when the cable comes out.
-    # A re-run finds it by its name (no second copy) and refreshes the battery values.
+    # Performance whose battery (DC) values are Balanced's, so Windows switches by itself when the cable comes out. A
+    # Modern Standby laptop refuses to copy Ultimate: then a copy of Balanced with Ultimate's plugged-in values. The plan
+    # is remembered (re-runs reuse it and refresh the battery values); it is never switched on without Balanced's
+    # battery values - that would be Ultimate on battery.
     param([string]$Id = '')
     $name = 'Ultimate + Balanced on battery'
     $balanced = '381b4222-f694-41f0-9685-ff5bb260df2e'
-    $g = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-    $guid = [regex]::Match((powercfg -list | Out-String), ("(?i)($g)\s*\(" + [regex]::Escape($name) + '\)')).Groups[1].Value
+    $guid = Find-PowerPlan -StateName 'LaptopPowerPlan' -Name $name
     if (-not $guid) {
-        $out = (powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 2>&1 | Out-String)
-        $guid = [regex]::Match($out, "(?i)$g").Value   # the NEW plan's GUID
-        if (-not $guid) { throw ("could not copy the Ultimate Performance plan: {0}" -f $out.Trim()) }
+        $guid = New-PowerPlanCopy -From 'e9a42b02-d5df-448d-aa00-03f14749eb61'
+        if (-not $guid) {
+            $guid = New-PowerPlanCopy -From $balanced
+            if (-not $guid) { throw 'Windows would not create a new power plan' }
+            Set-UltimateAcValues -Plan $guid
+            Write-Log INFO "No Ultimate Performance plan on this laptop (Modern Standby) - a copy of Balanced with Ultimate's plugged-in values instead" $Id
+        }
         $null = powercfg -changename $guid $name 'win11-tweaks: Ultimate Performance when plugged in, Balanced on battery'
     }
+    Set-Reg -Id $Id -Path $script:StateKey -Name 'LaptopPowerPlan' -Type String -Value $guid
     $n = Copy-PowerDcValues -From $balanced -To $guid
+    if ($n -lt 1) { throw ("no battery setting could be taken from Balanced - '{0}' was not switched on (it would run Ultimate on battery)" -f $name) }
     $null = powercfg -setactive $guid
     if ($LASTEXITCODE -ne 0) { throw ("powercfg -setactive {0} failed (exit code {1})" -f $guid, $LASTEXITCODE) }
     Write-Log DEBUG ("power plan '{0}' ({1}) active - {2} battery settings taken from Balanced" -f $name, $guid, $n) $Id
@@ -614,7 +710,10 @@ function Install-DirectDownload {
         [string]$SilentArgs = '',     # silent-install args for the downloaded installer
         [string]$DetectName,          # ARP DisplayName -like pattern -> skip if already installed
         [scriptblock]$Require,        # optional gate; if it returns falsey, skip (e.g. NVIDIA GPU present)
-        [string]$RequireMsg = 'requirement not met'
+        [string]$RequireMsg = 'requirement not met',
+        [hashtable]$Headers,          # extra request headers for the download (AMD serves its files only with an amd.com Referer)
+        [string]$Signer,              # the download must carry a valid signature from this publisher, or it is not run
+        [string]$Machine              # 'PC' / 'Laptop' only - checked by the install phase (listed so @splatting works)
     )
     if ($Require) {
         $met = $false; try { $met = [bool](& $Require) } catch { }
@@ -634,7 +733,9 @@ function Install-DirectDownload {
     Write-Log DEBUG "downloading $Name from $Url"
     try {
         $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -ErrorAction Stop
+        $iwr = @{ Uri = $Url; OutFile = $tmp; UseBasicParsing = $true; UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'; ErrorAction = 'Stop' }
+        if ($Headers) { $iwr.Headers = $Headers }
+        Invoke-WebRequest @iwr
         $ProgressPreference = $pp
     } catch { Write-Log WARN "Failed - $Name (download failed: $($_.Exception.Message))"; return 'FAILED' }
     # sanity: make sure we got a real installer (MZ='MZ' = exe, or OLE 'D0 CF 11 E0' = msi), not an HTML page
@@ -646,6 +747,14 @@ function Install-DirectDownload {
     if (-not ($isExe -or $isMsi)) {
         Write-Log WARN "Failed - $Name (downloaded file is not an exe/msi installer; get it manually from $Url)"
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return 'FAILED'
+    }
+    if ($Signer) {   # a scraped link must lead to the vendor's own signed file - anything else is never run
+        $sig = Get-AuthenticodeSignature -FilePath $tmp -ErrorAction SilentlyContinue
+        $subject = if ($sig -and $sig.SignerCertificate) { [string]$sig.SignerCertificate.Subject } else { '' }
+        if (-not $sig -or "$($sig.Status)" -ne 'Valid' -or $subject -notmatch [regex]::Escape($Signer)) {
+            Write-Log WARN ("Failed - {0} (the download is not signed by {1}: {2} {3}) - not run" -f $Name, $Signer, $(if ($sig) { $sig.Status } else { 'no signature' }), $subject)
+            Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return 'FAILED'
+        }
     }
     try {
         if ($isMsi)           { $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList "/i `"$tmp`" $SilentArgs" -Wait -PassThru }
@@ -1078,17 +1187,7 @@ $script:Tweaks = @(
   # Ultimate Performance power plan - max performance, then ACTIVATE it. PC only (Machine='PC'): a laptop gets
   # CustomLaptopPower instead (Ultimate on the charger only - on battery it would keep the CPU from idling).
   [pscustomobject]@{ Id='CustomUltimatePerf'; Content='Ultimate Performance - power plan'; Category='Custom'; Machine='PC'; Apply={
-      Invoke-Step -Id 'CustomUltimatePerf' -Description 'enable + activate Ultimate Performance power plan' -Action {
-          # Reuse an existing Ultimate Performance plan if present (no duplicates on re-run); else create one.
-          $guid = ([regex]::Match((powercfg -list | Out-String), '(?im)GUID:\s*([0-9a-f-]{36})\s*\(Ultimate Performance\)')).Groups[1].Value
-          if (-not $guid) {
-              # -duplicatescheme prints the NEW plan's GUID; activate THAT (the template GUID often won't activate).
-              $guid = ([regex]::Match((powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 2>&1 | Out-String), '[0-9a-f-]{36}')).Value
-          }
-          if (-not $guid) { $guid = 'e9a42b02-d5df-448d-aa00-03f14749eb61' }
-          powercfg -setactive $guid
-          Write-Log DEBUG ("active scheme -> {0}" -f ((powercfg -getactivescheme | Out-String).Trim())) 'CustomUltimatePerf'
-      }
+      Invoke-Step -Id 'CustomUltimatePerf' -Description 'enable + activate Ultimate Performance power plan' -Action { Set-PcPowerPlan -Id 'CustomUltimatePerf' }
   }}
 
   # Laptop power (superuser, 2026-09-27): Ultimate Performance on the charger, Balanced on battery - ONE plan, so
@@ -1414,7 +1513,9 @@ $script:Tweaks = @(
   # VBScript (51) - deprecated, Microsoft is phasing it out. LATE: removed after the app installs, in case an
   # installer still runs a .vbs step. Command-line activation (slmgr.vbs, Office's ospp.vbs) needs it - activate
   # in Settings, or add it back in Settings > System > Optional features.
+  # Kept on an AMD machine: AMD's chipset installer checks the platform with a VBScript - now and for every later update.
   [pscustomobject]@{ Id='CustomRemoveVBScript'; Content='VBScript - Remove (after the installs)'; Category='Custom'; Late=$true; Apply={
+      if ((Get-CpuVendor) -eq 'AuthenticAMD') { Write-Log INFO 'Keeping VBScript - the AMD chipset installer needs it (also for its later updates)' 'CustomRemoveVBScript'; return }
       Remove-WinCapability -Id 'CustomRemoveVBScript' -Name 'VBSCRIPT' -Label 'VBScript'
   }}
 )
@@ -1496,7 +1597,7 @@ $script:DirectApps = @(
         }
         SilentArgs = '-s -noreboot -noeula -nofinish -nosplash'
         DetectName = 'NVIDIA App*'
-        Require    = { [bool](Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'NVIDIA' }) }
+        Require    = { Test-GpuVendor '10DE' 'NVIDIA' }   # by PCI ID: before its driver is in, the card is a "Microsoft Basic Display Adapter"
         RequireMsg = 'no NVIDIA GPU detected'
     }
     @{  # Bitwarden - winget install fails as admin (ShellExec 0x8A150006); use the official direct installer.
@@ -1527,6 +1628,63 @@ $script:DirectApps = @(
         Url        = 'https://support.image-line.com/redirect/flstudio_win_installer'
         SilentArgs = '/S'
         DetectName = 'FL Studio*'
+    }
+    # ---- drivers from the maker's own site, not Windows Update (superuser, 2026-09-27). PC only: a laptop keeps its
+    # maker's tuned drivers (AMD and Intel both say so). Every file must be signed by the vendor or it is not run.
+    @{  # AMD Chipset Software - Ryzen chipset, power management and (X3D) V-Cache drivers; one package for every Ryzen
+        # board, read off the AM5 page (the file name changes: AMD_Chipset_Software_* / amd_software_*). amd.com serves
+        # the file only with an amd.com Referer (else an HTML page). Only with AMD chipset devices present - a VM on an
+        # AMD host says AMD CPU but has none, and the installer would refuse there. Its setup runs VBScript (kept on AMD).
+        Name       = 'AMD Chipset Software'
+        UrlScript  = {
+            $html = (Invoke-WebRequest 'https://www.amd.com/en/support/downloads/drivers.html/chipsets/am5/x870e.html' -UseBasicParsing -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -ErrorAction Stop).Content
+            [regex]::Matches($html, '(?i)https://drivers\.amd\.com/drivers/[^"''<> ]*(chipset_software|amd_software)[^"''<> ]*\.exe') |
+                ForEach-Object { $_.Value } | Where-Object { $_ -notmatch '(?i)win7|raid' } | Select-Object -First 1
+        }
+        Headers    = @{ Referer = 'https://www.amd.com/' }
+        SilentArgs = '/S'
+        DetectName = 'AMD Chipset Software*'
+        Signer     = 'Advanced Micro Devices'
+        Machine    = 'PC'
+        Require    = { (Get-CpuVendor) -eq 'AuthenticAMD' -and (Test-PciVendor '1022') }
+        RequireMsg = 'no AMD chipset'
+    }
+    @{  # Intel Chipset Device Software (the INF update utility - mostly device names). Intel's page answers 403 to
+        # PowerShell, so it is read with Windows' own curl.exe; if that fails, the last known build.
+        Name       = 'Intel Chipset Device Software'
+        UrlScript  = {
+            $html = ''
+            try { $html = (& curl.exe -s -L --max-time 30 'https://www.intel.com/content/www/us/en/download/19347/chipset-inf-utility.html' 2>$null) -join "`n" } catch { }
+            $m = [regex]::Match([string]$html, '(?i)https://downloadmirror\.intel\.com/\d+/SetupChipset\.exe')
+            if ($m.Success) { $m.Value } else { 'https://downloadmirror.intel.com/925343/SetupChipset.exe' }   # 10.1.20658.8883
+        }
+        SilentArgs = '-s -norestart'
+        DetectName = 'Intel(R) Chipset Device Software*'
+        Signer     = 'Intel Corporation'
+        Machine    = 'PC'
+        Require    = { (Get-CpuVendor) -eq 'GenuineIntel' -and (Test-PciVendor '8086') }
+        RequireMsg = 'no Intel chipset'
+    }
+    @{  # AMD Software: Adrenalin Edition - the Radeon driver + its app. The combined "-c" package (RX 5000 and newer,
+        # Ryzen 7000+ graphics; ~1.7 GB) linked from the current release notes, which the RX 9070 XT page links to.
+        # -INSTALL is silent (NOT -BOOT: that reboots). Older Vega / Polaris chips aren't in it - the installer refuses
+        # them (FAILED; amd.com has a separate package for those).
+        Name       = 'AMD Software Adrenalin'
+        UrlScript  = {
+            $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+            $gpu = (Invoke-WebRequest 'https://www.amd.com/en/support/downloads/drivers.html/graphics/radeon-rx/radeon-rx-9000-series/amd-radeon-rx-9070-xt.html' -UseBasicParsing -UserAgent $ua -ErrorAction Stop).Content
+            $rn = [regex]::Match($gpu, '(?i)/en/resources/support-articles/release-notes/RN-RAD-WIN-[0-9a-z-]+\.html').Value
+            if (-not $rn) { throw 'no release-notes link on the AMD page' }
+            $notes = (Invoke-WebRequest ('https://www.amd.com' + $rn) -UseBasicParsing -UserAgent $ua -ErrorAction Stop).Content
+            [regex]::Match($notes, '(?i)https://drivers\.amd\.com/drivers/[^"''<> ]*-win11-c\.exe').Value
+        }
+        Headers    = @{ Referer = 'https://www.amd.com/' }
+        SilentArgs = '-INSTALL'
+        DetectName = 'AMD Software*'
+        Signer     = 'Advanced Micro Devices'
+        Machine    = 'PC'
+        Require    = { Test-GpuVendor '1002' 'Radeon' }
+        RequireMsg = 'no AMD Radeon graphics'
     }
 )
 # Apps that should get a Desktop icon (most make their own; these do not reliably). Keyed by winget ID
@@ -1722,6 +1880,26 @@ function Install-Alienware {
     }
 }
 
+function Get-CpuVendor {
+    # 'AuthenticAMD' / 'GenuineIntel' (the CPU's own vendor string - not translated)
+    return [string](Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1).Manufacturer
+}
+
+function Test-PciVendor {
+    # Is there a PCI device from this vendor ('1022' AMD, '8086' Intel, '10DE' NVIDIA, '1002' AMD graphics)? A VM on an
+    # AMD host reports an AMD CPU but has only emulated devices - AMD's chipset installer would refuse there.
+    param([string]$Vendor)
+    return [bool](Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object { $_.DeviceID -like "PCI\VEN_$Vendor*" } | Select-Object -First 1)
+}
+
+function Test-GpuVendor {
+    # A graphics card from this PCI vendor ('10DE' NVIDIA, '1002' AMD) - by its PCI ID, so it's found before its driver is
+    # installed (until then Windows calls it "Microsoft Basic Display Adapter"); the name is a second chance.
+    param([string]$Vendor, [string]$NamePattern)
+    return [bool](Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
+        Where-Object { "$($_.PNPDeviceID)" -match "VEN_$Vendor" -or ($NamePattern -and "$($_.Name)" -match $NamePattern) })
+}
+
 function Get-Hardware {
     # "<Manufacturer> <Model>" - what $script:VendorApps' Hardware regexes are matched against
     $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
@@ -1768,6 +1946,11 @@ function Invoke-InstallPhase {
 
     # Non-winget apps (direct vendor download): Bitwarden, Parsec, NVIDIA App (GPU only)
     foreach ($d in $script:DirectApps) {
+        if ($d.Machine -and $d.Machine -ne $script:MachineType) {   # e.g. the chipset / Radeon drivers are PC only
+            Write-Log INFO ("Skipping {0} ({1} only)" -f $d.Name, $d.Machine)
+            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$d.Name; Content=$d.Name; Status='SKIPPED'; Detail="$($d.Machine) only" })
+            continue
+        }
         if (Skip-NotSelected -Key $d.Name -Content $d.Name -Label $d.Name) { continue }   # no icon / Chrome pin either
         $st = Install-DirectDownload @d
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$d.Name; Content=$d.Name; Status=$st; Detail='direct' })
@@ -2129,6 +2312,7 @@ function Get-AppChoices {
         $list.Add([pscustomobject]@{ Key = $id; Name = $(if ($script:AppNames.ContainsKey($id)) { $script:AppNames[$id] } else { $id }) })
     }
     foreach ($d in $script:DirectApps) {
+        if ($d.Machine -and $d.Machine -ne $script:MachineType) { continue }
         if ($d.Require) { $met = $false; try { $met = [bool](& $d.Require) } catch { }; if (-not $met) { continue } }
         $list.Add([pscustomobject]@{ Key = $d.Name; Name = $d.Name })
     }

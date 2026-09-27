@@ -430,7 +430,8 @@ namespace W11T2 {
 
 function Get-MonitorLinks {
     # How each monitor is connected, from WMI: monitor instance ("DISPLAY\MSI3CB1\5&2E2A4B5&0&UID4353") -> 'DisplayPort',
-    # 'HDMI', 'DVI', 'VGA', 'internal' or 'other'. (USB-C and Thunderbolt screens count as DisplayPort.)
+    # 'HDMI', 'DVI', 'VGA', 'internal' or 'other'. (USB-C DisplayPort alt mode counts as DisplayPort; a screen tunnelled
+    # through USB4 / Thunderbolt reports another type and is only logged.)
     $map = @{}
     foreach ($c in @(Get-CimInstance -Namespace 'root\wmi' -ClassName 'WmiMonitorConnectionParams' -ErrorAction SilentlyContinue)) {
         $link = switch ([int64]$c.VideoOutputTechnology) { 10 { 'DisplayPort' } 11 { 'DisplayPort' } 5 { 'HDMI' } 4 { 'DVI' } 0 { 'VGA' } 2147483648 { 'internal' } default { 'other' } }
@@ -537,10 +538,18 @@ function Set-UltimateAcValues {
     foreach ($x in $v) { $null = powercfg -setacvalueindex $Plan $x[0] $x[1] $x[2] }
 }
 
+function Set-BalancedForX3D {
+    # A dual-CCD Ryzen X3D keeps (or gets back) the Balanced plan - see Test-DualCcdX3D.
+    param([string]$Id = '')
+    $null = powercfg -setactive '381b4222-f694-41f0-9685-ff5bb260df2e'
+    Write-Log INFO "Ryzen X3D with two CCDs: the Balanced plan stays - AMD's V-Cache driver needs its core parking to keep games on the V-Cache CCD (Ultimate would switch that off)" $Id
+}
+
 function Set-PcPowerPlan {
     # PC: the Ultimate Performance plan, active. The copy made on an earlier run is reused - remembered by GUID, so it is
     # found in any Windows language (the English name is the fallback for copies made by older versions).
     param([string]$Id = '')
+    if (Test-DualCcdX3D) { Set-BalancedForX3D -Id $Id; return }
     $ultimate = 'e9a42b02-d5df-448d-aa00-03f14749eb61'
     $guid = Find-PowerPlan -StateName 'PcPowerPlan' -Name 'Ultimate Performance'
     if (-not $guid) { $guid = New-PowerPlanCopy -From $ultimate }
@@ -557,6 +566,7 @@ function Set-LaptopPowerPlan {
     # is remembered (re-runs reuse it and refresh the battery values); it is never switched on without Balanced's
     # battery values - that would be Ultimate on battery.
     param([string]$Id = '')
+    if (Test-DualCcdX3D) { Set-BalancedForX3D -Id $Id; return }
     $name = 'Ultimate + Balanced on battery'
     $balanced = '381b4222-f694-41f0-9685-ff5bb260df2e'
     $guid = Find-PowerPlan -StateName 'LaptopPowerPlan' -Name $name
@@ -626,7 +636,7 @@ function Test-AppInstalled {
     #  - winget list uses a locale-independent EXIT CODE (0 = found) -> catches winget-tracked installs.
     #  - the Add/Remove Programs DisplayName scan catches installs made OUTSIDE winget
     #    (e.g. an OEM/vendor app pre-installed on the PC), which 'winget list' won't see.
-    param([string]$Id, [string]$NamePattern)
+    param([string]$Id, [string[]]$NamePattern)   # one or more Add/Remove Programs DisplayName -like patterns
     if ($Id) {
         try {
             & winget list --id $Id --exact --accept-source-agreements *>$null
@@ -640,7 +650,7 @@ function Test-AppInstalled {
             'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
         )
         foreach ($k in $keys) {
-            if (Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like $NamePattern }) { return $true }
+            if (Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $dn = $_.DisplayName; @($NamePattern | Where-Object { $dn -like $_ }).Count }) { return $true }
         }
     }
     return $false
@@ -708,12 +718,13 @@ function Install-DirectDownload {
         [string]$Url,                 # direct URL; OR give -UrlScript to compute the current one
         [scriptblock]$UrlScript,
         [string]$SilentArgs = '',     # silent-install args for the downloaded installer
-        [string]$DetectName,          # ARP DisplayName -like pattern -> skip if already installed
+        [string[]]$DetectName,        # ARP DisplayName -like pattern(s) -> skip if already installed
         [scriptblock]$Require,        # optional gate; if it returns falsey, skip (e.g. NVIDIA GPU present)
         [string]$RequireMsg = 'requirement not met',
         [hashtable]$Headers,          # extra request headers for the download (AMD serves its files only with an amd.com Referer)
         [string]$Signer,              # the download must carry a valid signature from this publisher, or it is not run
-        [string]$Machine              # 'PC' / 'Laptop' only - checked by the install phase (listed so @splatting works)
+        [string]$Machine,             # 'PC' / 'Laptop' only - checked by the install phase (listed so @splatting works)
+        [switch]$WaitMainOnly         # wait for the installer process only, not for an app it leaves running (see below)
     )
     if ($Require) {
         $met = $false; try { $met = [bool](& $Require) } catch { }
@@ -737,7 +748,10 @@ function Install-DirectDownload {
         if ($Headers) { $iwr.Headers = $Headers }
         Invoke-WebRequest @iwr
         $ProgressPreference = $pp
-    } catch { Write-Log WARN "Failed - $Name (download failed: $($_.Exception.Message))"; return 'FAILED' }
+    } catch {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue   # no half file left in TEMP (Adrenalin alone is 1.6 GB)
+        Write-Log WARN "Failed - $Name (download failed: $($_.Exception.Message))"; return 'FAILED'
+    }
     # sanity: make sure we got a real installer (MZ='MZ' = exe, or OLE 'D0 CF 11 E0' = msi), not an HTML page
     try {
         $fs = [System.IO.File]::OpenRead($tmp); $sig = New-Object byte[] 4; [void]$fs.Read($sig, 0, 4); $fs.Close()
@@ -757,9 +771,16 @@ function Install-DirectDownload {
         }
     }
     try {
-        if ($isMsi)           { $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList "/i `"$tmp`" $SilentArgs" -Wait -PassThru }
-        elseif ($SilentArgs)  { $p = Start-Process -FilePath $tmp -ArgumentList $SilentArgs -Wait -PassThru }
-        else                  { $p = Start-Process -FilePath $tmp -Wait -PassThru }
+        $sp = if ($isMsi) { @{ FilePath = 'msiexec.exe'; ArgumentList = "/i `"$tmp`" $SilentArgs" } }
+              elseif ($SilentArgs) { @{ FilePath = $tmp; ArgumentList = $SilentArgs } }
+              else { @{ FilePath = $tmp } }
+        if ($WaitMainOnly) {
+            # the installer alone: Start-Process -Wait also waits for every process it started, so an app the setup
+            # leaves running (the Radeon app) would hold the run - the same trap as in Invoke-Winget
+            $p = Start-Process @sp -PassThru
+            $null = $p.Handle   # open it now, or ExitCode can be empty afterwards
+            Wait-Process -InputObject $p -ErrorAction SilentlyContinue
+        } else { $p = Start-Process @sp -Wait -PassThru }
         $code = $p.ExitCode
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         Write-Log DEBUG "$Name installer exit code: $code"
@@ -1561,7 +1582,8 @@ $script:RuntimeApps = @('Microsoft.DirectX')
 # Built-in apps the "Unwanted Pre-Installed Apps" tweak removes that a New user may keep instead - asked after the
 # install questions (Enter = keep). Gele isn't asked: they go, as always. Keyed by appx name -> label.
 $script:NewUserKeepApps = [ordered]@{ 'Microsoft.Paint' = 'Paint'; 'Microsoft.ZuneMusic' = 'Media Player' }
-# What the script remembers between runs on this PC (only: the date the promo apps were removed - see CustomRemoveMoreApps).
+# What the script remembers between runs on this PC: the date the promo apps were removed (CustomRemoveMoreApps) and the
+# GUIDs of the power plans it made (PcPowerPlan / LaptopPowerPlan).
 $script:StateKey = 'HKLM:\SOFTWARE\win11-tweaks'
 # The empty Start layout Clear-StartPins writes (start2.bin, 972 bytes, sha256 2378a237...81ee65). From Win11Debloat
 # (Assets/Start/start2.bin, MIT License, Copyright (c) 2020 Raphire).
@@ -1630,7 +1652,8 @@ $script:DirectApps = @(
         DetectName = 'FL Studio*'
     }
     # ---- drivers from the maker's own site, not Windows Update (superuser, 2026-09-27). PC only: a laptop keeps its
-    # maker's tuned drivers (AMD and Intel both say so). Every file must be signed by the vendor or it is not run.
+    # maker's tuned drivers (AMD and Intel both say so); never in a virtual machine (emulated chipset). Every file must be
+    # signed by the vendor or it is not run.
     @{  # AMD Chipset Software - Ryzen chipset, power management and (X3D) V-Cache drivers; one package for every Ryzen
         # board, read off the AM5 page (the file name changes: AMD_Chipset_Software_* / amd_software_*). amd.com serves
         # the file only with an amd.com Referer (else an HTML page). Only with AMD chipset devices present - a VM on an
@@ -1646,7 +1669,7 @@ $script:DirectApps = @(
         DetectName = 'AMD Chipset Software*'
         Signer     = 'Advanced Micro Devices'
         Machine    = 'PC'
-        Require    = { (Get-CpuVendor) -eq 'AuthenticAMD' -and (Test-PciVendor '1022') }
+        Require    = { (Get-CpuVendor) -eq 'AuthenticAMD' -and (Test-PciVendor '1022') -and -not (Test-VirtualMachine) }
         RequireMsg = 'no AMD chipset'
     }
     @{  # Intel Chipset Device Software (the INF update utility - mostly device names). Intel's page answers 403 to
@@ -1658,11 +1681,12 @@ $script:DirectApps = @(
             $m = [regex]::Match([string]$html, '(?i)https://downloadmirror\.intel\.com/\d+/SetupChipset\.exe')
             if ($m.Success) { $m.Value } else { 'https://downloadmirror.intel.com/925343/SetupChipset.exe' }   # 10.1.20658.8883
         }
-        SilentArgs = '-s -norestart'
-        DetectName = 'Intel(R) Chipset Device Software*'
+        SilentArgs = '/exenoui /qn /norestart'   # since 10.1.20378 an Advanced Installer package (the old -s is not silent);
+                                                  # verified on VM 102: silent, exit 0, 28 s
+        DetectName = 'SetupChipset*', 'Intel(R) Chipset Device Software*'   # the new name in Add/Remove Programs, and the old
         Signer     = 'Intel Corporation'
         Machine    = 'PC'
-        Require    = { (Get-CpuVendor) -eq 'GenuineIntel' -and (Test-PciVendor '8086') }
+        Require    = { (Get-CpuVendor) -eq 'GenuineIntel' -and (Test-PciVendor '8086') -and -not (Test-VirtualMachine) }
         RequireMsg = 'no Intel chipset'
     }
     @{  # AMD Software: Adrenalin Edition - the Radeon driver + its app. The combined "-c" package (RX 5000 and newer,
@@ -1680,11 +1704,13 @@ $script:DirectApps = @(
         }
         Headers    = @{ Referer = 'https://www.amd.com/' }
         SilentArgs = '-INSTALL'
+        WaitMainOnly = $true
         DetectName = 'AMD Software*'
         Signer     = 'Advanced Micro Devices'
         Machine    = 'PC'
-        Require    = { Test-GpuVendor '1002' 'Radeon' }
-        RequireMsg = 'no AMD Radeon graphics'
+        # not next to an NVIDIA card: Ryzen 7000 / 9000 CPUs have Radeon graphics of their own, often visible to Windows
+        Require    = { (Test-GpuVendor '1002' 'Radeon') -and -not (Test-GpuVendor '10DE' 'NVIDIA') }
+        RequireMsg = 'no AMD Radeon card (or an NVIDIA card is the main one)'
     }
 )
 # Apps that should get a Desktop icon (most make their own; these do not reliably). Keyed by winget ID
@@ -1883,6 +1909,19 @@ function Install-Alienware {
 function Get-CpuVendor {
     # 'AuthenticAMD' / 'GenuineIntel' (the CPU's own vendor string - not translated)
     return [string](Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1).Manufacturer
+}
+
+function Test-VirtualMachine {
+    # A virtual machine (Proxmox/QEMU, VMware, Hyper-V, VirtualBox, Parallels, Xen): its chipset is emulated - no chipset
+    # driver from AMD or Intel belongs there.
+    return ((Get-Hardware) -match '(?i)QEMU|VMware|Virtual Machine|VirtualBox|innotek|Parallels|Xen|KVM|Standard PC \(')
+}
+
+function Test-DualCcdX3D {
+    # A Ryzen X3D with two CCDs (7900X3D, 7950X3D, 9900X3D, 9950X3D, 7945HX3D...): AMD's V-Cache driver keeps games on the
+    # CCD with the cache by PARKING the other one - through the Balanced plan's core parking, which Ultimate switches off.
+    $c = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+    return ("$($c.Name)" -match 'X3D' -and [int]$c.NumberOfCores -gt 8)
 }
 
 function Test-PciVendor {

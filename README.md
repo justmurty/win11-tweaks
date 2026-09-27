@@ -9,7 +9,8 @@ console **and** a file so the run can be reviewed afterwards.
 
 - **53 tweaks** — 25 standard (Essential + Advanced + Customize Preferences toggles) + 28
   custom (shortcut-arrow off, Spotlight off + default wallpaper, **Ultimate Performance** on a PC — on a
-  laptop **Ultimate on the charger, Balanced on battery** (one plan, it switches by itself),
+  laptop **Ultimate on the charger, Balanced on battery** (one plan, it switches by itself); a Ryzen X3D
+  with two CCDs (7950X3D, 9950X3D...) keeps **Balanced**: AMD's V-Cache driver needs its core parking,
   **Memory Integrity / VBS off** for gaming, mouse acceleration off, DNS → Cloudflare,
   Explorer → This PC, taskbar cleanup (Search / Task view / Widgets / Chat / Resume off),
   **web/Bing, Store, highlights and cloud results in Start search off**, remove the Edge desktop
@@ -72,8 +73,9 @@ console **and** a file so the run can be reviewed afterwards.
   before its driver is in, **Bitwarden**, **Parsec**, **Google Play Games**, **FL Studio**) + on a PC the
   **drivers from the maker's own site** (not Windows Update), picked by the hardware: **AMD Chipset
   Software** on a Ryzen board, **Intel Chipset Device Software** on an Intel one, **AMD Software:
-  Adrenalin** with a Radeon card (every download must carry the vendor's signature or it isn't run; a
-  laptop keeps its maker's drivers) + **Alienware Command Center**, installed only on
+  Adrenalin** with a Radeon card and no NVIDIA one (every download must carry the vendor's signature or
+  it isn't run; a laptop keeps its maker's drivers; nothing of this in a virtual machine) +
+  **Alienware Command Center**, installed only on
   Alienware / Dell G-series hardware, desktop or laptop (a New user is asked). It also applies the
   **WinRAR license** and enables **.NET 3.5**
   (incl. 2.0/3.0) **and .NET 4** via DISM (like "Turn Windows features on/off").
@@ -173,8 +175,9 @@ New user automatically; if everyone must get it without being asked, also add it
   calling it FAILED. Battle.net's setup finishes after winget has stopped waiting for it (winget
   says "Installation abandoned"), so in that case the script gives it up to 5 minutes to land.
 - **No undo and no restore point** — if you want to roll back, take a snapshot/backup yourself
-  before the real run. The script remembers one thing on the PC: `HKLM\SOFTWARE\win11-tweaks`
-  `PromoAppsRemoved` (the date the promo apps went — later runs leave Store apps alone). The old Start
+  before the real run. The script remembers a few things on the PC under `HKLM\SOFTWARE\win11-tweaks`:
+  `PromoAppsRemoved` (the date the promo apps went — later runs leave Store apps alone) and
+  `PcPowerPlan` / `LaptopPowerPlan` (the power plan it made, so a re-run reuses it). The old Start
   layout is kept as `start2.bin.win11-tweaks.bak` next to the new one.
 - **winget needs an interactive session** — run via `Run-Win11Tweaks.bat` (double-click) or the
   one-liner in a PowerShell window on the PC itself, not over SSH/remoting (winget fails with

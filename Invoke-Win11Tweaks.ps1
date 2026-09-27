@@ -70,6 +70,9 @@ $script:Results              = [System.Collections.Generic.List[object]]::new()
 # The console view ("Rail", superuser's pick from the design page, 2026-09-28) - see Write-Ui
 $script:Version              = '1.6.0' # on the rail head - bumped with every release
 $script:Ui                   = -not $script:Detailed   # the console shows the rail; -Detailed puts the full log there instead
+# Cmdlets' own warnings ("WARNING: Restart is suppressed because NoRestart is specified.") would print straight onto the
+# rail's live line (seen in superuser's run, 2026-09-28). The rail says what matters; -Detailed still shows them.
+if ($script:Ui) { $WarningPreference = 'SilentlyContinue' }
 $script:UiLines              = [System.Collections.Generic.List[string]]::new()   # every rail line printed (the tests read it)
 $script:UiLive               = ''      # what the live line shows right now
 $script:LiveOpen             = $false  # the live line is on the console without its newline yet
@@ -485,7 +488,7 @@ function Remove-WinCapability {
         if (-not $caps) { Write-Log DEBUG "$Label not installed - nothing to remove" $Id; return }
         Write-Log INFO "removing $Label" $Id
         Set-LiveWhat $Label
-        foreach ($c in $caps) { $null = Remove-WindowsCapability -Online -Name $c.Name -ErrorAction Stop }
+        foreach ($c in $caps) { $null = Remove-WindowsCapability -Online -Name $c.Name -ErrorAction Stop -WarningAction SilentlyContinue }
         Write-Log DEBUG "removed $Label" $Id
         if (-not $script:UiRemoved.Contains($Label)) { $script:UiRemoved.Add($Label) }
     } catch { Write-Log WARN "$Label could not be removed: $($_.Exception.Message)" $Id }
@@ -500,7 +503,7 @@ function Disable-WinFeature {
         if (-not $f -or "$($f.State)" -ne 'Enabled') { Write-Log DEBUG "$Label not enabled - nothing to do" $Id; return }
         Write-Log INFO "removing $Label" $Id
         Set-LiveWhat $Label
-        $null = Disable-WindowsOptionalFeature -Online -FeatureName $Name -NoRestart -ErrorAction Stop
+        $null = Disable-WindowsOptionalFeature -Online -FeatureName $Name -NoRestart -ErrorAction Stop -WarningAction SilentlyContinue   # "restart suppressed" - the rail ends with "Restart the PC" anyway
         Write-Log DEBUG "disabled $Label" $Id
         $base = $Label -replace '\s*\(feature\)$', ''   # WMP Legacy is a capability AND a feature - one component
         if (-not $script:UiRemoved.Contains($base)) { $script:UiRemoved.Add($base) }
@@ -1349,7 +1352,7 @@ $script:Tweaks = @(
           # Only run the (slow) DISM disable if Recall is actually still Enabled - on a re-run it's already
           # off, and calling Disable-WindowsOptionalFeature again re-does the whole servicing pass for nothing.
           if ((Get-WindowsOptionalFeature -Online -FeatureName Recall -ErrorAction SilentlyContinue).State -eq 'Enabled') {
-              Disable-WindowsOptionalFeature -FeatureName Recall -Online -NoRestart -ErrorAction SilentlyContinue | Out-Null
+              Disable-WindowsOptionalFeature -FeatureName Recall -Online -NoRestart -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | Out-Null
           }
       }
   }}

@@ -16,11 +16,16 @@ console **and** a file so the run can be reviewed afterwards.
 - Shows the **MSUHost banner**, asks **`Continue? (Y/n)`** and **`PC or Laptop?`** (`1` PC / `2` Laptop).
   On a laptop the **Ultimate Performance** power plan is skipped (it keeps the CPU from idling —
   heat and battery drain) and **NZXT CAM** isn't installed (it's for desktop NZXT coolers/cases).
+- Then **`Gele, is that you?`** — `1` Yes: the full app set, as always. `2` New user: one **`(Y/n)`**
+  question per app (Enter = yes) before anything is downloaded; after the last answer the run goes on
+  by itself and installs only the picked apps (the rest show as SKIPPED "not selected"). Visual C++,
+  DirectX and .NET 3.5 are always installed. NVIDIA App is only offered with an NVIDIA card, Alienware
+  Command Center only on Alienware / Dell G hardware. Tweaks are the same for both.
 - Then the **install phase**: **12 Visual C++ redists** + **15 winget apps**
   (incl. VLC, Lightshot, TurboTop, WinRAR; NZXT CAM on a PC only) + **6 direct-download**
   (**Google Chrome**, **NVIDIA App** only if an NVIDIA GPU is present, **Bitwarden**, **Parsec**,
-  **Google Play Games**, **FL Studio**) + **Alienware Command Center**, installed automatically
-  (no prompt) only on Alienware / Dell G-series hardware, desktop or laptop. It also applies the
+  **Google Play Games**, **FL Studio**) + **Alienware Command Center**, installed only on
+  Alienware / Dell G-series hardware, desktop or laptop (a New user is asked). It also applies the
   **WinRAR license** and enables **.NET 3.5**
   (incl. 2.0/3.0) **and .NET 4** via DISM (like "Turn Windows features on/off").
 - **Pins "This PC"** and **Google Chrome** to the taskbar (via a temporary helper that is deleted
@@ -103,7 +108,9 @@ default Windows 11 shell use; PowerShell 7 has an open bug where Ctrl+C can skip
 Edit the arrays near the top of the install section of the script: `$script:AppsToInstall`
 for winget apps (add winget IDs, e.g. `'Mozilla.Firefox'`), `$script:DirectApps` for
 direct-download apps, or `$script:VendorApps` for apps that belong on one vendor's hardware
-(`Hardware` is a regex matched against the PC's manufacturer + model).
+(`Hardware` is a regex matched against the PC's manufacturer + model). A new app is offered to a
+New user automatically; if everyone must get it without being asked, also add its winget ID to
+`$script:RuntimeApps`.
 
 ## Notes
 

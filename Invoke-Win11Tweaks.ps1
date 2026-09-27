@@ -60,6 +60,7 @@ $script:RunFinished          = $false  # got to the end without being stopped
 $script:DotNet35Proc         = $null   # background DISM process for .NET 3.5 (started early, finished at the end)
 $script:PinHelper            = $null   # Pin-Taskbar helper path (kept after Invoke-TaskbarPins for the Chrome pin)
 $script:ChromePinned         = $false  # set by Add-ChromeTaskbarPin (right after Chrome installs) - Main refreshes the taskbar if true
+$script:NotSelected          = @{}     # apps a "New user" said n to (winget ID / direct-app Name / vendor Id) - the install phase skips them
 $script:Results              = [System.Collections.Generic.List[object]]::new()
 
 # --------------------------------------------------------------------------------------
@@ -883,8 +884,8 @@ $script:AppsToInstall = @(
     'SavardSoftware.TurboTop',           # always-on-top helper (on winget, not the savardsoftware.com exe)
     'RARLab.WinRAR'
 )
-# Vendor apps: installed AUTOMATICALLY - no y/N prompt - but ONLY on that vendor's hardware, desktop or
-# laptop alike (Hardware is a regex against Win32_ComputerSystem "<Manufacturer> <Model>"):
+# Vendor apps: installed automatically (a New user is asked, as for every app) but ONLY on that vendor's
+# hardware, desktop or laptop alike (Hardware is a regex against Win32_ComputerSystem "<Manufacturer> <Model>"):
 #   Alienware Command Center -> Alienware / Dell G-series (msstore - the Store only offers it there; if the
 #                               Store install fails, Install-Alienware falls back to Dell's direct installer).
 #                               Older G models have no "Dell " in the model ("Dell Inc. G5 5500"), newer ones
@@ -898,6 +899,9 @@ $script:VendorApps = @(
 $script:AppMachine = @{
     'NZXT.CAM' = 'PC'   # NZXT coolers / fans / cases - a desktop thing
 }
+# Runtimes in $script:AppsToInstall: installed for EVERY user - never offered in the "New user" app questions
+# (games and apps need them; the Visual C++ redists and .NET 3.5 aren't in the app lists at all).
+$script:RuntimeApps = @('Microsoft.DirectX')
 # Per-app install location for packages whose winget manifest REQUIRES one (otherwise
 # winget prompts "Specify the install root:" and blocks the run). Add IDs here as needed.
 $script:AppLocations = @{
@@ -1152,6 +1156,23 @@ function Install-Alienware {
     }
 }
 
+function Get-Hardware {
+    # "<Manufacturer> <Model>" - what $script:VendorApps' Hardware regexes are matched against
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    return ("{0} {1}" -f $cs.Manufacturer, $cs.Model).Trim()
+}
+
+function Skip-NotSelected {
+    # A "New user" said n to this app (or wasn't offered it): log it, record it as SKIPPED and return $true
+    # (the caller moves on).
+    param([string]$Key, [string]$Content, [string]$Label)
+    if (-not ($script:NotSelected -and $script:NotSelected.ContainsKey($Key))) { return $false }
+    $why = $script:NotSelected[$Key]; if ($why -isnot [string]) { $why = 'not selected' }
+    Write-Log INFO ("Skipping {0} ({1})" -f $Label, $why)
+    $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$Key; Content=$Content; Status='SKIPPED'; Detail=$why })
+    return $true
+}
+
 function Invoke-InstallPhase {
     Write-Log INFO "=========== INSTALLING APPS ==========="
 
@@ -1161,13 +1182,14 @@ function Invoke-InstallPhase {
             $script:Results.Add([pscustomobject]@{ Phase='VCRedist'; Id=$id; Content=$id; Status=$st; Detail='' })
         }
         foreach ($id in $script:AppsToInstall) {
+            $label = if ($script:AppNames.ContainsKey($id)) { $script:AppNames[$id] } else { $id }
             $only = $script:AppMachine[$id]
             if ($only -and $only -ne $script:MachineType) {   # e.g. NZXT CAM is PC only
-                $label = if ($script:AppNames.ContainsKey($id)) { $script:AppNames[$id] } else { $id }
                 Write-Log INFO ("Skipping {0} ({1} only)" -f $label, $only)
                 $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status='SKIPPED'; Detail="$only only" })
                 continue
             }
+            if (Skip-NotSelected -Key $id -Content $id -Label $label) { continue }   # no icon / WinRAR license either
             $st = Install-App -Id $id -Location $script:AppLocations[$id] -DetectName $script:AppDetectNames[$id]
             $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status=$st; Detail='' })
             if ($st -ne 'FAILED' -and $script:DesktopShortcutApps.ContainsKey($id)) { $sc = $script:DesktopShortcutApps[$id]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
@@ -1180,6 +1202,7 @@ function Invoke-InstallPhase {
 
     # Non-winget apps (direct vendor download): Bitwarden, Parsec, NVIDIA App (GPU only)
     foreach ($d in $script:DirectApps) {
+        if (Skip-NotSelected -Key $d.Name -Content $d.Name -Label $d.Name) { continue }   # no icon / Chrome pin either
         $st = Install-DirectDownload @d
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$d.Name; Content=$d.Name; Status=$st; Detail='direct' })
         if ($st -eq 'OK' -and $script:DesktopShortcutApps.ContainsKey($d.Name)) { $sc = $script:DesktopShortcutApps[$d.Name]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
@@ -1188,16 +1211,16 @@ function Invoke-InstallPhase {
 
     # (WinRAR license is created right after WinRAR installs, in the loop above - see Set-WinRarLicense.)
 
-    # Vendor apps LAST - auto-installed (no prompt) ONLY on that vendor's hardware, desktop or laptop alike:
+    # Vendor apps LAST - installed (a New user was asked) ONLY on that vendor's hardware, desktop or laptop alike:
     #   Alienware Command Center -> Alienware / Dell G-series.
-    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
-    $hw = ("{0} {1}" -f $cs.Manufacturer, $cs.Model).Trim()
+    $hw = Get-Hardware
     foreach ($a in $script:VendorApps) {
         if ($hw -notmatch $a.Hardware) {   # NOT a failure - just not this vendor's machine
             Write-Log DEBUG "$($a.Name): skipped (not $($a.Vendor) hardware: '$hw')"
             $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail="not $($a.Vendor) hardware" })
             continue
         }
+        if (Skip-NotSelected -Key $a.Id -Content $a.Name -Label $a.Name) { continue }
         if ($a.Id -eq '9PMHP03NJ9QP') { $st = Install-Alienware }   # Store first, then Dell's direct installer
         else { $st = Install-App -Id $a.Id -Name $a.Name -Source $a.Source }
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=$st; Detail=$hw })
@@ -1311,7 +1334,7 @@ function Test-TaskbarPinned {
 function Get-PinHelper {
     # Return a ready-to-use Pin-Taskbar helper path (in TEMP), fetching it ONCE and only when needed. Prefer
     # OUR copy next to the script (download/.bat -> no download); else fetch OUR copy from OUR repo (one-liner).
-    # Cached in $script:PinHelper (deleted by Add-ChromeTaskbarPin). Returns $null on failure.
+    # Cached in $script:PinHelper (deleted by Add-ChromeTaskbarPin, else at the end of Main). Returns $null on failure.
     if ($script:PinHelper -and (Test-Path $script:PinHelper)) { return $script:PinHelper }
     $helper = Join-Path $env:TEMP 'Pin-Taskbar.ps1'
     try {
@@ -1389,7 +1412,7 @@ function Invoke-TaskbarPins {
         catch { Write-Log WARN "unpin $app failed: $($_.Exception.Message)"; $u.Detail = $_.Exception.Message }
         $script:Results.Add($u)
     }
-    # (helper kept for Add-ChromeTaskbarPin, which deletes it)
+    # (helper kept for Add-ChromeTaskbarPin, which deletes it - Main's finally does if Chrome was left out)
 }
 
 function Add-ChromeTaskbarPin {
@@ -1451,12 +1474,67 @@ function Show-Intro {
         $script:MachineType = if ($Machine -eq 'Laptop') { 'Laptop' } else { 'PC' }
     } elseif ([Environment]::UserInteractive) {
         do { $mt = Read-Host "  Is this a Desktop PC or a Laptop?   [1] PC    [2] Laptop" }
-        until ($mt -match '^\s*[12]\s*$')
-        $script:MachineType = if ($mt.Trim() -eq '2') { 'Laptop' } else { 'PC' }
+        until ($null -eq $mt -or $mt -match '^\s*[12]\s*$')   # $null = no keyboard (input redirected) -> the default
+        $script:MachineType = if ("$mt".Trim() -eq '2') { 'Laptop' } else { 'PC' }
     } else {
         $script:MachineType = 'PC'   # non-interactive default (override with -Machine PC|Laptop)
     }
+    # Who is it? Gele gets the full app set, as always. A New user answers (Y/n) for every app BEFORE anything
+    # is downloaded; after the last answer the run goes on unattended. Non-interactive = Gele.
+    $newUser = $false
+    if ([Environment]::UserInteractive) {
+        do { $who = Read-Host "  Gele, is that you?   [1] Yes    [2] New user" }
+        until ($null -eq $who -or $who -match '^\s*[12]\s*$')   # $null = no keyboard -> Gele
+        $newUser = "$who".Trim() -eq '2'
+        if ($newUser) { $sel = Read-AppSelection }
+    }
     Write-Log INFO ("Machine type: {0}" -f $script:MachineType)
+    if ($newUser) { Write-Log INFO ("User: New user - {0} of {1} apps selected" -f $sel.Picked, $sel.Asked) }
+    else          { Write-Log INFO "User: Gele - installing all apps" }
+}
+
+function Get-AppChoices {
+    # The apps a New user is asked about, in install order: the winget apps (minus the runtimes and the apps
+    # for the other machine type), the direct downloads whose gate passes (NVIDIA App only with an NVIDIA card)
+    # and the vendor apps for this hardware (Alienware Command Center on Alienware / Dell G).
+    # Key = what the install phase looks up in $script:NotSelected.
+    $list = [System.Collections.Generic.List[object]]::new()
+    foreach ($id in $script:AppsToInstall) {
+        if ($script:RuntimeApps -contains $id) { continue }
+        $only = $script:AppMachine[$id]
+        if ($only -and $only -ne $script:MachineType) { continue }
+        $list.Add([pscustomobject]@{ Key = $id; Name = $(if ($script:AppNames.ContainsKey($id)) { $script:AppNames[$id] } else { $id }) })
+    }
+    foreach ($d in $script:DirectApps) {
+        if ($d.Require) { $met = $false; try { $met = [bool](& $d.Require) } catch { }; if (-not $met) { continue } }
+        $list.Add([pscustomobject]@{ Key = $d.Name; Name = $d.Name })
+    }
+    $hw = Get-Hardware
+    foreach ($a in $script:VendorApps) {
+        if ($hw -match $a.Hardware) { $list.Add([pscustomobject]@{ Key = $a.Id; Name = $a.Name }) }
+    }
+    return $list
+}
+
+function Read-AppSelection {
+    # New user: one (Y/n) per app - Enter (or anything but n/no) = yes. The no's go into $script:NotSelected.
+    # Returns how many apps were asked about (.Asked) and picked (.Picked).
+    $choices = @(Get-AppChoices)
+    Write-Host ""
+    Write-Host "  Pick the apps to install - Enter = yes, n = no."
+    Write-Host "  Visual C++, DirectX and .NET 3.5 are always installed - games and apps need them." -ForegroundColor DarkGray
+    Write-Host ""
+    $no = 0
+    foreach ($c in $choices) {
+        $ans = Read-Host ("    {0,-26}(Y/n)" -f $c.Name)
+        if ($ans -match '^\s*(n|no)\s*$') { $script:NotSelected[$c.Key] = 'not selected'; $no++ }
+    }
+    Write-Host ""
+    # A direct app that wasn't offered (its gate failed - e.g. no NVIDIA driver yet) must not install later
+    # either: the install phase checks the gate again, and Windows Update can add the NVIDIA driver mid-run.
+    $offered = @($choices | ForEach-Object { $_.Key })
+    foreach ($d in $script:DirectApps) { if ($offered -notcontains $d.Name) { $script:NotSelected[$d.Name] = 'not offered' } }
+    return [pscustomobject]@{ Asked = $choices.Count; Picked = $choices.Count - $no }
 }
 
 # --------------------------------------------------------------------------------------
@@ -1488,6 +1566,9 @@ finally {
         Write-Summary
         Write-Log INFO ("=========== WIN11-TWEAKS {0} ===========" -f $(if ($script:RunFinished) { 'DONE' } else { 'STOPPED' }))
     }
+    # The Pin-Taskbar helper is normally deleted by the Chrome pin - but not when Chrome was left out (New user)
+    # or the run was stopped before it. Don't leave it in TEMP.
+    if ($script:PinHelper) { Remove-Item $script:PinHelper -Force -ErrorAction SilentlyContinue; $script:PinHelper = $null }
     try { Stop-Transcript | Out-Null } catch { }
 }
 if ($script:RunFinished -and $Reboot -and -not $script:DryRun) {

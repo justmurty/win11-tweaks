@@ -61,6 +61,7 @@ $script:DotNet35Proc         = $null   # background DISM process for .NET 3.5 (s
 $script:PinHelper            = $null   # Pin-Taskbar helper path (kept after Invoke-TaskbarPins for the Chrome pin)
 $script:ChromePinned         = $false  # set by Add-ChromeTaskbarPin (right after Chrome installs) - Main refreshes the taskbar if true
 $script:NotSelected          = @{}     # apps a "New user" said n to (winget ID / direct-app Name / vendor Id) - the install phase skips them
+$script:ConsoleModeSaved     = $null   # console input mode before Set-QuickEdit turned QuickEdit off (put back at the end)
 $script:Results              = [System.Collections.Generic.List[object]]::new()
 
 # --------------------------------------------------------------------------------------
@@ -1445,6 +1446,39 @@ function Add-ChromeTaskbarPin {
     return $pinned
 }
 
+function Set-QuickEdit {
+    # The classic console window PAUSES the whole run when someone clicks into it (QuickEdit "Select" mode)
+    # until Enter/Esc - an unattended run then just sits there. Turn QuickEdit off for the run; -Restore puts
+    # the original mode back (so text can be selected again afterwards). No-op without a real console
+    # (SSH, ISE, redirected input) and in Windows Terminal, where a click never pauses anything.
+    param([switch]$Restore)
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'Native.ConsoleMode').Type) {
+            Add-Type -Namespace Native -Name ConsoleMode -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
+public static extern System.IntPtr GetStdHandle(int nStdHandle);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool GetConsoleMode(System.IntPtr hConsoleHandle, out uint lpMode);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool SetConsoleMode(System.IntPtr hConsoleHandle, uint dwMode);
+'@ -ErrorAction Stop
+        }
+        $h = [Native.ConsoleMode]::GetStdHandle(-10)   # STD_INPUT_HANDLE
+        if ($Restore) {
+            if ($null -ne $script:ConsoleModeSaved) { [void][Native.ConsoleMode]::SetConsoleMode($h, $script:ConsoleModeSaved); $script:ConsoleModeSaved = $null }
+            return
+        }
+        $mode = [uint32]0
+        if (-not [Native.ConsoleMode]::GetConsoleMode($h, [ref]$mode)) { return }   # no console
+        if (-not ($mode -band 0x40)) { return }                                     # QuickEdit is already off
+        $script:ConsoleModeSaved = $mode
+        # clear ENABLE_QUICK_EDIT_MODE (0x40); ENABLE_EXTENDED_FLAGS (0x80) must be set for that to stick
+        if ([Native.ConsoleMode]::SetConsoleMode($h, [uint32](($mode -bor 0x80) - 0x40))) {
+            Write-Log DEBUG "QuickEdit off for the run (a click in the window would pause it)"
+        }
+    } catch { Write-Log DEBUG "console mode left as is: $($_.Exception.Message)" }
+}
+
 function Test-Interactive {
     # Is someone at a console to answer questions? (Not over SSH / a service - there it's $false.) Wrapped so the
     # tests can say yes on a non-interactive runner.
@@ -1561,6 +1595,7 @@ function Read-AppSelection {
 #  Main
 # --------------------------------------------------------------------------------------
 try {
+    Set-QuickEdit                       # a click into the window must not pause the run (restored in finally)
     Show-Intro
     if ($script:Cancelled) { return }   # user answered "n" to Continue
     $script:RunStarted = $true          # from here on the summary is written - also if the run is stopped (see finally)
@@ -1589,6 +1624,7 @@ finally {
     # The Pin-Taskbar helper is normally deleted by the Chrome pin - but not when Chrome was left out (New user)
     # or the run was stopped before it. Don't leave it in TEMP.
     if ($script:PinHelper) { Remove-Item $script:PinHelper -Force -ErrorAction SilentlyContinue; $script:PinHelper = $null }
+    Set-QuickEdit -Restore
     try { Stop-Transcript | Out-Null } catch { }
 }
 if ($script:RunFinished -and $Reboot -and -not $script:DryRun) {

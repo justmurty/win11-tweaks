@@ -63,6 +63,7 @@ $script:ChromePinned         = $false  # set by Add-ChromeTaskbarPin (right afte
 $script:NotSelected          = @{}     # apps a "New user" said n to (winget ID / direct-app Name / vendor Id) - the install phase skips them
 $script:KeepApps             = @{}     # built-in apps a "New user" keeps (appx name -> label) - the app removal leaves them
 $script:SettingsPagesHidden  = @()     # Settings pages hidden so far in this run (SettingsPageVisibility is one merged string)
+$script:ProgressOpen         = $false  # a Write-Bar line is on the console without its newline yet (Write-Log ends it first)
 $script:ConsoleModeSaved     = $null   # console input mode before Set-QuickEdit turned QuickEdit off (put back at the end)
 $script:Results              = [System.Collections.Generic.List[object]]::new()
 
@@ -144,6 +145,7 @@ function Write-Log {
     try { Add-Content -Path $script:LogFile -Value ("{0} [{1,-5}] {2}{3}" -f $ts, $Level, $tag, $Message) -Encoding UTF8 -ErrorAction SilentlyContinue } catch { }
     if ($Level -eq 'WARN') { $script:WarnCount++ }   # Invoke-Tweaks compares this before/after each tweak
     if ($Level -eq 'DEBUG' -and -not $script:Detailed) { return }   # concise console - hide DEBUG unless -Detailed
+    if ($script:ProgressOpen) { Write-Host ''; $script:ProgressOpen = $false }   # a WARN mid-bar gets its own line
     $color = switch ($Level) {
         'OK'    { 'Green' }
         'WARN'  { 'Yellow' }
@@ -152,6 +154,19 @@ function Write-Log {
         default { 'Gray' }
     }
     Write-Host ("{0} [{1,-5}] {2}" -f $ts, $Level, $Message) -ForegroundColor $color
+}
+
+function Write-Bar {
+    # A loading bar on ONE console line, redrawn in place:  "  ==========..........  10/20". Console only - the log
+    # file gets the real per-item lines. Write-Log ends an unfinished bar line before it prints anything.
+    param([int]$Done, [int]$Total, [int]$Width = 20)
+    $fill = [int][math]::Floor($Width * $Done / [math]::Max($Total, 1))
+    Write-Host "`r  " -NoNewline
+    Write-Host ('=' * $fill) -NoNewline -ForegroundColor Cyan
+    Write-Host ('.' * ($Width - $fill)) -NoNewline -ForegroundColor DarkGray
+    Write-Host ("  {0}/{1}" -f $Done, $Total) -NoNewline -ForegroundColor White
+    $script:ProgressOpen = $true
+    if ($Done -ge $Total) { Write-Host ''; $script:ProgressOpen = $false }
 }
 
 function Set-Reg {
@@ -1103,14 +1118,18 @@ $script:Tweaks = @(
           'dmwappushservice'='Manual'; 'SCardSvr'='Manual'; 'TermService'='Manual'; 'SessionEnv'='Manual'        # WAP Push Message Routing, Smart Card, Remote Desktop (+ Configuration)
           'UmRdpService'='Manual'; 'RemoteAccess'='Disabled'; 'TapiSrv'='Manual'; 'lmhosts'='Manual'             # RDP UserMode Port Redirector, Routing and Remote Access, Telephony, TCP/IP NetBIOS Helper
       }
+      # a loading bar on the console (superuser's design); -Detailed prints every step instead
+      $bar = -not $script:Detailed; $i = 0
+      if ($bar) { Write-Host '  Setting services to manual:' -ForegroundColor Yellow; Write-Bar -Done 0 -Total $svcs.Count }
       foreach ($name in $svcs.Keys) {
           $want = $svcs[$name]
           $s = Get-Service -Name $name -ErrorAction SilentlyContinue
-          if (-not $s) { Write-Log DEBUG "service $name not present on this system; skipping" $id; continue }
-          $now = "$($s.StartType)"
-          if ($now -eq $want) { Write-Log DEBUG "service $name already $want" $id; continue }
-          if ($want -eq 'Manual' -and $now -eq 'Disabled') { Write-Log DEBUG "service $name is Disabled - left off" $id; continue }
-          Set-Svc -Id $id -Name $name -StartupType $want
+          if (-not $s) { Write-Log DEBUG "service $name not present on this system; skipping" $id }
+          elseif ("$($s.StartType)" -eq $want) { Write-Log DEBUG "service $name already $want" $id }
+          elseif ($want -eq 'Manual' -and "$($s.StartType)" -eq 'Disabled') { Write-Log DEBUG "service $name is Disabled - left off" $id }
+          else { Set-Svc -Id $id -Name $name -StartupType $want }
+          $i++
+          if ($bar) { Start-Sleep -Milliseconds 60; Write-Bar -Done $i -Total $svcs.Count }   # ~1 s in all, so the bar is seen moving
       }
   }}
 

@@ -45,6 +45,9 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+# The window's own progress / warning settings - put back at the end: `irm | iex` from an already elevated window runs
+# this in that window's own scope, and it should not stay silenced after the run.
+$script:SavedPrefs = @{ Progress = $ProgressPreference; Warning = $WarningPreference }
 # Silence ALL cmdlet progress banners (Disable-WindowsOptionalFeature, Remove-AppxProvisionedPackage,
 # Get-AppxPackage, Invoke-WebRequest, ...). Those blue "Running [ooooo]" bars sometimes fail to clear and
 # "stick" at the top of the console while the script keeps going underneath. We use our own [OK]/Done!
@@ -70,8 +73,9 @@ $script:Results              = [System.Collections.Generic.List[object]]::new()
 # The console view ("Rail", superuser's pick from the design page, 2026-09-28) - see Write-Ui
 $script:Version              = '1.6.0' # on the rail head - bumped with every release
 $script:Ui                   = -not $script:Detailed   # the console shows the rail; -Detailed puts the full log there instead
-# Cmdlets' own warnings ("WARNING: Restart is suppressed because NoRestart is specified.") would print straight onto the
-# rail's live line (seen in superuser's run, 2026-09-28). The rail says what matters; -Detailed still shows them.
+# Cmdlets' own warnings would print straight onto the rail's live line (superuser's run, 2026-09-28: DISM's "WARNING:
+# Restart is suppressed because NoRestart is specified.") - off in the rail view; -Detailed shows the other cmdlet warnings
+# (that DISM one is switched off where it's called - the restart advice comes from the script itself).
 if ($script:Ui) { $WarningPreference = 'SilentlyContinue' }
 $script:UiLines              = [System.Collections.Generic.List[string]]::new()   # every rail line printed (the tests read it)
 $script:UiLive               = ''      # what the live line shows right now
@@ -2089,7 +2093,7 @@ function Invoke-Tweaks {
         else { Show-Live (Format-Row -Glyph "{b:$($script:G.Run)}" -Name $t.Content -NameWidth 60 -Right "$n/$($list.Count)") }
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $status = 'OK'; $detail = ''; $warnsBefore = $script:WarnCount
-        try { & $t.Apply }
+        try { $null = & $t.Apply }   # a stray output would print onto the live line
         catch { $status = 'FAILED'; $detail = $_.Exception.Message; Write-Log ERROR "tweak failed: $detail" $t.Id }
         # Set-Reg / Set-Svc / Invoke-Step log a WARN instead of throwing -> a tweak with a failed step is WARN, not OK
         if ($status -eq 'OK' -and $script:WarnCount -gt $warnsBefore) {
@@ -2913,6 +2917,7 @@ finally {
     if ($script:PinHelper) { Remove-Item $script:PinHelper -Force -ErrorAction SilentlyContinue; $script:PinHelper = $null }
     Set-QuickEdit -Restore
     try { Stop-Transcript | Out-Null } catch { }
+    if ($script:SavedPrefs) { $ProgressPreference = $script:SavedPrefs.Progress; $WarningPreference = $script:SavedPrefs.Warning }   # the window's own settings
 }
 if ($script:RunFinished -and $Reboot -and -not $script:DryRun) {
     Write-Log WARN "Rebooting in 15s (-Reboot given). Press Ctrl+C to cancel."

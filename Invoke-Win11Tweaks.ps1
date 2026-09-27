@@ -1099,7 +1099,7 @@ $script:Tweaks = @(
       $svcs = [ordered]@{
           'Fax'='Manual'; 'MapsBroker'='Manual'; 'RetailDemo'='Manual'; 'PhoneSvc'='Manual'; 'icssvc'='Manual'   # Downloaded Maps Manager, Phone Service, Mobile Hotspot
           'lfsvc'='Manual'; 'WpcMonSvc'='Manual'; 'AssignedAccessManagerSvc'='Manual'; 'wisvc'='Manual'          # Geolocation, Parental Controls, Windows Insider Service
-          'SEMgrSvc'='Manual'; 'WalletService'='Manual'; 'TrkWks'='Manual'; 'DiagTrack'='Disabled'              # Payments and NFC, Distributed Link Tracking, Connected User Experiences and Telemetry
+          'SEMgrSvc'='Manual'; 'WalletService'='Manual'; 'DiagTrack'='Disabled'                                 # Payments and NFC, Connected User Experiences and Telemetry
           'dmwappushservice'='Manual'; 'SCardSvr'='Manual'; 'TermService'='Manual'; 'SessionEnv'='Manual'        # WAP Push Message Routing, Smart Card, Remote Desktop (+ Configuration)
           'UmRdpService'='Manual'; 'RemoteAccess'='Disabled'; 'TapiSrv'='Manual'; 'lmhosts'='Manual'             # RDP UserMode Port Redirector, Routing and Remote Access, Telephony, TCP/IP NetBIOS Helper
       }

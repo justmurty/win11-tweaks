@@ -36,7 +36,7 @@ console **and** a file so the run can be reviewed afterwards.
     tabs / default-browser and sign-in nags / sidebar;
   - **rarely used services to Manual** — Fax, Downloaded Maps Manager, Retail Demo, Phone Service, Mobile
     Hotspot, Geolocation, Parental Controls, Assigned Access Manager, Windows Insider, Payments and NFC,
-    Wallet, Distributed Link Tracking, WAP Push, Smart Card, Remote Desktop (+ Configuration, UserMode
+    Wallet, WAP Push, Smart Card, Remote Desktop (+ Configuration, UserMode
     Port Redirector), Telephony, TCP/IP NetBIOS Helper; **Disabled**: Connected User Experiences and
     Telemetry, Routing and Remote Access (a service that is Disabled is never raised to Manual);
   - **Copilot** "share" button on taskbar previews and Click to Do off; **Windows Error Reporting** off;

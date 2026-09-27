@@ -1445,6 +1445,12 @@ function Add-ChromeTaskbarPin {
     return $pinned
 }
 
+function Test-Interactive {
+    # Is someone at a console to answer questions? (Not over SSH / a service - there it's $false.) Wrapped so the
+    # tests can say yes on a non-interactive runner.
+    return [Environment]::UserInteractive
+}
+
 function Show-Intro {
     $art = @'
  __  __  _____ _    _ _    _           _
@@ -1460,7 +1466,7 @@ function Show-Intro {
     Write-Host "  Applies Windows 11 tweaks (privacy, debloat, UI, performance) and installs" -ForegroundColor Gray
     Write-Host "  a set of apps + Visual C++ / .NET runtimes.  Full log saved next to the script." -ForegroundColor Gray
     Write-Host ""
-    if ([Environment]::UserInteractive) {
+    if (Test-Interactive) {
         $ans = Read-Host "  Continue? (Y/n)"
         if ($ans -match '^\s*(n|no)\s*$') {
             Write-Host "  Cancelled - nothing was changed." -ForegroundColor Red
@@ -1472,25 +1478,39 @@ function Show-Intro {
     # Center goes by the actual hardware instead - see Invoke-InstallPhase.)
     if ($Machine -eq 'PC' -or $Machine -eq 'Laptop') {
         $script:MachineType = if ($Machine -eq 'Laptop') { 'Laptop' } else { 'PC' }
-    } elseif ([Environment]::UserInteractive) {
-        do { $mt = Read-Host "  Is this a Desktop PC or a Laptop?   [1] PC    [2] Laptop" }
-        until ($null -eq $mt -or $mt -match '^\s*[12]\s*$')   # $null = no keyboard (input redirected) -> the default
-        $script:MachineType = if ("$mt".Trim() -eq '2') { 'Laptop' } else { 'PC' }
+    } elseif (Test-Interactive) {
+        $mt = Read-Choice -Title 'Is this a PC or a Laptop?' -Options 'PC', 'Laptop'
+        $script:MachineType = if ($mt -eq '2') { 'Laptop' } else { 'PC' }   # $null (no keyboard) -> PC
     } else {
         $script:MachineType = 'PC'   # non-interactive default (override with -Machine PC|Laptop)
     }
     # Who is it? Gele gets the full app set, as always. A New user answers (Y/n) for every app BEFORE anything
     # is downloaded; after the last answer the run goes on unattended. Non-interactive = Gele.
     $newUser = $false
-    if ([Environment]::UserInteractive) {
-        do { $who = Read-Host "  Gele, is that you?   [1] Yes    [2] New user" }
-        until ($null -eq $who -or $who -match '^\s*[12]\s*$')   # $null = no keyboard -> Gele
-        $newUser = "$who".Trim() -eq '2'
+    if (Test-Interactive) {
+        $newUser = (Read-Choice -Options 'Gele, is that you?', 'New user') -eq '2'   # $null (no keyboard) -> Gele
         if ($newUser) { $sel = Read-AppSelection }
     }
     Write-Log INFO ("Machine type: {0}" -f $script:MachineType)
     if ($newUser) { Write-Log INFO ("User: New user - {0} of {1} apps selected" -f $sel.Picked, $sel.Asked) }
     else          { Write-Log INFO "User: Gele - installing all apps" }
+}
+
+function Read-Choice {
+    # A small coloured menu - an optional title, one "[n] option" per line - then "Select [1/n]" until a valid
+    # number is typed. Returns that number as a string, or $null when there's no keyboard (input redirected:
+    # Read-Host gives nothing back), so the caller falls back to its default instead of asking forever.
+    param([string]$Title, [string[]]$Options)
+    Write-Host ""
+    if ($Title) { Write-Host "  $Title" -ForegroundColor Yellow }
+    for ($i = 0; $i -lt $Options.Count; $i++) {
+        Write-Host ("  [{0}] " -f ($i + 1)) -NoNewline -ForegroundColor Cyan
+        Write-Host $Options[$i] -ForegroundColor White
+    }
+    do { $ans = Read-Host ("  Select [1/{0}]" -f $Options.Count) }
+    until ($null -eq $ans -or ($ans -match '^\s*\d+\s*$' -and [int]$ans -ge 1 -and [int]$ans -le $Options.Count))
+    if ($null -eq $ans) { return $null }
+    return $ans.Trim()
 }
 
 function Get-AppChoices {
@@ -1521,7 +1541,7 @@ function Read-AppSelection {
     # Returns how many apps were asked about (.Asked) and picked (.Picked).
     $choices = @(Get-AppChoices)
     Write-Host ""
-    Write-Host "  Pick the apps to install - Enter = yes, n = no."
+    Write-Host "  Pick the apps to install - Enter = yes, n = no." -ForegroundColor Yellow
     Write-Host "  Visual C++, DirectX and .NET 3.5 are always installed - games and apps need them." -ForegroundColor DarkGray
     Write-Host ""
     $no = 0

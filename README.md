@@ -13,10 +13,11 @@ console **and** a file so the run can be reviewed afterwards.
   Explorer → This PC, taskbar cleanup (Search / Task view / Widgets / Chat / Resume off),
   **web/Bing + Store search in Start off**, remove the Edge desktop shortcut). Details:
   [`docs/2026-07-11-win11-tweaks-design.md`](docs/2026-07-11-win11-tweaks-design.md).
-- Shows the **MSUHost banner**, asks **`Continue? (Y/n)`** and **`PC or Laptop?`** (`1` PC / `2` Laptop).
+- Shows the **MSUHost banner**, asks **`Continue? (Y/n)`**, then two small menus (one option per line,
+  answered with `Select [1/2]`). **`Is this a PC or a Laptop?`** — `[1] PC` / `[2] Laptop`.
   On a laptop the **Ultimate Performance** power plan is skipped (it keeps the CPU from idling —
   heat and battery drain) and **NZXT CAM** isn't installed (it's for desktop NZXT coolers/cases).
-- Then **`Gele, is that you?`** — `1` Yes: the full app set, as always. `2` New user: one **`(Y/n)`**
+- Then **`[1] Gele, is that you?`** / **`[2] New user`**. `1`: the full app set, as always. `2`: one **`(Y/n)`**
   question per app (Enter = yes) before anything is downloaded; after the last answer the run goes on
   by itself and installs only the picked apps (the rest show as SKIPPED "not selected"). Visual C++,
   DirectX and .NET 3.5 are always installed. NVIDIA App is only offered with an NVIDIA card, Alienware

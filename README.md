@@ -2,8 +2,8 @@
 
 A single, no-GUI PowerShell script that applies a fixed set of Windows 11 tweaks,
 then installs a defined application set (winget +
-direct downloads), and finally enables the .NET features. Everything is logged to the
-console **and** a file so the run can be reviewed afterwards.
+direct downloads), and finally enables the .NET features. The console shows a compact view of
+the run (see [The console](#the-console)); every detail goes to a log file for later.
 
 ## What it does
 
@@ -125,6 +125,34 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Invoke-Win11Tweaks.ps1
 Open PowerShell/Terminal **as administrator**, `cd` to the script's folder, and run it. On
 PowerShell 7 use `pwsh` instead of `powershell`.
 
+## The console
+
+A rail down the left, from the questions to the result:
+
+```
+  ┌  MSUHost  win11-tweaks 1.6.0
+  ?  Continue? (Y/n) › y
+  ?  Who is it?  1 Gele  2 New user  › 1
+  ├─ WIN11-TEST · Windows 11 Pro 25H2 (26200) · PC · Gele
+  ├─ Tweaks
+  │  √ Privacy           telemetry, activity history, location, error reports        4.3s
+  │  ! Edge              Microsoft Edge - Debloat: 1 step(s) failed - see the log     140ms
+  ├─ Apps
+  │  √ Battle.net                      + desktop icon                              1m 18s
+  │  × Google Chrome                   installer exit code 1603, see the log       1m 01s
+  │  ► Epic Games Launcher             installing                                   00:07
+  ├─ .NET 3.5   ready · downloaded next to the apps
+  ├─ Finishing
+  └─ Done in 19m 29s   93 OK · 7 skipped · 0 failed
+     ► Restart the PC to finish. Windows completes some changes only at a restart.
+```
+
+The tweaks show as groups once they're done; every app gets its line with its time; the step
+running now is one live line with a clock, redrawn in place. Problems are listed again at the
+end. It uses only the 16 console colours and characters every Windows console font has, so it
+looks the same in Windows Terminal and in the old console. `-Detailed` shows the full log on
+the console instead (the old view).
+
 ## The log
 
 The log is written **in the same folder as the script**, named:
@@ -133,10 +161,10 @@ The log is written **in the same folder as the script**, named:
 win11-tweaks_YYYYMMDD_HHMMSS.log
 ```
 
-The script prints the full log path at the start and end. Lines are timestamped and levelled
+The console shows the log path at the end. Lines are timestamped and levelled
 (`[DEBUG] [INFO] [OK] [WARN] [ERROR]`), with a summary table at the end. A compact
-`*_results.txt` is written alongside it. The console stays concise; the log file always has full
-detail (use `-Detailed` for verbose console output).
+`*_results.txt` is written alongside it. The log file always has every detail (use `-Detailed`
+to see it on the console as the run goes).
 
 Each item in the summary gets one status: `OK`, `WARN` (applied, but a step failed — see the
 log), `FAILED`, `SKIPPED` (not needed, or not for this machine), `DRYRUN`, or `BACKGROUND`
@@ -150,7 +178,7 @@ default Windows 11 shell use; PowerShell 7 has an open bug where Ctrl+C can skip
 |------|--------|
 | `-DryRun` | Log what it WOULD do, change **nothing**. Run this first. |
 | (none) | Actually apply the tweaks + install the apps. |
-| `-Detailed` | Verbose console output (the log file is always full). |
+| `-Detailed` | The full log on the console instead of the rail (the log file is always full). |
 | `-Machine PC\|Laptop` | Skip the "PC or Laptop?" question (`Laptop`: Ultimate only on the charger, keeps hibernation and the panel's refresh rate, no NZXT CAM; `PC`: plain Ultimate, no battery tweaks). |
 | `-Reboot` | Reboot 15s after finishing (cancel with Ctrl+C). |
 | `-LogDir <path>` | Different folder for the log (default: the script's folder). |

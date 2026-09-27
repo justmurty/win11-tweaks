@@ -3,8 +3,8 @@
 .SYNOPSIS
     Applies a fixed set of Windows 11 tweaks, then installs a defined application set via
     winget (plus Visual C++ redists, .NET features and, on a PC, the chipset / Radeon drivers from
-    the maker's own site). No GUI. Logs everything to the
-    console AND a file so the run can be reviewed afterwards.
+    the maker's own site). No GUI. The console shows a compact view of the run (a rail: the tweaks as
+    groups, one line per app, the step running now); everything goes to a log file for later.
 
 .DESCRIPTION
     The 53 tweaks (25 standard + 28 custom) and the install list are a fixed, curated set
@@ -65,9 +65,35 @@ $script:ChromePinned         = $false  # set by Add-ChromeTaskbarPin (right afte
 $script:NotSelected          = @{}     # apps a "New user" said n to (winget ID / direct-app Name / vendor Id) - the install phase skips them
 $script:KeepApps             = @{}     # built-in apps a "New user" keeps (appx name -> label) - the app removal leaves them
 $script:SettingsPagesHidden  = @()     # Settings pages hidden so far in this run (SettingsPageVisibility is one merged string)
-$script:ProgressOpen         = $false  # a Write-Bar line is on the console without its newline yet (Write-Log ends it first)
 $script:ConsoleModeSaved     = $null   # console input mode before Set-QuickEdit turned QuickEdit off (put back at the end)
 $script:Results              = [System.Collections.Generic.List[object]]::new()
+# The console view ("Rail", superuser's pick from the design page, 2026-09-28) - see Write-Ui
+$script:Version              = '1.6.0' # on the rail head - bumped with every release
+$script:Ui                   = -not $script:Detailed   # the console shows the rail; -Detailed puts the full log there instead
+$script:UiLines              = [System.Collections.Generic.List[string]]::new()   # every rail line printed (the tests read it)
+$script:UiLive               = ''      # what the live line shows right now
+$script:LiveOpen             = $false  # the live line is on the console without its newline yet
+$script:Live                 = $null   # the step running now: Name / What / Clock - Update-LiveTick redraws it with the time
+$script:UiNotes              = @{}     # tweak Id -> what came of it, for its Finishing line ('7 removed: ...')
+$script:UiCount              = @{ Appx = 0; Svc = 0 }   # apps removed / services changed - for the tweak group lines
+$script:UiRemoved            = [System.Collections.Generic.List[string]]::new()   # old components removed (their labels)
+$script:ItemNote             = ''      # what an installer says about the app it just handled ('already installed', a skip reason)
+$script:ItemFail             = ''      # ... or why it failed ('winget exit code 0x8A150011')
+$script:RunClock             = $null   # started when the run starts ("Done in 19m 29s")
+$script:DotNet35Clock        = $null   # started with the .NET 3.5 download
+$script:UserLabel            = 'Gele'  # "Gele" / "New user, 14 of 21 apps" - on the machine line
+$script:LastPrompt           = ''      # the question on the console right now, as plain text
+# Console glyphs - made at run time, so this file stays pure ASCII. Only characters Cascadia Mono AND Consolas have: the
+# old console (conhost) has no fallback font, so anything else (rounded corners, check marks, braille spinners) shows as a box.
+$script:G = @{
+    Top = [string][char]0x250C; Bar = [string][char]0x2502; Tee = [string][char]0x251C; End = [string][char]0x2514
+    Rule = [string][char]0x2500; Ok = [string][char]0x221A; Dot = [string][char]0x00B7; Fail = [string][char]0x00D7
+    Run = [string][char]0x25BA; Next = [string][char]0x203A; Full = [string][char]0x2588; Empty = [string][char]0x2591
+    More = [string][char]0x2026; Dash = [string][char]0x2013
+}
+# Rail markup "{b:text}" -> console colour. Only the 16 console colours - they follow the terminal's colour scheme.
+# Blue is #3B78FF in Windows Terminal's default scheme - the MSUHost blue.
+$script:UiColors = @{ d = 'DarkGray'; w = 'White'; b = 'Blue'; g = 'Green'; y = 'Yellow'; r = 'Red'; c = 'Cyan' }
 
 # --------------------------------------------------------------------------------------
 #  Bootstrap: elevation, HKU: drive, log file + transcript
@@ -103,7 +129,7 @@ if (-not $isAdmin) {
             Invoke-WebRequest -Uri $SelfUrl -OutFile $scriptFile -UseBasicParsing -ErrorAction Stop
             $fwd = @('-LogDir', ('"{0}"' -f [Environment]::GetFolderPath('Desktop')))
         }
-        $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-NoExit','-File',('"{0}"' -f $scriptFile)) + $fwd
+        $argList = @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-NoExit','-File',('"{0}"' -f $scriptFile)) + $fwd   # -NoLogo: the rail starts at the top
         Start-Process -FilePath $psExe -Verb RunAs -ArgumentList $argList
         exit   # elevated instance launched -> close THIS original (non-admin) window
     } catch {
@@ -134,8 +160,8 @@ try { "win11-tweaks log  -  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" | Out-Fil
 #  Logging + primitive helpers (all DryRun-aware) - the apply engine
 # --------------------------------------------------------------------------------------
 function Write-Log {
-    # Full detail (every level) ALWAYS goes to the LOG FILE. The CONSOLE is concise by default:
-    # DEBUG lines (granular reg/service/appx writes, heartbeats) are hidden unless -Detailed was given.
+    # EVERY line goes to the LOG FILE (every level, with the [Id] tag). The console shows the rail instead (Write-Ui) -
+    # unless -Detailed, which puts the log itself on the console, DEBUG lines included (the tag is left out there).
     param(
         [ValidateSet('DEBUG','INFO','OK','WARN','ERROR')][string]$Level = 'INFO',
         [Parameter(Mandatory)][string]$Message,
@@ -143,11 +169,9 @@ function Write-Log {
     )
     $ts  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
     $tag = if ($Id) { "[$Id] " } else { '' }
-    # the LOG FILE gets the full line (incl. the [Id] tag, for diagnostics); the CONSOLE omits the tag
     try { Add-Content -Path $script:LogFile -Value ("{0} [{1,-5}] {2}{3}" -f $ts, $Level, $tag, $Message) -Encoding UTF8 -ErrorAction SilentlyContinue } catch { }
     if ($Level -eq 'WARN') { $script:WarnCount++ }   # Invoke-Tweaks compares this before/after each tweak
-    if ($Level -eq 'DEBUG' -and -not $script:Detailed) { return }   # concise console - hide DEBUG unless -Detailed
-    if ($script:ProgressOpen) { Write-Host ''; $script:ProgressOpen = $false }   # a WARN mid-bar gets its own line
+    if (-not $script:Detailed) { return }
     $color = switch ($Level) {
         'OK'    { 'Green' }
         'WARN'  { 'Yellow' }
@@ -158,17 +182,193 @@ function Write-Log {
     Write-Host ("{0} [{1,-5}] {2}" -f $ts, $Level, $Message) -ForegroundColor $color
 }
 
-function Write-Bar {
-    # A loading bar on ONE console line, redrawn in place:  "  ==========..........  10/20". Console only - the log
-    # file gets the real per-item lines. Write-Log ends an unfinished bar line before it prints anything.
+# --------------------------------------------------------------------------------------
+#  The console view ("Rail"): a rail down the left from the questions to the result - the tweaks as groups, one line
+#  per app with its time, .NET 3.5, Finishing, "Done in". The step running now is ONE live line, redrawn in place.
+#  Console only: the log file keeps every detail. Markup: "{b:text}" = text in console colour b ($script:UiColors).
+# --------------------------------------------------------------------------------------
+function Get-UiWidth {
+    # The width a rail line may use: the window minus one (so it never wraps), at most 94. 94 where there's no window.
+    $w = 0; try { $w = [int]$Host.UI.RawUI.WindowSize.Width } catch { }
+    if ($w -lt 40) { return 94 }
+    return [math]::Min($w - 1, 94)
+}
+
+function Get-Visible {
+    # A rail line as it reads on the screen (the markup taken out)
+    param([string]$Markup)
+    return ($Markup -replace '\{[a-z]+:([^{}]*)\}', '$1')
+}
+
+function Get-Cut {
+    # $Text cut to $Max characters - ending in an ellipsis when it had to be cut
+    param([string]$Text, [int]$Max)
+    if ($Max -le 0) { return '' }
+    if ($Text.Length -le $Max) { return $Text }
+    return $Text.Substring(0, $Max - 1) + $script:G.More
+}
+
+function Format-Span {
+    # 30ms / 4.3s / 31s / 1m 50s - in the invariant culture: a Bulgarian Windows would write 4,3s
+    param([double]$Seconds)
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    if ($Seconds -lt 1) { return [string]::Format($inv, '{0}ms', [math]::Max(1, [int][math]::Round($Seconds * 1000))) }
+    if ($Seconds -lt 10) { return [string]::Format($inv, '{0:0.0}s', $Seconds) }
+    $r = [int][math]::Round($Seconds)
+    if ($r -lt 60) { return "${r}s" }
+    return [string]::Format($inv, '{0}m {1:00}s', [math]::Floor($r / 60), $r % 60)
+}
+
+function Write-Markup {
+    # Print rail markup: "{b:text}" in console colour b, everything else in the console's own colour
+    param([string]$Markup, [switch]$NoNewline)
+    $pos = 0
+    foreach ($m in [regex]::Matches($Markup, '\{([a-z]+):([^{}]*)\}')) {
+        if ($m.Index -gt $pos) { Write-Host $Markup.Substring($pos, $m.Index - $pos) -NoNewline }
+        $text = $m.Groups[2].Value; $color = $script:UiColors[$m.Groups[1].Value]
+        if ($text -and $color) { Write-Host $text -NoNewline -ForegroundColor $color } elseif ($text) { Write-Host $text -NoNewline }
+        $pos = $m.Index + $m.Length
+    }
+    if ($pos -lt $Markup.Length) { Write-Host $Markup.Substring($pos) -NoNewline }
+    if (-not $NoNewline) { Write-Host '' }
+}
+
+function Test-LiveConsole {
+    # Can a line be redrawn in place here? Not when the output goes to a pipe or a file (SSH, a transcript) - every
+    # redraw would land there as a line of its own.
+    try { return -not [Console]::IsOutputRedirected } catch { return $false }
+}
+
+function Clear-Live {
+    # Wipe the live line so the next line starts clean
+    if (-not $script:LiveOpen) { return }
+    Write-Host ("`r" + (' ' * (Get-UiWidth)) + "`r") -NoNewline
+    $script:LiveOpen = $false
+}
+
+function Write-Ui {
+    # One line of the rail. -Always: with -Detailed too (the rail head and the questions).
+    param([string]$Markup = '', [switch]$Always)
+    if (-not ($script:Ui -or $Always)) { return }
+    Clear-Live
+    $script:UiLines.Add($Markup)
+    Write-Markup $Markup
+}
+
+function Show-Live {
+    # The live line: the step running now, redrawn in place on ONE console line (padded, so a shorter text leaves
+    # nothing of the longer one behind)
+    param([string]$Markup)
+    if (-not $script:Ui) { return }
+    $script:UiLive = $Markup
+    if (-not (Test-LiveConsole)) { return }
+    $pad = (Get-UiWidth) - (Get-Visible $Markup).Length
+    Write-Host "`r" -NoNewline
+    Write-Markup $Markup -NoNewline
+    if ($pad -gt 0) { Write-Host (' ' * $pad) -NoNewline }
+    $script:LiveOpen = $true
+}
+
+function Format-Row {
+    # "  |  <glyph> <Name padded>  <text, cut to fit>  <right, flush with the right edge>" - $Glyph is markup
+    param([string]$Glyph, [string]$Name, [string]$Text = '', [string]$TextColor = 'd', [string]$Right = '',
+          [string]$RightColor = 'd', [int]$NameWidth = 18)
+    $plain = { param($s) ([string]$s) -replace '\{', '(' -replace '\}', ')' }   # braces would break the markup
+    $w = Get-UiWidth
+    $n = Get-Cut (& $plain $Name) ($NameWidth - 1)
+    $line = "  {d:$($script:G.Bar)}  $Glyph {w:$n}" + (' ' * ($NameWidth - $n.Length))
+    $used = 7 + $NameWidth
+    $Right = & $plain $Right
+    $t = Get-Cut (& $plain $Text) ($w - $used - $(if ($Right) { $Right.Length + 2 } else { 0 }))
+    if ($t) { $line += $(if ($TextColor) { "{${TextColor}:$t}" } else { $t }) }
+    if ($Right) {
+        $gap = [math]::Max(2, $w - $used - $t.Length - $Right.Length)
+        $line += (' ' * $gap) + $(if ($RightColor) { "{${RightColor}:$Right}" } else { $Right })
+    }
+    return $line
+}
+
+function Get-Glyph {
+    # the status glyph, in its colour
+    param([string]$Status, [switch]$Warn)
+    switch ($Status) {
+        'OK'     { if ($Warn) { return '{y:!}' }; return "{g:$($script:G.Ok)}" }
+        'WARN'   { return '{y:!}' }
+        'FAILED' { return "{r:$($script:G.Fail)}" }
+        default  { return "{d:$($script:G.Dot)}" }   # SKIPPED / DRYRUN / BACKGROUND
+    }
+}
+
+function Format-Blocks {
+    # a bar of $Width blocks, $Done of $Total filled (superuser's services bar, on the rail)
     param([int]$Done, [int]$Total, [int]$Width = 20)
-    $fill = [int][math]::Floor($Width * $Done / [math]::Max($Total, 1))
-    Write-Host "`r  " -NoNewline
-    Write-Host ('=' * $fill) -NoNewline -ForegroundColor Cyan
-    Write-Host ('.' * ($Width - $fill)) -NoNewline -ForegroundColor DarkGray
-    Write-Host ("  {0}/{1}" -f $Done, $Total) -NoNewline -ForegroundColor White
-    $script:ProgressOpen = $true
-    if ($Done -ge $Total) { Write-Host ''; $script:ProgressOpen = $false }
+    $f = [int][math]::Floor($Width * $Done / [math]::Max($Total, 1))
+    return "{b:$($script:G.Full * $f)}{d:$($script:G.Empty * ($Width - $f))}"
+}
+
+function Write-UiPhase {
+    # "  |" then "  |- Name" - the start of a phase on the rail
+    param([string]$Name, [string]$Rest = '')
+    Write-Ui "  {d:$($script:G.Bar)}"
+    Write-Ui ("  {d:$($script:G.Tee)$($script:G.Rule)} {w:$Name}" + $Rest)
+}
+
+function Show-LiveText {
+    # a live line that is just a text: "  |  > restarting Explorer"
+    param([string]$Text)
+    Show-Live (Format-Row -Glyph "{b:$($script:G.Run)}" -Name $Text -NameWidth 60)
+}
+
+function Start-LiveItem {
+    # The live line for one step: "  |  > Name   what   mm:ss" - its clock ticks while Update-LiveTick is called
+    param([string]$Name, [string]$What = '')
+    $script:Live = @{ Name = $Name; What = $What; Clock = [System.Diagnostics.Stopwatch]::StartNew() }
+    Update-LiveTick
+}
+
+function Set-LiveWhat {
+    param([string]$What)
+    if ($script:Live) { $script:Live.What = $What; Update-LiveTick }
+}
+
+function Update-LiveTick {
+    # redraw the live step with its clock (about once a second while an installer runs)
+    if (-not $script:Live) { return }
+    $s = [int][math]::Floor($script:Live.Clock.Elapsed.TotalSeconds)
+    Show-Live (Format-Row -Glyph "{b:$($script:G.Run)}" -Name $script:Live.Name -Text $script:Live.What `
+        -Right ('{0:00}:{1:00}' -f [math]::Floor($s / 60), ($s % 60)) -RightColor 'b' -NameWidth 32)
+}
+
+function Stop-LiveItem {
+    # how long the live step took (seconds; -1 if there was none)
+    $s = if ($script:Live) { $script:Live.Clock.Elapsed.TotalSeconds } else { -1 }
+    $script:Live = $null
+    return $s
+}
+
+function Get-ShortName {
+    # "Old Windows components - Remove (...)" -> "Old Windows components"
+    param([string]$Content)
+    return (($Content -split ' - ')[0]).Trim()
+}
+
+function Set-UiNote {
+    # what came of a tweak, for its line on the rail ('7 removed: ...', '64 Hz, already the highest')
+    param([string]$Id, [string]$Text)
+    $script:UiNotes[$Id] = $Text
+}
+
+function Read-Answer {
+    # A question on ONE line: the prompt (markup), then the answer typed right after it. Read-Host gets no prompt of its
+    # own, so Windows PowerShell adds no ": ". Returns $null when there's no keyboard (input redirected).
+    param([string]$Prompt)
+    Clear-Live
+    $script:LastPrompt = Get-Visible $Prompt
+    $script:UiLines.Add($Prompt)
+    Write-Markup $Prompt -NoNewline
+    $ans = Read-Host
+    if ($null -eq $ans) { Write-Host '' }   # no keyboard: nothing ended the line
+    return $ans
 }
 
 function Set-Reg {
@@ -209,6 +409,7 @@ function Set-Svc {
     try {
         Set-Service -Name $Name -StartupType $StartupType -ErrorAction Stop
         Write-Log DEBUG "service $Name -> $StartupType" $Id
+        $script:UiCount.Svc++
     } catch {
         Write-Log WARN "service $Name failed: $($_.Exception.Message)" $Id
     }
@@ -226,7 +427,7 @@ function Remove-Appx {
         foreach ($p in $prov) { Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -ErrorAction SilentlyContinue | Out-Null }
         if (-not ($had -or $prov)) { Write-Log DEBUG "appx '$Name' not installed" $Id; return }
         if (Get-AppxPackage $Name -ErrorAction SilentlyContinue) { Write-Log WARN "appx '$Name' is still installed - Windows did not remove it" $Id }
-        else { Write-Log DEBUG "removed appx '$Name'" $Id }
+        else { Write-Log DEBUG "removed appx '$Name'" $Id; $script:UiCount.Appx++ }
     } catch {
         Write-Log WARN "appx '$Name' failed: $($_.Exception.Message)" $Id
     }
@@ -275,8 +476,10 @@ function Remove-WinCapability {
         $caps = @(Get-WindowsCapability -Online -Name "$Name~~~~*" -ErrorAction Stop | Where-Object { "$($_.State)" -eq 'Installed' })
         if (-not $caps) { Write-Log DEBUG "$Label not installed - nothing to remove" $Id; return }
         Write-Log INFO "removing $Label" $Id
+        Set-LiveWhat $Label
         foreach ($c in $caps) { $null = Remove-WindowsCapability -Online -Name $c.Name -ErrorAction Stop }
         Write-Log DEBUG "removed $Label" $Id
+        if (-not $script:UiRemoved.Contains($Label)) { $script:UiRemoved.Add($Label) }
     } catch { Write-Log WARN "$Label could not be removed: $($_.Exception.Message)" $Id }
 }
 
@@ -288,8 +491,11 @@ function Disable-WinFeature {
         $f = Get-WindowsOptionalFeature -Online -FeatureName $Name -ErrorAction SilentlyContinue
         if (-not $f -or "$($f.State)" -ne 'Enabled') { Write-Log DEBUG "$Label not enabled - nothing to do" $Id; return }
         Write-Log INFO "removing $Label" $Id
+        Set-LiveWhat $Label
         $null = Disable-WindowsOptionalFeature -Online -FeatureName $Name -NoRestart -ErrorAction Stop
         Write-Log DEBUG "disabled $Label" $Id
+        $base = $Label -replace '\s*\(feature\)$', ''   # WMP Legacy is a capability AND a feature - one component
+        if (-not $script:UiRemoved.Contains($base)) { $script:UiRemoved.Add($base) }
     } catch { Write-Log WARN "$Label could not be turned off: $($_.Exception.Message)" $Id }
 }
 
@@ -483,17 +689,25 @@ function Set-MaxRefreshRate {
         Write-Log WARN 'Refresh rate not changed: the screen was locked - run the script again at an unlocked screen, or set it in Settings > Display > Advanced display' $Id
         return
     }
+    $notes = [System.Collections.Generic.List[string]]::new()   # one per screen, for the Finishing line
     foreach ($d in @(Get-DisplayRates)) {
         $label = if ($d.Name) { $d.Name } else { $d.Device }
-        if ($d.MaxHz -le $d.Hz) { Write-Log DEBUG ("{0}: already at its highest refresh rate ({1} Hz)" -f $label, $d.Hz) $Id; continue }
+        if ($d.MaxHz -le $d.Hz) {
+            Write-Log DEBUG ("{0}: already at its highest refresh rate ({1} Hz)" -f $label, $d.Hz) $Id
+            $notes.Add(('{0} Hz, already the highest' -f $d.Hz)); continue
+        }
         if ($d.Link -ne 'DisplayPort') {
             Write-Log INFO ("{0} ({1}): up to {2} Hz is available - left at {3} Hz; set it in Settings > System > Display > Advanced display if the cable is up to it" -f $label, $d.Link, $d.MaxHz, $d.Hz) $Id
-            continue
+            $notes.Add(('{0}: left at {1} Hz, can do {2}' -f $d.Link, $d.Hz, $d.MaxHz)); continue
         }
         $rc = Set-DisplayRate -Device $d.Device -Hz $d.MaxHz
-        if ($rc -eq 0 -or $rc -eq 1) { Write-Log INFO ("{0}: {1} Hz -> {2} Hz{3}" -f $label, $d.Hz, $d.MaxHz, $(if ($rc -eq 1) { ' (after a restart)' })) $Id }
+        if ($rc -eq 0 -or $rc -eq 1) {
+            Write-Log INFO ("{0}: {1} Hz -> {2} Hz{3}" -f $label, $d.Hz, $d.MaxHz, $(if ($rc -eq 1) { ' (after a restart)' })) $Id
+            $notes.Add(('{0} Hz to {1} Hz{2}' -f $d.Hz, $d.MaxHz, $(if ($rc -eq 1) { ' after a restart' })))
+        }
         else { Write-Log WARN ("{0}: could not switch to {1} Hz (Windows answered {2}) - it stays at {3} Hz" -f $label, $d.MaxHz, $rc, $d.Hz) $Id }
     }
+    if ($notes.Count) { Set-UiNote $Id ($notes -join '; ') }
 }
 
 function Copy-PowerDcValues {
@@ -613,6 +827,7 @@ function Update-Explorer {
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would $Action explorer"; return }
     if ($Action -eq 'restart') {
         Write-Log INFO "restarting explorer"
+        if (-not $script:Live) { Show-LiveText 'restarting Explorer' }
         taskkill.exe /F /IM explorer.exe 2>$null | Out-Null
         if ($script:NeedIconCacheClear) {
             # Rebuild the icon cache while explorer is stopped - otherwise a changed overlay (our removed
@@ -670,7 +885,8 @@ function Invoke-Winget {
     param([string]$ArgumentList, [string]$OutFile)
     $p = Start-Process -FilePath 'winget' -NoNewWindow -PassThru -ArgumentList $ArgumentList -RedirectStandardOutput $OutFile
     $null = $p.Handle   # open the handle NOW - Windows PowerShell returns the process by PID, and without a handle ExitCode can be empty after exit
-    Wait-Process -InputObject $p
+    # a second at a time, so the live line's clock ticks while winget works
+    do { Wait-Process -InputObject $p -Timeout 1 -ErrorAction Ignore; Update-LiveTick } until ($p.HasExited)
     return $p.ExitCode
 }
 
@@ -685,7 +901,7 @@ function Install-App {
     $wingetArgs = "install $Id --accept-package-agreements --accept-source-agreements --source $src --silent"
     if ($Location) { $wingetArgs += " --location `"$Location`"" }   # e.g. Battle.net requires an install location
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $label"; return 'DRYRUN' }
-    if (Test-AppInstalled -Id $Id -NamePattern $DetectName) { Write-Log OK "Already installed - $label"; return 'OK' }
+    if (Test-AppInstalled -Id $Id -NamePattern $DetectName) { Write-Log OK "Already installed - $label"; $script:ItemNote = 'already installed'; return 'OK' }
     Write-Log INFO "Installing $label"
     $wo = Join-Path $env:TEMP 'winget_out.log'
     try {
@@ -700,19 +916,20 @@ function Install-App {
         $installed = Test-AppInstalled -Id $Id -NamePattern $DetectName
         if (-not $installed -and $code -eq -2147467260) {
             Write-Log INFO ("winget stopped waiting for the {0} installer - checking whether it finishes on its own (up to {1:N0} min)" -f $label, ($AbandonWaitSeconds / 60))
+            Set-LiveWhat 'finishing on its own'
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
             while (-not $installed -and $sw.Elapsed.TotalSeconds -lt $AbandonWaitSeconds) {
-                Start-Sleep -Seconds 5
+                foreach ($i in 1..5) { Start-Sleep -Seconds 1; Update-LiveTick }
                 $installed = Test-AppInstalled -Id $Id -NamePattern $DetectName
             }
         }
         if ($installed) { Write-Log DEBUG "${label}: winget exit code $hex, but it IS installed - treating as success" }
-        else            { Write-Log WARN "Failed - $label (winget exit code $hex)" }
+        else            { Write-Log WARN "Failed - $label (winget exit code $hex)"; $script:ItemFail = "winget exit code $hex" }
         if (Test-Path $wo) { Get-Content $wo -ErrorAction SilentlyContinue | Where-Object { $_.Trim() } | Select-Object -Last 8 | ForEach-Object { Write-Log DEBUG "  winget> $($_.Trim())" }; Remove-Item $wo -Force -ErrorAction SilentlyContinue }
         if ($installed) { Write-Log OK "Done!"; return 'OK' }
         return 'FAILED'
     } catch {
-        Write-Log WARN "Failed - $label : $($_.Exception.Message)"; return 'FAILED'
+        Write-Log WARN "Failed - $label : $($_.Exception.Message)"; $script:ItemFail = $_.Exception.Message; return 'FAILED'
     }
 }
 
@@ -734,15 +951,15 @@ function Install-DirectDownload {
     )
     if ($Require) {
         $met = $false; try { $met = [bool](& $Require) } catch { }
-        if (-not $met) { Write-Log INFO "${Name}: skipped ($RequireMsg)"; return 'SKIPPED' }
+        if (-not $met) { Write-Log INFO "${Name}: skipped ($RequireMsg)"; $script:ItemNote = $RequireMsg; return 'SKIPPED' }
     }
     if ($DetectName -and -not $script:DryRun -and (Test-AppInstalled -NamePattern $DetectName)) {
-        Write-Log OK "Already installed - $Name"; return 'OK'
+        Write-Log OK "Already installed - $Name"; $script:ItemNote = 'already installed'; return 'OK'
     }
     if ($UrlScript) {
-        try { $Url = & $UrlScript } catch { Write-Log WARN "Failed - $Name (could not resolve download URL: $($_.Exception.Message))"; return 'FAILED' }
+        try { $Url = & $UrlScript } catch { Write-Log WARN "Failed - $Name (could not resolve download URL: $($_.Exception.Message))"; $script:ItemFail = 'could not find the download'; return 'FAILED' }
     }
-    if (-not $Url) { Write-Log WARN "Failed - $Name (no download URL found)"; return 'FAILED' }
+    if (-not $Url) { Write-Log WARN "Failed - $Name (no download URL found)"; $script:ItemFail = 'no download link found'; return 'FAILED' }
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $Name (direct download from $Url)"; return 'DRYRUN' }
     Write-Log INFO "Installing $Name"
     $ext = if ($Url -match '\.msi(\?|#|$)') { 'msi' } else { 'exe' }   # MSI installers (e.g. Chrome) need msiexec
@@ -756,7 +973,7 @@ function Install-DirectDownload {
         $ProgressPreference = $pp
     } catch {
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue   # no half file left in TEMP (Adrenalin alone is 1.6 GB)
-        Write-Log WARN "Failed - $Name (download failed: $($_.Exception.Message))"; return 'FAILED'
+        Write-Log WARN "Failed - $Name (download failed: $($_.Exception.Message))"; $script:ItemFail = 'download failed'; return 'FAILED'
     }
     # sanity: make sure we got a real installer (MZ='MZ' = exe, or OLE 'D0 CF 11 E0' = msi), not an HTML page
     try {
@@ -766,6 +983,7 @@ function Install-DirectDownload {
     $isMsi = ($sig[0] -eq 0xD0 -and $sig[1] -eq 0xCF -and $sig[2] -eq 0x11 -and $sig[3] -eq 0xE0)
     if (-not ($isExe -or $isMsi)) {
         Write-Log WARN "Failed - $Name (downloaded file is not an exe/msi installer; get it manually from $Url)"
+        $script:ItemFail = 'the download is not an installer'
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return 'FAILED'
     }
     if ($Signer) {   # a scraped link must lead to the vendor's own signed file - anything else is never run
@@ -773,9 +991,11 @@ function Install-DirectDownload {
         $subject = if ($sig -and $sig.SignerCertificate) { [string]$sig.SignerCertificate.Subject } else { '' }
         if (-not $sig -or "$($sig.Status)" -ne 'Valid' -or $subject -notmatch [regex]::Escape($Signer)) {
             Write-Log WARN ("Failed - {0} (the download is not signed by {1}: {2} {3}) - not run" -f $Name, $Signer, $(if ($sig) { $sig.Status } else { 'no signature' }), $subject)
+            $script:ItemFail = "not signed by $Signer - not run"
             Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return 'FAILED'
         }
     }
+    Set-LiveWhat 'installing'
     try {
         $sp = if ($isMsi) { @{ FilePath = 'msiexec.exe'; ArgumentList = "/i `"$tmp`" $SilentArgs" } }
               elseif ($SilentArgs) { @{ FilePath = $tmp; ArgumentList = $SilentArgs } }
@@ -785,7 +1005,7 @@ function Install-DirectDownload {
             # leaves running (the Radeon app) would hold the run - the same trap as in Invoke-Winget
             $p = Start-Process @sp -PassThru
             $null = $p.Handle   # open it now, or ExitCode can be empty afterwards
-            Wait-Process -InputObject $p -ErrorAction SilentlyContinue
+            do { Wait-Process -InputObject $p -Timeout 1 -ErrorAction Ignore; Update-LiveTick } until ($p.HasExited)   # the clock ticks
         } else { $p = Start-Process @sp -Wait -PassThru }
         $code = $p.ExitCode
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
@@ -797,9 +1017,9 @@ function Install-DirectDownload {
             Write-Log DEBUG "$Name exit code $code is non-standard, but it IS installed (ARP match) - treating as success"
             Write-Log OK "Done!"; return 'OK'
         }
-        Write-Log WARN "Failed - $Name (installer exit code $code)"; return 'FAILED'
+        Write-Log WARN "Failed - $Name (installer exit code $code)"; $script:ItemFail = "installer exit code $code"; return 'FAILED'
     } catch {
-        Write-Log WARN "Failed - $Name : $($_.Exception.Message)"
+        Write-Log WARN "Failed - $Name : $($_.Exception.Message)"; $script:ItemFail = $_.Exception.Message
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return 'FAILED'
     }
 }
@@ -1402,9 +1622,8 @@ $script:Tweaks = @(
           'dmwappushservice'='Manual'; 'SCardSvr'='Manual'; 'TermService'='Manual'; 'SessionEnv'='Manual'        # WAP Push Message Routing, Smart Card, Remote Desktop (+ Configuration)
           'UmRdpService'='Manual'; 'RemoteAccess'='Disabled'; 'TapiSrv'='Manual'; 'lmhosts'='Manual'             # RDP UserMode Port Redirector, Routing and Remote Access, Telephony, TCP/IP NetBIOS Helper
       }
-      # a loading bar on the console (superuser's design); -Detailed prints every step instead
-      $bar = -not $script:Detailed; $i = 0
-      if ($bar) { Write-Host '  Setting services to manual:' -ForegroundColor Yellow; Write-Bar -Done 0 -Total $svcs.Count }
+      # a loading bar on the rail's live line (superuser's design); -Detailed prints every step instead
+      $i = 0
       foreach ($name in $svcs.Keys) {
           $want = $svcs[$name]
           $s = Get-Service -Name $name -ErrorAction SilentlyContinue
@@ -1413,7 +1632,10 @@ $script:Tweaks = @(
           elseif ($want -eq 'Manual' -and "$($s.StartType)" -eq 'Disabled') { Write-Log DEBUG "service $name is Disabled - left off" $id }
           else { Set-Svc -Id $id -Name $name -StartupType $want }
           $i++
-          if ($bar) { Start-Sleep -Milliseconds 60; Write-Bar -Done $i -Total $svcs.Count }   # ~1 s in all, so the bar is seen moving
+          if ($script:Ui) {
+              Show-Live ("  {d:$($script:G.Bar)}  {b:$($script:G.Run)} {w:Services to Manual}  " + (Format-Blocks $i $svcs.Count 20) + "  {w:$i/$($svcs.Count)}")
+              if (Test-LiveConsole) { Start-Sleep -Milliseconds 60 }   # ~1 s in all, so the bar is seen moving
+          }
       }
   }}
 
@@ -1523,12 +1745,17 @@ $script:Tweaks = @(
       Remove-WinCapability -Id $id -Name 'Microsoft.Windows.PowerShell.ISE' -Label 'PowerShell ISE'
       Remove-WinCapability -Id $id -Name 'Print.Management.Console' -Label 'Print Management'
       Disable-WinFeature   -Id $id -Name 'WorkFolders-Client' -Label 'Work Folders'
-      if (Test-KeepLegacyPlayer) {
+      $kept = Test-KeepLegacyPlayer
+      if ($kept) {
           Write-Log INFO 'Keeping Windows Media Player Legacy - no VLC and no Media Player, it is the only video player left' $id
       } else {
           Remove-WinCapability -Id $id -Name 'Media.WindowsMediaPlayer' -Label 'Windows Media Player Legacy'
           Disable-WinFeature   -Id $id -Name 'WindowsMediaPlayer' -Label 'Windows Media Player Legacy (feature)'
       }
+      $n = $script:UiRemoved.Count
+      $note = if ($n) { '{0} removed: {1}' -f $n, ($script:UiRemoved -join ', ') } else { 'nothing left to remove' }
+      if ($kept) { $note = 'Media Player Legacy kept (the last video player); ' + $note }
+      if (-not $script:DryRun) { Set-UiNote $id $note }
   }}
 
   # Monitors (superuser, 2026-09-27): a 144 / 165 Hz monitor often comes set to 60 Hz - every screen to its highest
@@ -1544,9 +1771,38 @@ $script:Tweaks = @(
   # in Settings, or add it back in Settings > System > Optional features.
   # Kept on an AMD machine: AMD's chipset installer checks the platform with a VBScript - now and for every later update.
   [pscustomobject]@{ Id='CustomRemoveVBScript'; Content='VBScript - Remove (after the installs)'; Category='Custom'; Late=$true; Apply={
-      if ((Get-CpuVendor) -eq 'AuthenticAMD') { Write-Log INFO 'Keeping VBScript - the AMD chipset installer needs it (also for its later updates)' 'CustomRemoveVBScript'; return }
+      if ((Get-CpuVendor) -eq 'AuthenticAMD') {
+          Write-Log INFO 'Keeping VBScript - the AMD chipset installer needs it (also for its later updates)' 'CustomRemoveVBScript'
+          Set-UiNote 'CustomRemoveVBScript' 'kept: the AMD chipset installer needs it'; return
+      }
       Remove-WinCapability -Id 'CustomRemoveVBScript' -Name 'VBSCRIPT' -Label 'VBScript'
+      if (-not $script:DryRun) { Set-UiNote 'CustomRemoveVBScript' $(if ($script:UiRemoved.Contains('VBScript')) { 'removed' } else { 'not installed' }) }
   }}
+)
+
+# The tweak phase on the console: ONE rail line per group, in this order, once the phase is over (Write-TweakGroups).
+# Text = what the group does: a string, one per machine type, or a scriptblock (the counts). A tweak in no group
+# would land in "Other" - the tests make sure none does. The Late tweaks have their own lines (Finishing).
+$script:TweakGroups = @(
+    [pscustomobject]@{ Name = 'Privacy'; Text = 'telemetry, activity history, location, error reports'
+        Ids = @('WPFTweaksActivity', 'WPFTweaksConsumerFeatures', 'WPFTweaksDeliveryOptimization', 'WPFTweaksLocation', 'WPFTweaksTelemetry', 'WPFTweaksWPBT', 'CustomWerOff') }
+    [pscustomobject]@{ Name = 'Apps removed'; Text = { if ($script:UiCount.Appx) { '{0} pre-installed apps removed' -f $script:UiCount.Appx } else { 'pre-installed apps, OneDrive, Widgets, Phone Link' } }
+        Ids = @('WPFTweaksDeBloat', 'WPFTweaksRemoveOneDrive', 'CustomRemoveMoreApps', 'CustomOemTrialware', 'CustomNoReinstall') }
+    [pscustomobject]@{ Name = 'Windows AI'; Text = 'Copilot, Recall and Click to Do off'; Ids = @('WPFTweaksWindowsAI', 'CustomCopilotBits') }
+    [pscustomobject]@{ Name = 'Start & search'; Text = 'no tips, nags, ads or web results'
+        Ids = @('CustomStartCleanup', 'CustomStartPins', 'CustomNagsOff', 'CustomLockScreen', 'CustomSpotlightOff', 'WPFToggleStartMenuRecommendations', 'WPFToggleHideSettingsHome', 'CustomDisableWebSearch') }
+    [pscustomobject]@{ Name = 'Taskbar'; Text = 'This PC pinned, Edge unpinned, no Search or Widgets'; Pins = $true
+        Ids = @('CustomTaskbarCleanup', 'WPFTweaksEndTaskOnTaskbar', 'WPFToggleTaskbarAlignment', 'WPFToggleBatteryPercentage') }
+    [pscustomobject]@{ Name = 'Explorer'; Text = 'opens This PC, file extensions, classic menu'
+        Ids = @('CustomExplorerThisPC', 'WPFTweaksDisableExplorerAutoDiscovery', 'WPFToggleShowExt', 'WPFTweaksRightClickMenu', 'CustomShortcutArrow', 'CustomRemoveEdgeShortcut') }
+    [pscustomobject]@{ Name = 'Edge'; Text = 'no startup boost, promos or sidebar'; Ids = @('WPFTweaksEdgeDebloat') }
+    [pscustomobject]@{ Name = 'Performance'; Text = @{ PC = 'Ultimate Performance, Memory Integrity off, no hibernation'; Laptop = 'Ultimate on the charger, Balanced on battery' }
+        Ids = @('CustomUltimatePerf', 'CustomLaptopPower', 'CustomDisableVBS', 'WPFToggleGameMode', 'CustomHibernateOff', 'WPFToggleStandbyFix', 'CustomStandbyNoNetBattery') }
+    [pscustomobject]@{ Name = 'Input & look'; Text = 'dark theme, Num Lock, no mouse acceleration'
+        Ids = @('WPFToggleDarkMode', 'WPFToggleLoginBlur', 'WPFToggleNumLock', 'CustomMouseAccel', 'CustomStickyKeysOff') }
+    [pscustomobject]@{ Name = 'Services'; Text = { if ($script:UiCount.Svc) { 'rarely used ones to Manual, {0} changed' -f $script:UiCount.Svc } else { 'rarely used ones to Manual' } }
+        Ids = @('WPFTweaksServices', 'CustomServicesManual') }
+    [pscustomobject]@{ Name = 'System'; Text = 'Cloudflare DNS, no auto-restart, temp files cleaned'; Ids = @('CustomDnsCloudflare', 'CustomNoAutoReboot', 'WPFTweaksDeleteTempFiles') }
 )
 
 # --------------------------------------------------------------------------------------
@@ -1786,19 +2042,40 @@ function Write-Banner {
     Write-Log DEBUG ("os={0}  build={1}" -f $os.Caption, $os.BuildNumber)
     Write-Log DEBUG ("psver={0}  mode={1}" -f $PSVersionTable.PSVersion, ($(if ($script:DryRun) {'DRYRUN'} else {'APPLY'})))
     Write-Log DEBUG ("logfile={0}" -f $script:LogFile)
+    # the rail: "  |- WIN11-TEST . Windows 11 Pro 25H2 (26200) . PC . Gele"
+    $g = $script:G
+    $osName = ("$($os.Caption)" -replace '^\s*Microsoft\s+', '').Trim(); if (-not $osName) { $osName = 'Windows' }
+    $ver = Get-RegValue -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name 'DisplayVersion'
+    if ($ver) { $osName += " $ver" }
+    if ($os.BuildNumber) { $osName += " {d:($($os.BuildNumber))}" }
+    $pcName = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'this PC' }
+    Write-Ui "  {d:$($g.Bar)}"
+    $bits = @($osName, $script:MachineType, $script:UserLabel | ForEach-Object { "{d:$($g.Dot)} $_" })
+    Write-Ui ("  {d:$($g.Tee)$($g.Rule)} {w:$pcName} " + ($bits -join ' '))
+    if ($script:DryRun) { Write-Ui "  {d:$($g.Bar)}  {y:DRY RUN - nothing will be changed}" }
 }
 
 function Invoke-Tweaks {
     # The tweak phase runs every tweak except the Late ones; -Late runs only those (Main, after the installs).
+    # The rail: one live line while the phase runs (the groups are printed after it - Write-TweakGroups); the Late
+    # ones are "Finishing", one line each.
     param([switch]$Late)
-    foreach ($t in $script:Tweaks) {
-        if ([bool]$t.Late -ne [bool]$Late) { continue }
+    $list = @($script:Tweaks | Where-Object { [bool]$_.Late -eq [bool]$Late })
+    Write-UiPhase $(if ($Late) { 'Finishing' } else { 'Tweaks' })
+    $n = 0
+    foreach ($t in $list) {
+        $n++
         if ($t.Machine -and $t.Machine -ne $script:MachineType) {   # e.g. Ultimate Performance is PC only
             Write-Log INFO ("Skipping {0} ({1} only)" -f $t.Content, $t.Machine) $t.Id
-            $script:Results.Add([pscustomobject]@{ Phase='Tweak'; Id=$t.Id; Content=$t.Content; Status='SKIPPED'; Detail="$($t.Machine) only" })
+            $rec = [pscustomobject]@{ Phase='Tweak'; Id=$t.Id; Content=$t.Content; Status='SKIPPED'; Detail="$($t.Machine) only"; Seconds=0 }
+            $script:Results.Add($rec)
+            if ($Late) { Write-Ui (Format-TweakLine $rec) }
             continue
         }
         Write-Log INFO ("Applying {0}" -f $t.Content) $t.Id
+        if ($Late) { Start-LiveItem -Name (Get-ShortName $t.Content) }
+        else { Show-Live (Format-Row -Glyph "{b:$($script:G.Run)}" -Name $t.Content -NameWidth 60 -Right "$n/$($list.Count)") }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $status = 'OK'; $detail = ''; $warnsBefore = $script:WarnCount
         try { & $t.Apply }
         catch { $status = 'FAILED'; $detail = $_.Exception.Message; Write-Log ERROR "tweak failed: $detail" $t.Id }
@@ -1812,7 +2089,54 @@ function Invoke-Tweaks {
             'WARN'   { Write-Log WARN "Done, but $detail" $t.Id }
             default  { Write-Log OK 'Done!' $t.Id }
         }
-        $script:Results.Add([pscustomobject]@{ Phase='Tweak'; Id=$t.Id; Content=$t.Content; Status=$status; Detail=$detail })
+        $rec = [pscustomobject]@{ Phase='Tweak'; Id=$t.Id; Content=$t.Content; Status=$status; Detail=$detail; Seconds=$sw.Elapsed.TotalSeconds }
+        $script:Results.Add($rec)
+        if ($Late) { $null = Stop-LiveItem; Write-Ui (Format-TweakLine $rec) }
+    }
+}
+
+function Format-TweakLine {
+    # A Finishing line: short name, what came of it (the tweak's note - or what went wrong), time
+    param($Rec)
+    $note = if ($Rec.Status -in 'FAILED', 'WARN', 'SKIPPED') { $Rec.Detail } elseif ($script:UiNotes.ContainsKey($Rec.Id)) { $script:UiNotes[$Rec.Id] } else { '' }
+    $color = switch ($Rec.Status) { 'FAILED' { 'r' } 'WARN' { 'y' } default { 'd' } }
+    $right = switch ($Rec.Status) { 'DRYRUN' { 'dry run' } 'SKIPPED' { '' } default { Format-Span $Rec.Seconds } }
+    return Format-Row -Glyph (Get-Glyph $Rec.Status) -Name (Get-ShortName $Rec.Content) -Text $note -TextColor $color -Right $right -NameWidth 24
+}
+
+function Write-TweakGroups {
+    # The tweak phase on the rail, once it's over: one line per group - done (what it did, its time), or the first thing
+    # that went wrong ("! Edge  Microsoft Edge - Debloat: 1 step(s) failed - see the log") - then the tweaks this
+    # machine type skips, on one line ("Laptop only  Power plan, Sleep on battery").
+    if (-not $script:Ui) { return }
+    $late = @{}; foreach ($t in $script:Tweaks) { if ($t.Late) { $late[$t.Id] = $true } }
+    $done = @($script:Results | Where-Object { $_.Phase -eq 'Tweak' -and -not $late.ContainsKey($_.Id) })
+    $pins = @($script:Results | Where-Object { $_.Phase -eq 'Taskbar' -and $_.Id -ne 'Chrome.Pin' })
+    $known = @{}; foreach ($grp in $script:TweakGroups) { foreach ($id in $grp.Ids) { $known[$id] = $true } }
+    $groups = [System.Collections.Generic.List[object]]::new(); foreach ($grp in $script:TweakGroups) { $groups.Add($grp) }
+    $other = @($done | Where-Object { -not $known.ContainsKey($_.Id) } | ForEach-Object { $_.Id })
+    if ($other) { $groups.Add([pscustomobject]@{ Name = 'Other'; Text = ''; Ids = $other }) }
+    foreach ($grp in $groups) {
+        $rs = @($done | Where-Object { $grp.Ids -contains $_.Id -and $_.Status -ne 'SKIPPED' })
+        if ($grp.PSObject.Properties['Pins'] -and $grp.Pins) { $rs += $pins }
+        if (-not $rs) { continue }
+        $secs = 0.0; foreach ($r in $rs) { if ($r.PSObject.Properties['Seconds']) { $secs += [double]$r.Seconds } }
+        $bad = @($rs | Where-Object { $_.Status -in 'FAILED', 'WARN' })
+        $text = if ($grp.Text -is [scriptblock]) { [string](& $grp.Text) } elseif ($grp.Text -is [hashtable]) { [string]$grp.Text[$script:MachineType] } else { [string]$grp.Text }
+        if ($bad) {
+            $st = if (@($bad | Where-Object { $_.Status -eq 'FAILED' })) { 'FAILED' } else { 'WARN' }
+            $why = if ($bad[0].Detail) { $bad[0].Detail } else { 'see the log' }
+            $more = if ($bad.Count -gt 1) { " (+$($bad.Count - 1) more)" } else { '' }
+            Write-Ui (Format-Row -Glyph (Get-Glyph $st) -Name $grp.Name -Text ('{0}: {1}{2}' -f $bad[0].Content, $why, $more) `
+                -TextColor $(if ($st -eq 'FAILED') { 'r' } else { 'y' }) -Right (Format-Span $secs))
+        } elseif ($script:DryRun) {
+            Write-Ui (Format-Row -Glyph (Get-Glyph 'DRYRUN') -Name $grp.Name -Text $text -Right 'dry run')
+        } else {
+            Write-Ui (Format-Row -Glyph (Get-Glyph 'OK') -Name $grp.Name -Text $text -Right (Format-Span $secs))
+        }
+    }
+    foreach ($only in @($done | Where-Object { $_.Status -eq 'SKIPPED' } | Group-Object Detail)) {
+        Write-Ui (Format-Row -Glyph (Get-Glyph 'SKIPPED') -Name $only.Name -Text ((@($only.Group | ForEach-Object { Get-ShortName $_.Content })) -join ', '))
     }
 }
 
@@ -1888,7 +2212,7 @@ function Install-Alienware {
     $id = '9PMHP03NJ9QP'; $label = 'Alienware Command Center'
     $dellUrl = 'https://dl.dell.com/FOLDER12874937M/2/Alienware-Command-Center-6-x-Full-Installer-for_5T498_WIN64_6.7.37.0_A00_01.EXE'
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $label"; return 'DRYRUN' }
-    if (Test-AppInstalled -NamePattern 'Alienware Command Center*') { Write-Log OK "Already installed - $label"; return 'OK' }
+    if (Test-AppInstalled -NamePattern 'Alienware Command Center*') { Write-Log OK "Already installed - $label"; $script:ItemNote = 'already installed'; return 'OK' }
     Write-Log INFO "Installing $label"
     # 1) Microsoft Store (official, always-latest)
     $wo = Join-Path $env:TEMP 'winget_awcc.log'
@@ -1907,10 +2231,10 @@ function Install-Alienware {
         $dp = Start-Process -FilePath $tmp -ArgumentList '/s' -Wait -PassThru
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         if (Test-AppInstalled -NamePattern 'Alienware Command Center*') { Write-Log OK "Done!"; return 'OK' }
-        Write-Log WARN "Failed - $label (install manually from dell.com/support)"; return 'FAILED'
+        Write-Log WARN "Failed - $label (install manually from dell.com/support)"; $script:ItemFail = 'install it from dell.com/support'; return 'FAILED'
     } catch {
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-        Write-Log WARN "Failed - $label (Dell fallback download failed: $($_.Exception.Message))"; return 'FAILED'
+        Write-Log WARN "Failed - $label (Dell fallback download failed: $($_.Exception.Message))"; $script:ItemFail = 'the Dell download failed'; return 'FAILED'
     }
 }
 
@@ -1964,13 +2288,59 @@ function Skip-NotSelected {
     return $true
 }
 
+function Format-ItemLine {
+    # An app's rail line: glyph, name, note (what came with it / why not), time
+    param([string]$Name, [string]$Status, [string]$Note = '', [double]$Seconds = -1, [switch]$Warn)
+    $color = if ($Status -eq 'FAILED') { 'r' } elseif ($Warn) { 'y' } else { 'd' }
+    $right = if ($Status -eq 'DRYRUN') { 'dry run' }
+             elseif ($Status -in 'OK', 'FAILED' -and $Seconds -ge 0 -and $Note -ne 'already installed') { Format-Span $Seconds } else { '' }
+    return Format-Row -Glyph (Get-Glyph $Status -Warn:$Warn) -Name $Name -Text $Note -TextColor $color -Right $right -NameWidth 32
+}
+
+function Write-AppLine {
+    # An app's line once it - and its desktop icon / license / taskbar pin, the records from index $From on - is done
+    param([string]$Name, [string]$Status, [int]$From)
+    $secs = Stop-LiveItem
+    $extras = [System.Collections.Generic.List[string]]::new(); $warn = $false
+    for ($i = $From; $i -lt $script:Results.Count; $i++) {
+        $x = $script:Results[$i]
+        $what = switch -Wildcard ($x.Id) { 'Desktop.*' { 'desktop icon' } 'WinRAR.License' { 'license' } 'Chrome.Pin' { 'pinned to the taskbar' } default { $null } }
+        if (-not $what) { continue }
+        if ($x.Status -eq 'OK' -and $x.Detail -ne 'exists') { $extras.Add("+ $what") }
+        elseif ($x.Status -eq 'FAILED') { $extras.Add("$what failed"); $warn = $true }
+    }
+    $note = switch ($Status) {
+        'FAILED'  { if ($script:ItemFail) { "$($script:ItemFail), see the log" } else { 'see the log' } }
+        'SKIPPED' { $script:ItemNote }
+        default   { (@($script:ItemNote) + @($extras) | Where-Object { $_ }) -join ', ' }
+    }
+    Write-Ui (Format-ItemLine -Name $Name -Status $Status -Note $note -Seconds $secs -Warn:$warn)
+}
+
 function Invoke-InstallPhase {
     Write-Log INFO "=========== INSTALLING APPS ==========="
+    Write-UiPhase 'Apps'
+    $notSelected = [System.Collections.Generic.List[string]]::new()   # a New user's "n" apps - one rail line at the end
 
     if (Get-Command winget -ErrorAction SilentlyContinue) {
-        foreach ($id in $script:VCRedists) {   # Visual C++ Redistributables first (apps/games need them)
-            $st = Install-App -Id $id
-            $script:Results.Add([pscustomobject]@{ Phase='VCRedist'; Id=$id; Content=$id; Status=$st; Detail='' })
+        if ($script:VCRedists.Count) {   # Visual C++ Redistributables first (apps/games need them) - ONE rail line for all
+            $vcName = "Visual C++ 2005$($script:G.Dash)2022"; $vc = @(); $k = 0
+            Start-LiveItem -Name $vcName -What "0/$($script:VCRedists.Count)"
+            foreach ($id in $script:VCRedists) {
+                $script:ItemNote = ''; $script:ItemFail = ''
+                $st = Install-App -Id $id
+                $script:Results.Add([pscustomobject]@{ Phase='VCRedist'; Id=$id; Content=$id; Status=$st; Detail=$script:ItemFail })
+                $vc += [pscustomobject]@{ Status = $st; Note = $script:ItemNote }
+                $k++; Set-LiveWhat "$k/$($script:VCRedists.Count)"
+            }
+            $secs = Stop-LiveItem
+            $failed = @($vc | Where-Object { $_.Status -eq 'FAILED' }).Count
+            if ($script:DryRun) { Write-Ui (Format-ItemLine -Name $vcName -Status 'DRYRUN' -Note "$($vc.Count) runtimes") }
+            elseif ($failed) { Write-Ui (Format-ItemLine -Name $vcName -Status 'FAILED' -Note "$failed of $($vc.Count) failed, see the log" -Seconds $secs) }
+            else {
+                $new = @($vc | Where-Object { $_.Note -ne 'already installed' }).Count
+                Write-Ui (Format-ItemLine -Name $vcName -Status 'OK' -Note $(if ($new) { "$($vc.Count) runtimes" } else { 'already installed' }) -Seconds $secs)
+            }
         }
         foreach ($id in $script:AppsToInstall) {
             $label = if ($script:AppNames.ContainsKey($id)) { $script:AppNames[$id] } else { $id }
@@ -1978,17 +2348,23 @@ function Invoke-InstallPhase {
             if ($only -and $only -ne $script:MachineType) {   # e.g. NZXT CAM is PC only
                 Write-Log INFO ("Skipping {0} ({1} only)" -f $label, $only)
                 $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status='SKIPPED'; Detail="$only only" })
+                Write-Ui (Format-ItemLine -Name $label -Status 'SKIPPED' -Note "$only only")
                 continue
             }
-            if (Skip-NotSelected -Key $id -Content $id -Label $label) { continue }   # no icon / WinRAR license either
+            if (Skip-NotSelected -Key $id -Content $id -Label $label) { $notSelected.Add($label); continue }   # no icon / WinRAR license either
+            $from = $script:Results.Count + 1
+            $script:ItemNote = ''; $script:ItemFail = ''
+            Start-LiveItem -Name $label -What 'installing'
             $st = Install-App -Id $id -Location $script:AppLocations[$id] -DetectName $script:AppDetectNames[$id]
-            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status=$st; Detail='' })
+            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status=$st; Detail=$script:ItemFail })
             if ($st -ne 'FAILED' -and $script:DesktopShortcutApps.ContainsKey($id)) { $sc = $script:DesktopShortcutApps[$id]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
             if ($id -eq 'RARLab.WinRAR') { Set-WinRarLicense }   # license right after WinRAR installs (clean pairing)
+            Write-AppLine -Name $label -Status $st -From $from
         }
     } else {
         Write-Log ERROR "winget not found; skipping VC++/app installs. Install 'App Installer' (Microsoft.DesktopAppInstaller) and re-run."
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='winget'; Content='winget missing'; Status='SKIPPED'; Detail='no winget' })
+        Write-Ui (Format-ItemLine -Name 'winget' -Status 'FAILED' -Note 'not found: install App Installer from the Store, then run again')
     }
 
     # Non-winget apps (direct vendor download): Bitwarden, Parsec, NVIDIA App (GPU only)
@@ -1996,13 +2372,22 @@ function Invoke-InstallPhase {
         if ($d.Machine -and $d.Machine -ne $script:MachineType) {   # e.g. the chipset / Radeon drivers are PC only
             Write-Log INFO ("Skipping {0} ({1} only)" -f $d.Name, $d.Machine)
             $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$d.Name; Content=$d.Name; Status='SKIPPED'; Detail="$($d.Machine) only" })
+            Write-Ui (Format-ItemLine -Name $d.Name -Status 'SKIPPED' -Note "$($d.Machine) only")
             continue
         }
-        if (Skip-NotSelected -Key $d.Name -Content $d.Name -Label $d.Name) { continue }   # no icon / Chrome pin either
+        if (Skip-NotSelected -Key $d.Name -Content $d.Name -Label $d.Name) {   # no icon / Chrome pin either
+            if ($script:NotSelected[$d.Name] -eq 'not offered') { Write-Ui (Format-ItemLine -Name $d.Name -Status 'SKIPPED' -Note $(if ($d.RequireMsg) { $d.RequireMsg } else { 'not offered' })) }
+            else { $notSelected.Add($d.Name) }
+            continue
+        }
+        $from = $script:Results.Count + 1
+        $script:ItemNote = ''; $script:ItemFail = ''
+        Start-LiveItem -Name $d.Name -What 'downloading'
         $st = Install-DirectDownload @d
-        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$d.Name; Content=$d.Name; Status=$st; Detail='direct' })
+        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$d.Name; Content=$d.Name; Status=$st; Detail=$(if ($st -eq 'FAILED' -and $script:ItemFail) { $script:ItemFail } else { 'direct' }) })
         if ($st -eq 'OK' -and $script:DesktopShortcutApps.ContainsKey($d.Name)) { $sc = $script:DesktopShortcutApps[$d.Name]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
         if ($d.Name -eq 'Google Chrome') { $script:ChromePinned = Add-ChromeTaskbarPin }   # pin Chrome to the taskbar RIGHT AFTER it installs
+        Write-AppLine -Name $d.Name -Status $st -From $from
     }
 
     # (WinRAR license is created right after WinRAR installs, in the loop above - see Set-WinRarLicense.)
@@ -2014,13 +2399,19 @@ function Invoke-InstallPhase {
         if ($hw -notmatch $a.Hardware) {   # NOT a failure - just not this vendor's machine
             Write-Log DEBUG "$($a.Name): skipped (not $($a.Vendor) hardware: '$hw')"
             $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail="not $($a.Vendor) hardware" })
+            Write-Ui (Format-ItemLine -Name $a.Name -Status 'SKIPPED' -Note "not $($a.Vendor) hardware")
             continue
         }
-        if (Skip-NotSelected -Key $a.Id -Content $a.Name -Label $a.Name) { continue }
+        if (Skip-NotSelected -Key $a.Id -Content $a.Name -Label $a.Name) { $notSelected.Add($a.Name); continue }
+        $from = $script:Results.Count + 1
+        $script:ItemNote = ''; $script:ItemFail = ''
+        Start-LiveItem -Name $a.Name -What 'installing'
         if ($a.Id -eq '9PMHP03NJ9QP') { $st = Install-Alienware }   # Store first, then Dell's direct installer
         else { $st = Install-App -Id $a.Id -Name $a.Name -Source $a.Source }
-        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=$st; Detail=$hw })
+        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=$st; Detail=$(if ($st -eq 'FAILED' -and $script:ItemFail) { $script:ItemFail } else { $hw }) })
+        Write-AppLine -Name $a.Name -Status $st -From $from
     }
+    if ($notSelected.Count) { Write-Ui (Format-Row -Glyph (Get-Glyph 'SKIPPED') -Name 'Not selected' -Text ($notSelected -join ', ') -NameWidth 32) }
 
     # (.NET 3.5 was started in the BACKGROUND before this phase (Start-DotNet35) so it downloads in
     #  parallel; it's finished after this phase (Enable-DotNetFeatures). Desktop icons are per-app above.)
@@ -2039,16 +2430,29 @@ function Start-DotNet35 {
     try {
         $script:DotNet35Proc = Start-Process -FilePath "$env:SystemRoot\System32\dism.exe" -WindowStyle Hidden -PassThru `
             -ArgumentList '/Online','/Enable-Feature','/FeatureName:NetFx3','/All','/NoRestart','/Quiet',"/LogPath:$dlog"
+        $script:DotNet35Clock = [System.Diagnostics.Stopwatch]::StartNew()   # the rail shows how long it has been downloading
     } catch { Write-Log DEBUG ".NET 3.5 background start failed: $($_.Exception.Message)" }
+}
+
+function Format-PhaseLine {
+    # "  |- Name   text                                   right" - a phase that is one line (.NET 3.5)
+    param([string]$Name, [string]$Text, [string]$Right = '')
+    $line = "  {d:$($script:G.Tee)$($script:G.Rule)} {w:$Name}   $Text"
+    if ($Right) { $line += (' ' * [math]::Max(2, (Get-UiWidth) - (Get-Visible $line).Length - $Right.Length)) + "{d:$Right}" }
+    return $line
 }
 
 function Enable-DotNetFeatures {
     # Print a clean "Installing .NET 3.5 / Done!" pair HERE at the end. The download already ran in the
     # background during the install phase (Start-DotNet35), so on a normal machine this is instant; if it's
     # still going we WAIT until it fully finishes (live heartbeat, no cap). Then .NET 4 (quiet).
+    # The rail: ONE line - ".NET 3.5   ready", "ready at the next restart", or why not.
+    $g = $script:G
+    Write-Ui "  {d:$($g.Bar)}"
     if ($script:DryRun) {
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NetFx3'; Content='.NET 3.5'; Status='DRYRUN'; Detail='' })
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NetFx4-AdvSrvs'; Content='.NET 4'; Status='DRYRUN'; Detail='' })
+        Write-Ui (Format-PhaseLine '.NET 3.5' '{d:dry run}')
         return
     }
     Write-Log INFO "Installing .NET 3.5"
@@ -2056,21 +2460,28 @@ function Enable-DotNetFeatures {
     # summary - written from Main's finally - still shows that .NET 3.5 is finishing in the background.
     $rec3 = [pscustomobject]@{ Phase='Install'; Id='NetFx3'; Content='.NET 3.5'; Status='BACKGROUND'; Detail='' }
     $script:Results.Add($rec3)
-    $st3 = 'OK'
+    $st3 = 'OK'; $waited = 0.0
     if ($script:DotNet35Proc -and -not $script:DotNet35Proc.HasExited) {
         # Still downloading from Windows Update (started before the install phase). WAIT until it fully
         # finishes - no cap. The background DISM holds the servicing lock, so we do NOT query the feature
         # state while it runs (that can block ON the lock); we just wait for the DISM PROCESS to exit,
-        # printing a live one-line heartbeat so the console never looks frozen. On a normal machine this is
-        # seconds; on a WU-throttled box it can be ~30 min. Ctrl+C stops the run here: the summary is still
-        # written and DISM keeps going on its own (/NoRestart - no surprise reboot).
-        # The heartbeat uses Write-Host (console only) so it never spams the log file.
+        # showing a live line so the console never looks frozen. On a normal machine this is seconds; on a
+        # WU-throttled box it can be ~30 min. Ctrl+C stops the run here: the summary is still written and DISM
+        # keeps going on its own (/NoRestart - no surprise reboot). Console only - it never spams the log file.
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $clock = if ($script:DotNet35Clock) { $script:DotNet35Clock } else { $sw }
         while (-not $script:DotNet35Proc.HasExited) {
-            Write-Host ("`r  .NET 3.5 still installing (downloading from Windows Update)... {0:mm\:ss}   " -f $sw.Elapsed) -NoNewline -ForegroundColor DarkYellow
-            Start-Sleep -Seconds 3
+            if ($script:Ui) {
+                $s = [int][math]::Floor($clock.Elapsed.TotalSeconds)
+                Show-Live (Format-PhaseLine '.NET 3.5' ("{d:downloading from Windows Update $($g.Dot)} {b:" + ('{0:00}:{1:00}' -f [math]::Floor($s / 60), ($s % 60)) + '}'))
+                Start-Sleep -Seconds 1
+            } else {
+                Write-Host ("`r  .NET 3.5 still installing (downloading from Windows Update)... {0:mm\:ss}   " -f $sw.Elapsed) -NoNewline -ForegroundColor DarkYellow
+                Start-Sleep -Seconds 3
+            }
         }
-        Write-Host ("`r{0}`r" -f (' ' * 78)) -NoNewline   # wipe the heartbeat line before the final status
+        if (-not $script:Ui) { Write-Host ("`r{0}`r" -f (' ' * 78)) -NoNewline }   # wipe the heartbeat line before the final status
+        $waited = $sw.Elapsed.TotalSeconds
         Start-Sleep -Milliseconds 500
     }
     # .NET 3.5 was already enabled, the DISM just finished, or it was never started - safe to query state now.
@@ -2082,15 +2493,22 @@ function Enable-DotNetFeatures {
         $code = if ($null -eq $c -or "$c" -eq '') { 'unknown' } elseif ([int64]$c -lt 0) { '0x{0:X8}' -f [int]$c } else { "$c" }
         Write-Log DEBUG "DISM exit code $code"
     }
+    $wait = if ($waited -ge 1) { 'waited ' + (Format-Span $waited) } else { '' }
     $state = "$((Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction SilentlyContinue).State)"
     if ($state -eq 'Enabled') {
         Write-Log OK "Done!"
+        if ($script:DotNet35Proc) { Write-Ui (Format-PhaseLine '.NET 3.5' "ready {d:$($g.Dot) downloaded next to the apps}" $wait) }
+        else { Write-Ui (Format-PhaseLine '.NET 3.5' 'already on') }
     } elseif ($state -eq 'EnablePending') {
         Write-Log OK "Done! (finishes at the next restart)"; $rec3.Detail = 'finishes at the next restart'
+        Write-Ui (Format-PhaseLine '.NET 3.5' 'ready at the next restart' $wait)
     } elseif (-not $script:DotNet35Proc) {
-        Write-Log WARN "Failed - .NET 3.5 (was not started)"; $st3 = 'FAILED'
+        Write-Log WARN "Failed - .NET 3.5 (was not started)"; $st3 = 'FAILED'; $rec3.Detail = 'was not started'
+        Write-Ui (Format-PhaseLine '.NET 3.5' "{r:$($g.Fail) not started, see the log}")
     } else {
         Write-Log WARN "Failed - .NET 3.5 (DISM exit code $code, state '$state' - see %TEMP%\dism_NetFx3.log)"; $st3 = 'FAILED'
+        $rec3.Detail = "DISM exit code $code"
+        Write-Ui (Format-PhaseLine '.NET 3.5' "{r:$($g.Fail) not installed (DISM $code), see the log}" $wait)
     }
     $rec3.Status = $st3
     # .NET 4 is already enabled on Win11 -> record quietly (no console clutter); enable only if somehow off.
@@ -2098,8 +2516,10 @@ function Enable-DotNetFeatures {
         Write-Log DEBUG ".NET 4 already enabled"
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NetFx4-AdvSrvs'; Content='.NET 4'; Status='OK'; Detail='already enabled' })
     } else {
+        Start-LiveItem -Name '.NET 4' -What 'installing'
         $st4 = Enable-Feature -Name 'NetFx4-AdvSrvs' -Display '.NET 4'
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NetFx4-AdvSrvs'; Content='.NET 4'; Status=$st4; Detail='' })
+        Write-AppLine -Name '.NET 4' -Status $st4 -From $script:Results.Count
     }
 }
 
@@ -2125,13 +2545,41 @@ function Write-Summary {
         $lines | Out-File -FilePath $resultsFile -Encoding UTF8 -Force
         Write-Log INFO ("results summary: {0}" -f $resultsFile)
     } catch { Write-Log WARN "could not write results file: $($_.Exception.Message)" }
+    $restart = -not $script:DryRun -and (Test-RestartPending)
     if ($script:DotNet35Proc -and -not $script:DotNet35Proc.HasExited) {
         Write-Log WARN ".NET 3.5 is still installing in the background - reboot / sign out only after it finishes."
-    } elseif (-not $script:DryRun -and (Test-RestartPending)) {
+    } elseif ($restart) {
         Write-Log WARN "Restart the PC to finish - Windows completes some of the changes only at a restart (a sign-out is not enough)."
     } else {
         Write-Log WARN "A reboot / sign-out is recommended to fully apply the changes."
     }
+    # The rail: "Done in 19m 29s   93 OK . 7 skipped . 0 failed", every problem again, what to do next, the log
+    if (-not $script:Ui) { return }
+    $gl = $script:G
+    $count = @{}; foreach ($r in $script:Results) { $count[[string]$r.Status] = 1 + [int]$count[[string]$r.Status] }
+    $parts = [System.Collections.Generic.List[string]]::new()
+    if ($script:DryRun) { $parts.Add(('{0} would apply' -f [int]$count['DRYRUN'])) } else { $parts.Add(('{{g:{0} OK}}' -f [int]$count['OK'])) }
+    if ($count['SKIPPED']) { $parts.Add(('{0} skipped' -f $count['SKIPPED'])) }
+    if ($count['WARN']) { $parts.Add(('{{y:{0} warning{1}}}' -f $count['WARN'], $(if ($count['WARN'] -gt 1) { 's' }))) }
+    if ($count['BACKGROUND']) { $parts.Add(('{{y:{0} still installing}}' -f $count['BACKGROUND'])) }
+    $parts.Add($(if ($count['FAILED']) { '{{r:{0} failed}}' -f $count['FAILED'] } else { '0 failed' }))
+    $time = if ($script:RunClock) { Format-Span $script:RunClock.Elapsed.TotalSeconds } else { '-' }
+    $head = if (-not $script:RunFinished) { "Stopped after $time" } elseif ($script:DryRun) { "Dry run done in $time" } else { "Done in $time" }
+    Write-Ui "  {d:$($gl.Bar)}"
+    Write-Ui ("  {d:$($gl.End)$($gl.Rule)} {w:$head}   " + ($parts -join " {d:$($gl.Dot)} "))
+    foreach ($r in @($script:Results | Where-Object { $_.Status -in 'WARN', 'FAILED' })) {
+        $label = if ($script:AppNames.ContainsKey([string]$r.Id)) { $script:AppNames[[string]$r.Id] } else { [string]$r.Content }
+        $why = if ($r.Detail -and $r.Detail -ne 'direct') { ": $($r.Detail)" } else { '' }
+        Write-Ui ('     ' + (Get-Glyph $r.Status) + ' ' + (Get-Cut ("$label$why" -replace '[{}]', '') ((Get-UiWidth) - 7)))
+    }
+    Write-Ui ''
+    $next = if (-not $script:RunFinished) { 'Run the script again to finish the rest.' }
+            elseif ($script:DotNet35Proc -and -not $script:DotNet35Proc.HasExited) { '.NET 3.5 is still installing in the background - restart only after it finishes.' }
+            elseif ($script:DryRun) { 'Dry run - nothing was changed.' }
+            elseif ($restart) { 'Restart the PC to finish. Windows completes some changes only at a restart.' }
+            else { 'Restart or sign out to apply everything.' }
+    Write-Ui "     {y:$($gl.Run)} $next"
+    Write-Ui "       {d:Log}  $($script:LogFile)"
 }
 
 function Test-TaskbarPinned {
@@ -2153,6 +2601,7 @@ function Get-PinHelper {
             Write-Log DEBUG "using the bundled Pin-Taskbar helper (next to the script - no download)"
         } else {
             Write-Log INFO "fetching the Pin-Taskbar helper (our copy, from our repo; temporary)"
+            if (-not $script:Live) { Show-LiveText 'fetching the Pin-Taskbar helper' }
             $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
             Invoke-WebRequest -Uri 'https://gitlab.msuhost.com/superuser/win11-tweaks/-/raw/main/Pin-Taskbar.ps1' -OutFile $helper -UseBasicParsing -ErrorAction Stop
             $ProgressPreference = $pp
@@ -2208,6 +2657,7 @@ function Invoke-TaskbarPins {
             $wsh = New-Object -ComObject WScript.Shell; $sc = $wsh.CreateShortcut($lnk)
             $sc.TargetPath = "$env:SystemRoot\explorer.exe"; $sc.Arguments = 'shell:MyComputerFolder'
             $sc.IconLocation = "$env:SystemRoot\System32\imageres.dll,-109"; $sc.Description = 'This PC'; $sc.Save()
+            Show-LiveText 'pinning This PC to the taskbar'
             Invoke-PinHelper -Helper $helper -Target $lnk
             Write-Log OK "pinned This PC to the taskbar"; $r.Status = 'OK'
         } catch { Write-Log WARN "This PC pin failed: $($_.Exception.Message)"; $r.Detail = $_.Exception.Message }
@@ -2217,7 +2667,7 @@ function Invoke-TaskbarPins {
     foreach ($app in 'Microsoft Edge', 'Microsoft Store') {
         if (-not (Test-TaskbarPinned $app)) { Write-Log DEBUG "$app already unpinned - skipping"; continue }
         $u = [pscustomobject]@{ Phase='Taskbar'; Id="Unpin.$app"; Content="Unpinned $app from taskbar"; Status='FAILED'; Detail='' }
-        try { Invoke-PinHelper -Helper $helper -Target $app -Unpin; Write-Log OK "unpinned $app from the taskbar"; $u.Status = 'OK' }
+        try { Show-LiveText "unpinning $app"; Invoke-PinHelper -Helper $helper -Target $app -Unpin; Write-Log OK "unpinned $app from the taskbar"; $u.Status = 'OK' }
         catch { Write-Log WARN "unpin $app failed: $($_.Exception.Message)"; $u.Detail = $_.Exception.Message }
         $script:Results.Add($u)
     }
@@ -2294,24 +2744,16 @@ function Test-Interactive {
 }
 
 function Show-Intro {
-    $art = @'
- __  __  _____ _    _ _    _           _
-|  \/  |/ ____| |  | | |  | |         | |
-| \  / | (___ | |  | | |__| | ___  ___| |_
-| |\/| |\___ \| |  | |  __  |/ _ \/ __| __|
-| |  | |____) | |__| | |  | | (_) \__ \ |_
-|_|  |_|_____/ \____/|_|  |_|\___/|___/\__|
-'@
-    Write-Host ""
-    Write-Host $art -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "  Applies Windows 11 tweaks (privacy, debloat, UI, performance) and installs" -ForegroundColor Gray
-    Write-Host "  a set of apps + Visual C++ / .NET runtimes.  Full log saved next to the script." -ForegroundColor Gray
-    Write-Host ""
+    # The rail head and the questions - each on ONE line, the answer typed right after it
+    $g = $script:G; $bar = "  {d:$($g.Bar)}"
+    Write-Ui -Always ''
+    Write-Ui -Always "  {d:$($g.Top)}  {b:MSUHost}  {w:win11-tweaks} {d:$($script:Version)}"
+    Write-Ui -Always "$bar  {d:Windows 11 setup: tweaks, apps and runtimes. About 20 minutes.}"
+    Write-Ui -Always $bar
     if (Test-Interactive) {
-        $ans = Read-Host "  Continue? (Y/n)"
+        $ans = Read-Answer "  {b:?}  {w:Continue?} {d:(Y/n)} {b:$($g.Next)} "
         if ($ans -match '^\s*(n|no)\s*$') {
-            Write-Host "  Cancelled - nothing was changed." -ForegroundColor Red
+            Write-Ui -Always "  {d:$($g.End)$($g.Rule)} {r:Cancelled - nothing was changed.}"
             $script:Cancelled = $true   # NOT `exit` - that would close the host window when run via `irm|iex`
             return
         }
@@ -2321,7 +2763,7 @@ function Show-Intro {
     if ($Machine -eq 'PC' -or $Machine -eq 'Laptop') {
         $script:MachineType = if ($Machine -eq 'Laptop') { 'Laptop' } else { 'PC' }
     } elseif (Test-Interactive) {
-        $mt = Read-Choice -Title 'Is this a PC or a Laptop?' -Options 'PC', 'Laptop'
+        $mt = Read-Choice -Title 'PC or laptop?' -Options 'PC', 'Laptop'
         $script:MachineType = if ($mt -eq '2') { 'Laptop' } else { 'PC' }   # $null (no keyboard) -> PC
     } else {
         $script:MachineType = 'PC'   # non-interactive default (override with -Machine PC|Laptop)
@@ -2330,7 +2772,7 @@ function Show-Intro {
     # is downloaded; after the last answer the run goes on unattended. Non-interactive = Gele.
     $newUser = $false
     if (Test-Interactive) {
-        $newUser = (Read-Choice -Options 'Gele, is that you?', 'New user') -eq '2'   # $null (no keyboard) -> Gele
+        $newUser = (Read-Choice -Title 'Who is it?' -Options 'Gele', 'New user') -eq '2'   # $null (no keyboard) -> Gele
         if ($newUser) { $sel = Read-AppSelection }
     }
     Write-Log INFO ("Machine type: {0}" -f $script:MachineType)
@@ -2338,22 +2780,18 @@ function Show-Intro {
         $kept = @($script:NewUserKeepApps.Keys | Where-Object { $script:KeepApps.ContainsKey($_) } | ForEach-Object { $script:NewUserKeepApps[$_] })
         $keeps = if ($kept) { ', keeps ' + ($kept -join ' + ') } else { '' }
         Write-Log INFO ("User: New user - {0} of {1} apps selected{2}" -f $sel.Picked, $sel.Asked, $keeps)
+        $script:UserLabel = 'New user, {0} of {1} apps' -f $sel.Picked, $sel.Asked
     }
-    else { Write-Log INFO "User: Gele - installing all apps" }
+    else { Write-Log INFO "User: Gele - installing all apps"; $script:UserLabel = 'Gele' }
 }
 
 function Read-Choice {
-    # A small coloured menu - an optional title, one "[n] option" per line - then "Select [1/n]" until a valid
-    # number is typed. Returns that number as a string, or $null when there's no keyboard (input redirected:
-    # Read-Host gives nothing back), so the caller falls back to its default instead of asking forever.
+    # A one-line menu in colour - "  ?  Title  1 PC  2 Laptop  >" - asked again until a valid number is typed. Returns
+    # that number as a string, or $null when there's no keyboard (input redirected: Read-Host gives nothing back), so the
+    # caller falls back to its default instead of asking forever.
     param([string]$Title, [string[]]$Options)
-    Write-Host ""
-    if ($Title) { Write-Host "  $Title" -ForegroundColor Yellow }
-    for ($i = 0; $i -lt $Options.Count; $i++) {
-        Write-Host ("  [{0}] " -f ($i + 1)) -NoNewline -ForegroundColor Cyan
-        Write-Host $Options[$i] -ForegroundColor White
-    }
-    do { $ans = Read-Host ("  Select [1/{0}]" -f $Options.Count) }
+    $opts = @(for ($i = 0; $i -lt $Options.Count; $i++) { "{b:$($i + 1)} $($Options[$i])" }) -join '  '
+    do { $ans = Read-Answer "  {b:?}  {w:$Title}  $opts  {b:$($script:G.Next)} " }
     until ($null -eq $ans -or ($ans -match '^\s*\d+\s*$' -and [int]$ans -ge 1 -and [int]$ans -le $Options.Count))
     if ($null -eq $ans) { return $null }
     return $ans.Trim()
@@ -2383,28 +2821,33 @@ function Get-AppChoices {
     return $list
 }
 
+function Format-Question {
+    # "  |  Revo Uninstaller ................ Y/n > " - one (Y/n) question on the rail
+    param([string]$Name)
+    $n = Get-Cut $Name 30
+    return "  {d:$($script:G.Bar)}  $n {d:" + ('.' * (32 - $n.Length)) + "} {d:Y/n} {b:$($script:G.Next)} "
+}
+
 function Read-AppSelection {
     # New user: one (Y/n) per app - Enter (or anything but n/no) = yes. The no's go into $script:NotSelected.
     # Returns how many apps were asked about (.Asked) and picked (.Picked).
     $choices = @(Get-AppChoices)
-    Write-Host ""
-    Write-Host "  Pick the apps to install - Enter = yes, n = no." -ForegroundColor Yellow
-    Write-Host "  Visual C++, DirectX and .NET 3.5 are always installed - games and apps need them." -ForegroundColor DarkGray
-    Write-Host ""
+    $g = $script:G; $bar = "  {d:$($g.Bar)}"
+    Write-Ui -Always $bar
+    Write-Ui -Always ("  {b:?}  {w:Apps for this $(if ($script:MachineType -eq 'Laptop') { 'laptop' } else { 'PC' })}  {d:Enter = yes, n = no}")
+    Write-Ui -Always "$bar  {d:Visual C++, DirectX and .NET 3.5 always go in - games and apps need them.}"
     $no = 0
     foreach ($c in $choices) {
-        $ans = Read-Host ("    {0,-26}(Y/n)" -f $c.Name)
+        $ans = Read-Answer (Format-Question $c.Name)
         if ($ans -match '^\s*(n|no)\s*$') { $script:NotSelected[$c.Key] = 'not selected'; $no++ }
     }
     # Built-in apps the script would remove (Gele never gets asked - they go): Enter keeps them, n removes them.
-    Write-Host ""
-    Write-Host "  Keep these Windows apps? - Enter = yes, n = no." -ForegroundColor Yellow
-    Write-Host ""
+    Write-Ui -Always $bar
+    Write-Ui -Always "  {b:?}  {w:Keep these Windows apps?}  {d:Enter = yes, n = no}"
     foreach ($k in $script:NewUserKeepApps.Keys) {
-        $ans = Read-Host ("    {0,-26}(Y/n)" -f $script:NewUserKeepApps[$k])
+        $ans = Read-Answer (Format-Question $script:NewUserKeepApps[$k])
         if ($ans -notmatch '^\s*(n|no)\s*$') { $script:KeepApps[$k] = $script:NewUserKeepApps[$k] }
     }
-    Write-Host ""
     # A direct app that wasn't offered (its gate failed - e.g. no NVIDIA driver yet) must not install later
     # either: the install phase checks the gate again, and Windows Update can add the NVIDIA driver mid-run.
     $offered = @($choices | ForEach-Object { $_.Key })
@@ -2420,11 +2863,13 @@ try {
     Show-Intro
     if ($script:Cancelled) { return }   # user answered "n" to Continue
     $script:RunStarted = $true          # from here on the summary is written - also if the run is stopped (see finally)
+    $script:RunClock = [System.Diagnostics.Stopwatch]::StartNew()
     Write-Banner
     if ($script:DryRun) { Write-Log WARN "DRY RUN - no changes will be made." }
     Invoke-Tweaks
     Invoke-TaskbarPins        # This PC pin + unpin Edge/Store BEFORE installs...
     if ($script:NeedExplorerRestart -and -not $script:DryRun) { Update-Explorer -Action restart }   # ...then restart explorer so the taskbar/desktop is already clean (no Widgets/Search) during the installs
+    Write-TweakGroups         # the tweak phase on the rail: one line per group, now that it's over
     Start-DotNet35            # fire the slow .NET 3.5 WU download NOW so it overlaps the install phase (parallel)
     Invoke-InstallPhase       # apps + per-app desktop icons (Chrome is pinned right after it installs, inside this)
     if ($script:ChromePinned -and -not $script:DryRun) { Update-Explorer -Action restart }   # refresh the taskbar to show the Chrome pin
@@ -2437,7 +2882,7 @@ finally {
     # the .NET 3.5 wait, which then simply keeps installing in the background (/NoRestart).
     if ($script:RunStarted) {
         if (-not $script:RunFinished) {
-            Write-Host ''   # end the line - Ctrl+C can land mid-heartbeat (.NET 3.5 wait), which never printed its newline
+            if ($script:LiveOpen) { Clear-Live } elseif ($script:Detailed) { Write-Host '' }   # Ctrl+C can land mid-line (the live step / the .NET 3.5 heartbeat)
             # e.g. Ctrl+C in the .NET 3.5 wait: the last steps (old components, refresh rate, VBScript) come after it
             Write-Log WARN "Stopped early - this summary only covers what ran. Run the script again to finish the rest."
         }
@@ -2452,6 +2897,7 @@ finally {
 }
 if ($script:RunFinished -and $Reboot -and -not $script:DryRun) {
     Write-Log WARN "Rebooting in 15s (-Reboot given). Press Ctrl+C to cancel."
+    Write-Ui "     {y:$($script:G.Run)} Restarting in 15 s (-Reboot) - Ctrl+C cancels."
     Start-Sleep -Seconds 15
     Restart-Computer -Force
 }

@@ -30,11 +30,12 @@ console **and** a file so the run can be reviewed afterwards.
     ExpressVPN have no silent uninstall, so the summary lists them WARN with the tool that removes them;
   - removed apps **stay removed** (Windows Update's reinstall entries for the new Outlook, Dev Home and
     Cross Device are deleted);
-  - **old components removed** — Steps Recorder, Math Recognizer, Internet Explorer mode, PowerShell ISE,
-    Print Management, Work Folders, Windows Media Player Legacy (kept when it is the only video player),
-    and **VBScript** at the very end, after the installs (command-line activation with `slmgr.vbs` needs
-    it — activate in Settings, or add it back under Optional features; **kept on AMD machines**: AMD's
-    chipset installer runs a VBScript);
+  - **old components removed** at the end, after .NET 3.5 (Windows completes the removal at the next
+    restart) — Steps Recorder, Math Recognizer, Internet Explorer mode, PowerShell ISE, Print Management,
+    Work Folders, Windows Media Player Legacy (kept when it is the only video player), and **VBScript**
+    last, after the installs (command-line activation with `slmgr.vbs` needs it — activate in Settings,
+    or add it back under Optional features; **kept on AMD machines**: AMD's chipset installer runs a
+    VBScript);
   - **Edge** doesn't preload or run after it's closed, downloads no local AI model, no news / promo
     tabs / default-browser and sign-in nags / sidebar;
   - **rarely used services to Manual** — Fax, Downloaded Maps Manager, Retail Demo, Phone Service, Mobile
@@ -187,4 +188,6 @@ New user automatically; if everyone must get it without being asked, also add it
   On a normal connection this is seconds; on a WU-throttled box it can take ~30 min. Ctrl+C stops
   the script there (the summary is still written — see [The log](#the-log)), and .NET 3.5 keeps
   installing in the background (`/NoRestart`, so no surprise reboot — just don't reboot until
-  it's done).
+  it's done). When Windows is already waiting for a restart (a Windows update, or the components
+  an earlier run removed), it installs .NET 3.5 but finishes it only at that restart: the run then
+  says `Done! (finishes at the next restart)` and ends with "Restart the PC to finish".

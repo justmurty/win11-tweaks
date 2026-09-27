@@ -293,6 +293,12 @@ function Disable-WinFeature {
     } catch { Write-Log WARN "$Label could not be turned off: $($_.Exception.Message)" $Id }
 }
 
+function Test-RestartPending {
+    # Windows servicing waits for a restart (a removed component, .NET 3.5 held back, a Windows update): those
+    # changes complete only at a restart - a sign-out is not enough.
+    Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+}
+
 function Get-InstalledPrograms {
     # DisplayName of every desktop program in Add/Remove Programs (machine 64/32-bit + this user).
     $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -1507,7 +1513,9 @@ $script:Tweaks = @(
 
   # Old Windows components nobody uses at home (42-47, 50) - they come back from Settings > System > Optional
   # features. Windows Media Player Legacy stays when it's the last video player (see Test-KeepLegacyPlayer).
-  [pscustomobject]@{ Id='CustomRemoveComponents'; Content='Old Windows components - Remove (Steps Recorder, IE mode...)'; Category='Custom'; Apply={
+  # LATE, after .NET 3.5: removing IE mode / Work Folders leaves Windows waiting for a restart, and while it waits
+  # it holds every new feature back until the restart too - .NET 3.5 included (superuser's VM run, 2026-09-27).
+  [pscustomobject]@{ Id='CustomRemoveComponents'; Content='Old Windows components - Remove (Steps Recorder, IE mode...)'; Category='Custom'; Late=$true; Apply={
       $id='CustomRemoveComponents'
       Remove-WinCapability -Id $id -Name 'App.StepsRecorder' -Label 'Steps Recorder'
       Remove-WinCapability -Id $id -Name 'MathRecognizer' -Label 'Math Recognizer'
@@ -2023,9 +2031,9 @@ function Start-DotNet35 {
     # phase, so it overlaps the ~15 min of app installs instead of adding ~11 min serially at the end.
     # Finished by Enable-DotNetFeatures. (Runs after the tweaks' Recall DISM, so no DISM-vs-DISM clash.)
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would start .NET 3.5 (NetFx3) download in the background"; return }
-    if ((Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction SilentlyContinue).State -eq 'Enabled') {
-        Write-Log DEBUG ".NET 3.5 already enabled - nothing to start"; return
-    }
+    $state = "$((Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction SilentlyContinue).State)"
+    if ($state -eq 'Enabled') { Write-Log DEBUG ".NET 3.5 already enabled - nothing to start"; return }
+    if ($state -eq 'EnablePending') { Write-Log DEBUG ".NET 3.5 already installed - Windows finishes it at the next restart"; return }
     $dlog = Join-Path $env:TEMP 'dism_NetFx3.log'
     Write-Log DEBUG "starting .NET 3.5 (NetFx3) download in the background (shown as Installing/Done at the end)"
     try {
@@ -2066,12 +2074,23 @@ function Enable-DotNetFeatures {
         Start-Sleep -Milliseconds 500
     }
     # .NET 3.5 was already enabled, the DISM just finished, or it was never started - safe to query state now.
-    if ((Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction SilentlyContinue).State -eq 'Enabled') {
+    # EnablePending = installed, Windows finishes it at the next restart: while Windows already waits for a restart
+    # (a removed component, a Windows update) it holds a new feature back like that - DISM says "Reboot required".
+    $code = ''
+    if ($script:DotNet35Proc) {
+        $c = $script:DotNet35Proc.ExitCode
+        $code = if ($null -eq $c -or "$c" -eq '') { 'unknown' } elseif ([int64]$c -lt 0) { '0x{0:X8}' -f [int]$c } else { "$c" }
+        Write-Log DEBUG "DISM exit code $code"
+    }
+    $state = "$((Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction SilentlyContinue).State)"
+    if ($state -eq 'Enabled') {
         Write-Log OK "Done!"
+    } elseif ($state -eq 'EnablePending') {
+        Write-Log OK "Done! (finishes at the next restart)"; $rec3.Detail = 'finishes at the next restart'
     } elseif (-not $script:DotNet35Proc) {
         Write-Log WARN "Failed - .NET 3.5 (was not started)"; $st3 = 'FAILED'
     } else {
-        Write-Log WARN "Failed - .NET 3.5 (DISM finished but the feature is not enabled - see %TEMP%\dism_NetFx3.log)"; $st3 = 'FAILED'
+        Write-Log WARN "Failed - .NET 3.5 (DISM exit code $code, state '$state' - see %TEMP%\dism_NetFx3.log)"; $st3 = 'FAILED'
     }
     $rec3.Status = $st3
     # .NET 4 is already enabled on Win11 -> record quietly (no console clutter); enable only if somehow off.
@@ -2108,6 +2127,8 @@ function Write-Summary {
     } catch { Write-Log WARN "could not write results file: $($_.Exception.Message)" }
     if ($script:DotNet35Proc -and -not $script:DotNet35Proc.HasExited) {
         Write-Log WARN ".NET 3.5 is still installing in the background - reboot / sign out only after it finishes."
+    } elseif (-not $script:DryRun -and (Test-RestartPending)) {
+        Write-Log WARN "Restart the PC to finish - Windows completes some of the changes only at a restart (a sign-out is not enough)."
     } else {
         Write-Log WARN "A reboot / sign-out is recommended to fully apply the changes."
     }
@@ -2408,7 +2429,7 @@ try {
     Invoke-InstallPhase       # apps + per-app desktop icons (Chrome is pinned right after it installs, inside this)
     if ($script:ChromePinned -and -not $script:DryRun) { Update-Explorer -Action restart }   # refresh the taskbar to show the Chrome pin
     Enable-DotNetFeatures     # finish .NET 3.5 (usually already done) + .NET 4
-    Invoke-Tweaks -Late       # last: what must wait until the installers are done (VBScript) - DISM is free again here
+    Invoke-Tweaks -Late       # last: what must wait for the installers (VBScript) and for .NET 3.5 (old components) - DISM is free again here
     $script:RunFinished = $true
 }
 finally {

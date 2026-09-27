@@ -285,7 +285,8 @@ function Install-App {
     # Clean console output: just "Installing <name>" then "Done!" (or "Failed"). winget's own chatter
     # (Found / Downloading / Successfully installed) is redirected to a temp file - shown only in the
     # log file on failure, never on the console. Returns a STATUS: OK / FAILED / DRYRUN.
-    param([string]$Id, [string]$Name, [string]$Location, [string]$DetectName, [string]$Source)
+    param([string]$Id, [string]$Name, [string]$Location, [string]$DetectName, [string]$Source,
+          [int]$AbandonWaitSeconds = 300)   # how long to wait for an installer winget abandoned (see below)
     $label = if ($Name) { $Name } elseif ($script:AppNames.ContainsKey($Id)) { $script:AppNames[$Id] } else { $Id }
     $src = if ($Source) { $Source } else { 'winget' }   # 'msstore' for Store-only apps (e.g. Alienware Command Center)
     $wingetArgs = "install $Id --accept-package-agreements --accept-source-agreements --source $src --silent"
@@ -297,8 +298,25 @@ function Install-App {
     try {
         $code = Invoke-Winget -ArgumentList $wingetArgs -OutFile $wo
         if ($code -eq 0) { Remove-Item $wo -Force -ErrorAction SilentlyContinue; Write-Log OK "Done!"; return 'OK' }
-        Write-Log WARN "Failed - $label"
+        # A non-zero exit code is not the last word - trust the system over it (like Install-DirectDownload does):
+        # an installer can return an odd code and still install. E_ABORT (0x80004004) means winget stopped
+        # watching the installer ("Installation abandoned") without killing it - Battle.net's setup does this
+        # and finishes on its own (its ~750 MB download can take minutes) - so give the install time to land
+        # before calling it a failure. A clock, not a count: each check runs 'winget list' (seconds).
+        $hex = '0x{0:X8}' -f $code
+        $installed = Test-AppInstalled -Id $Id -NamePattern $DetectName
+        if (-not $installed -and $code -eq -2147467260) {
+            Write-Log INFO ("winget stopped waiting for the {0} installer - checking whether it finishes on its own (up to {1:N0} min)" -f $label, ($AbandonWaitSeconds / 60))
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            while (-not $installed -and $sw.Elapsed.TotalSeconds -lt $AbandonWaitSeconds) {
+                Start-Sleep -Seconds 5
+                $installed = Test-AppInstalled -Id $Id -NamePattern $DetectName
+            }
+        }
+        if ($installed) { Write-Log DEBUG "${label}: winget exit code $hex, but it IS installed - treating as success" }
+        else            { Write-Log WARN "Failed - $label (winget exit code $hex)" }
         if (Test-Path $wo) { Get-Content $wo -ErrorAction SilentlyContinue | Where-Object { $_.Trim() } | Select-Object -Last 8 | ForEach-Object { Write-Log DEBUG "  winget> $($_.Trim())" }; Remove-Item $wo -Force -ErrorAction SilentlyContinue }
+        if ($installed) { Write-Log OK "Done!"; return 'OK' }
         return 'FAILED'
     } catch {
         Write-Log WARN "Failed - $label : $($_.Exception.Message)"; return 'FAILED'
@@ -888,6 +906,7 @@ $script:AppLocations = @{
 # Skip-if-already-installed detection by Add/Remove Programs DisplayName (-like pattern),
 # for apps often present OUTSIDE winget so 'winget list' alone won't see them. Add IDs here as needed.
 $script:AppDetectNames = @{
+    'Blizzard.BattleNet' = '*Battle.net*'   # its setup finishes outside winget (winget reports "Installation abandoned")
 }
 # Non-winget apps: fetch the vendor installer directly and run it silently (see Install-DirectDownload).
 $script:DirectApps = @(
@@ -1260,10 +1279,10 @@ function Write-Summary {
         Write-Log INFO ("{0,-8}: {1}" -f $g.Name, $g.Count)
     }
     foreach ($r in ($script:Results | Where-Object { $_.Status -eq 'WARN' })) {
-        Write-Log WARN ("WARN    [{0}] {1} - {2}" -f $r.Phase, $r.Content, $r.Detail)
+        Write-Log WARN ("WARN    [{0}] {1}{2}" -f $r.Phase, $r.Content, $(if ($r.Detail) { " - $($r.Detail)" }))
     }
     foreach ($r in ($script:Results | Where-Object { $_.Status -eq 'FAILED' })) {
-        Write-Log ERROR ("FAILED  [{0}] {1} - {2}" -f $r.Phase, $r.Content, $r.Detail)
+        Write-Log ERROR ("FAILED  [{0}] {1}{2}" -f $r.Phase, $r.Content, $(if ($r.Detail) { " - $($r.Detail)" }))
     }
     Write-Log INFO ("full log: {0}" -f $script:LogFile)
     # Compact results file next to the log (quick OK/FAILED overview)

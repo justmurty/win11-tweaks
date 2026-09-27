@@ -113,6 +113,9 @@ direct-download apps, or `$script:VendorApps` for apps that belong on one vendor
 - Some direct installers return a non-standard exit code even on success (FL Studio returns
   `1223`), so the script verifies the actual install via Add/Remove Programs instead of trusting
   the exit code.
+- winget gets the same check: when it reports a failure, the script looks for the app before
+  calling it FAILED. Battle.net's setup finishes after winget has stopped waiting for it (winget
+  says "Installation abandoned"), so in that case the script gives it up to 5 minutes to land.
 - **No undo and no restore point** — if you want to roll back, take a snapshot/backup yourself
   before the real run.
 - **winget needs an interactive session** — run via `Run-Win11Tweaks.bat` (double-click) or the

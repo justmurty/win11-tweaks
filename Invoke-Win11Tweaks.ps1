@@ -3225,7 +3225,8 @@ function ConvertTo-GuiXml([string]$Text) {
 }
 
 function Get-GuiClock([double]$Seconds) {
-    $s = [int][math]::Floor([math]::Max(0, $Seconds)); '{0:00}:{1:00}' -f [math]::Floor($s / 60), ($s % 60)
+    # 0.0, not 0: [math]::Max(0, 3.7) takes the Int32 overload - it rounds 3.7 to 4 first
+    $s = [int][math]::Floor([math]::Max(0.0, $Seconds)); '{0:00}:{1:00}' -f [math]::Floor($s / 60), ($s % 60)
 }
 
 # ---- building blocks (XAML text). Text handed to New-GuiText is XML already: the callers escape data (ConvertTo-GuiXml).
@@ -3613,7 +3614,7 @@ function Get-GuiRunParts($M) {
         $lc = if ($ph.State -eq 'live') { $GuiC.tx } else { $GuiC.tx3 }
         $bar = if ($ph.State -in 'done', 'stopped') { "<Border Height='4' CornerRadius='2' Background='$($GuiC.ok)'/>" }
                elseif ($ph.State -in 'live', 'running') {
-                   $f = [math]::Round([math]::Max(0.04, [math]::Min(1, $frac)), 3)
+                   $f = [math]::Round([math]::Max(0.04, [math]::Min(1.0, $frac)), 3)   # 1.0: Min(1, 0.29) is the Int32 overload = 0
                    "<Border Height='4' CornerRadius='2'><Border.Background><LinearGradientBrush StartPoint='0,0' EndPoint='1,0'><GradientStop Color='$($GuiC.blue)' Offset='0'/>" +
                    "<GradientStop Color='$($GuiC.blue)' Offset='$f'/><GradientStop Color='$($GuiC.line2)' Offset='$f'/><GradientStop Color='$($GuiC.line2)' Offset='1'/></LinearGradientBrush></Border.Background>" +
                    "<Border.Effect><DropShadowEffect Color='$($GuiC.blue)' BlurRadius='10' ShadowDepth='0' Opacity='0.45'/></Border.Effect></Border>"

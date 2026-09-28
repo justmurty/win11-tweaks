@@ -1669,6 +1669,18 @@ $script:Tweaks = @(
       }
   }}
 
+  # Calls (superuser, 2026-09-28): when a call starts (Discord, Teams...) Windows turns every other sound down by 80%,
+  # the game included. 3 = "Do nothing" on the Communications tab of the Sound control panel (no value = the 80%).
+  [pscustomobject]@{ Id='CustomNoCallDucking'; Content='Sound - no volume drop during calls'; Category='Custom'; Apply={
+      Set-Reg -Id 'CustomNoCallDucking' -Path 'HKCU:\Software\Microsoft\Multimedia\Audio' -Name 'UserDuckingPreference' -Type DWord -Value '3'
+  }}
+
+  # Clipboard history (superuser, 2026-09-28): Win+V shows the history from the first press instead of asking to turn
+  # it on. On this PC only - syncing it to other devices (the cloud clipboard) stays off.
+  [pscustomobject]@{ Id='CustomClipboardHistory'; Content='Clipboard history (Win+V) - Enable'; Category='Custom'; Apply={
+      Set-Reg -Id 'CustomClipboardHistory' -Path 'HKCU:\Software\Microsoft\Clipboard' -Name 'EnableClipboardHistory' -Type DWord -Value '1'
+  }}
+
   # Windows Update restarts (73): never on its own while someone is signed in - it asks instead
   [pscustomobject]@{ Id='CustomNoAutoReboot'; Content='Windows Update - no auto-restart while signed in'; Category='Custom'; Apply={
       Set-Reg -Id 'CustomNoAutoReboot' -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Name 'NoAutoRebootWithLoggedOnUsers' -Type DWord -Value '1'
@@ -1814,8 +1826,9 @@ $script:TweakGroups = @(
     [pscustomobject]@{ Name = 'Edge'; Text = 'no startup boost, promos or sidebar'; Ids = @('WPFTweaksEdgeDebloat') }
     [pscustomobject]@{ Name = 'Performance'; Text = @{ PC = 'Ultimate Performance, Memory Integrity off, no hibernation'; Laptop = 'Ultimate on the charger, Balanced on battery' }
         Ids = @('CustomUltimatePerf', 'CustomLaptopPower', 'CustomDisableVBS', 'WPFToggleGameMode', 'CustomHibernateOff', 'WPFToggleStandbyFix', 'CustomStandbyNoNetBattery') }
-    [pscustomobject]@{ Name = 'Input & look'; Text = 'dark theme, Num Lock, no mouse acceleration'
-        Ids = @('WPFToggleDarkMode', 'WPFToggleLoginBlur', 'WPFToggleNumLock', 'CustomMouseAccel', 'CustomStickyKeysOff') }
+    [pscustomobject]@{ Name = 'Input & look'; Text = 'dark theme, Num Lock, Win+V history, no mouse acceleration'
+        Ids = @('WPFToggleDarkMode', 'WPFToggleLoginBlur', 'WPFToggleNumLock', 'CustomMouseAccel', 'CustomStickyKeysOff', 'CustomClipboardHistory') }
+    [pscustomobject]@{ Name = 'Sound'; Text = 'no volume drop during calls'; Ids = @('CustomNoCallDucking') }
     [pscustomobject]@{ Name = 'Services'; Text = { if ($script:UiCount.Svc) { 'rarely used ones to Manual, {0} changed' -f $script:UiCount.Svc } else { 'rarely used ones to Manual' } }
         Ids = @('WPFTweaksServices', 'CustomServicesManual') }
     [pscustomobject]@{ Name = 'System'; Text = 'Cloudflare DNS, no auto-restart, temp files cleaned'; Ids = @('CustomDnsCloudflare', 'CustomNoAutoReboot', 'WPFTweaksDeleteTempFiles') }

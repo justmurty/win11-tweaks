@@ -7,7 +7,7 @@ the run (see [The console](#the-console)); every detail goes to a log file for l
 
 ## What it does
 
-- **53 tweaks** — 25 standard (Essential + Advanced + Customize Preferences toggles) + 28
+- **55 tweaks** — 25 standard (Essential + Advanced + Customize Preferences toggles) + 30
   custom (shortcut-arrow off, Spotlight off + default wallpaper, **Ultimate Performance** on a PC — on a
   laptop **Ultimate on the charger, Balanced on battery** (one plan, it switches by itself); a Ryzen X3D
   with two CCDs (7950X3D, 9950X3D...) keeps **Balanced**: AMD's V-Cache driver needs its core parking,
@@ -52,6 +52,10 @@ the run (see [The console](#the-console)); every detail goes to a log file for l
     adapter can fail at a rate Windows lists and leave the screen black), at the very end: without the real
     GPU driver Windows only offers 60 Hz, and that driver often arrives during the run (if a screen stayed at
     60 Hz, run the script again once the driver is in).
+
+  New since v1.6.0 (in the one-liner now, in the next release): **a call no longer turns the game
+  down** (Windows lowers every other sound by 80% while a call runs — set to "Do nothing"), and the
+  **clipboard history (Win+V)** is on from the first press (on this PC only, nothing synced to the cloud).
 
   Fixed in v1.6.0: Activity History no longer breaks the clipboard history (Win+V), Get Help stays
   (the Settings troubleshooters need it), "ConsumerFeatures" now also works on Pro. Details:

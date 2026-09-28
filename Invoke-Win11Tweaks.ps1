@@ -3,11 +3,12 @@
 .SYNOPSIS
     Applies a fixed set of Windows 11 tweaks, then installs a defined application set via
     winget (plus Visual C++ redists, .NET features and, on a PC, the chipset / Radeon drivers from
-    the maker's own site). No GUI. The console shows a compact view of the run (a rail: the tweaks as
-    groups, one line per app, the step running now); everything goes to a log file for later.
+    the maker's own site). A window asks the setup questions and shows the run (the tweaks as groups,
+    one line per app, the step running now); -Console shows the same in the console (a rail).
+    Everything goes to a log file for later.
 
 .DESCRIPTION
-    The 53 tweaks (25 standard + 28 custom) and the install list are a fixed, curated set
+    The 55 tweaks (25 standard + 30 custom) and the install list are a fixed, curated set
     (see docs/2026-07-11-win11-tweaks-design.md). Only the ON toggles / checked items are
     applied; nothing else is touched.
     The script makes NO restore point and does NOT reboot unless -Reboot is given.
@@ -16,7 +17,8 @@
     Log what WOULD happen and make NO system changes. Recommended for the first run.
 
 .PARAMETER Reboot
-    Reboot 15 seconds after finishing (cancellable with Ctrl+C). Off by default.
+    Reboot 15 seconds after finishing (cancellable with Ctrl+C). Off by default. An unattended
+    run: the console shows it (no window).
 
 .PARAMETER Machine
     'PC' or 'Laptop'. Skips the interactive "PC or Laptop?" question at startup. A laptop skips
@@ -28,6 +30,10 @@
 .PARAMETER LogDir
     Directory for the log file. Default: the script's own folder (fallback: Desktop
     if the script folder is unknown/unwritable). The log lands right next to the script.
+
+.PARAMETER Console
+    The rail in this console instead of the window. The console is also what you get without a
+    desktop (SSH, a service), with -Detailed or -Reboot, or when the window cannot open.
 
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\Invoke-Win11Tweaks.ps1 -DryRun
@@ -41,7 +47,8 @@ param(
     [switch]$Reboot,
     [switch]$Detailed,   # full/debug console output (default: concise, human-friendly; the LOG FILE is always full)
     [string]$Machine,   # 'PC' or 'Laptop' (validated in Show-Intro, NOT via [ValidateSet] - that breaks `irm|iex`)
-    [string]$LogDir
+    [string]$LogDir,
+    [switch]$Console    # the rail in this console instead of the window
 )
 
 $ErrorActionPreference = 'Continue'
@@ -71,7 +78,7 @@ $script:SettingsPagesHidden  = @()     # Settings pages hidden so far in this ru
 $script:ConsoleModeSaved     = $null   # console input mode before Set-QuickEdit turned QuickEdit off (put back at the end)
 $script:Results              = [System.Collections.Generic.List[object]]::new()
 # The console view ("Rail", superuser's pick from the design page, 2026-09-28) - see Write-Ui
-$script:Version              = '1.6.0' # on the rail head - bumped with every release
+$script:Version              = '1.7.0' # on the rail head and in the window's title bar - bumped with every release
 $script:Ui                   = -not $script:Detailed   # the console shows the rail; -Detailed puts the full log there instead
 # Cmdlets' own warnings would print straight onto the rail's live line (superuser's run, 2026-09-28: DISM's "WARNING:
 # Restart is suppressed because NoRestart is specified.") - off in the rail view; -Detailed shows the other cmdlet warnings
@@ -81,7 +88,7 @@ $script:UiLines              = [System.Collections.Generic.List[string]]::new() 
 $script:UiLive               = ''      # what the live line shows right now
 $script:LiveOpen             = $false  # the live line is on the console without its newline yet
 $script:Live                 = $null   # the step running now: Name / What / Clock - Update-LiveTick redraws it with the time
-$script:UiNotes              = @{}     # tweak Id -> what came of it, for its Finishing line ('7 removed: ...')
+$script:UiNotes              = @{}     # tweak Id -> what came of it, for its Finishing line ('7 removed')
 $script:UiWarn               = @{}     # tweak Id -> why it is a WARN, in words (instead of "1 step(s) failed")
 $script:UiCount              = @{ Appx = 0; Svc = 0 }   # apps removed / services changed - for the tweak group lines
 $script:UiRemoved            = [System.Collections.Generic.List[string]]::new()   # old components removed (their labels)
@@ -91,6 +98,12 @@ $script:RunClock             = $null   # started when the run starts ("Done in 1
 $script:DotNet35Clock        = $null   # started with the .NET 3.5 download
 $script:UserLabel            = 'Gele'  # "Gele" / "New user, 14 of 21 apps" - on the machine line
 $script:LastPrompt           = ''      # the question on the console right now, as plain text
+# The window (variant A of the design page, superuser's pick 2026-09-28) - see Start-Gui. The run only FEEDS it.
+$script:ConsoleOnly          = [bool]$Console   # -Console: the rail in the console, no window
+$script:Gui                  = $null   # while the window is open: @{ Shared; PowerShell; Runspace; Handle }
+$script:UiRow                = $null   # the row the last rail formatter built, for the window (Write-Ui sends it with its line)
+$script:UiPhase              = ''      # the phase the rail is in (Tweaks / Apps / .NET 3.5 / Finishing) - rows go under it
+$script:SummaryLine          = ''      # "Done in 19m 51s . 95 OK . 7 skipped . 0 failed" - for the console when the window closes
 # Console glyphs - made at run time, so this file stays pure ASCII. Only characters Cascadia Mono AND Consolas have: the
 # old console (conhost) has no fallback font, so anything else (rounded corners, check marks, braille spinners) shows as a box.
 $script:G = @{
@@ -230,6 +243,7 @@ function Format-Span {
 function Write-Markup {
     # Print rail markup: "{b:text}" in console colour b, everything else in the console's own colour
     param([string]$Markup, [switch]$NoNewline)
+    if (Test-ConsoleQuiet) { return }   # the window shows the run
     $pos = 0
     foreach ($m in [regex]::Matches($Markup, '\{([a-z]+):([^{}]*)\}')) {
         if ($m.Index -gt $pos) { Write-Host $Markup.Substring($pos, $m.Index - $pos) -NoNewline }
@@ -250,16 +264,27 @@ function Test-LiveConsole {
 function Clear-Live {
     # Wipe the live line so the next line starts clean
     if (-not $script:LiveOpen) { return }
-    Write-Host ("`r" + (' ' * (Get-UiWidth)) + "`r") -NoNewline
     $script:LiveOpen = $false
+    if (Test-ConsoleQuiet) { return }
+    Write-Host ("`r" + (' ' * (Get-UiWidth)) + "`r") -NoNewline
 }
 
 function Write-Ui {
-    # One line of the rail. -Always: with -Detailed too (the rail head and the questions).
+    # One line of the rail. -Always: with -Detailed too (the rail head and the questions). A row a formatter built with a
+    # status (Format-Row -Status) goes to the window as well - under the phase the rail is in.
     param([string]$Markup = '', [switch]$Always)
     if (-not ($script:Ui -or $Always)) { return }
     Clear-Live
+    if ($script:Gui -and $script:Gui.Shared.Closed -and -not $script:Gui.Replayed) {
+        # the window went before the end (it failed): the console takes over - with the rail so far, once
+        $script:Gui.Replayed = $true
+        foreach ($l in $script:UiLines) { Write-Markup $l }
+    }
     $script:UiLines.Add($Markup)
+    $r = $script:UiRow; $script:UiRow = $null
+    if ($r -and $r.Markup -eq $Markup) {
+        Send-GuiEvent 'row' @{ Phase = $script:UiPhase; Status = $r.Status; Warn = $r.Warn; Name = $r.Name; Text = $r.Text; Right = $r.Right }
+    }
     Write-Markup $Markup
 }
 
@@ -269,7 +294,7 @@ function Show-Live {
     param([string]$Markup)
     if (-not $script:Ui) { return }
     $script:UiLive = $Markup
-    if (-not (Test-LiveConsole)) { return }
+    if ((Test-ConsoleQuiet) -or -not (Test-LiveConsole)) { return }
     $w = Get-UiWidth
     $plain = Get-Visible $Markup
     if ($plain.Length -gt $w) { $Markup = Get-Cut $plain $w; $plain = $Markup }   # a live line that wraps leaves a copy per redraw
@@ -281,10 +306,12 @@ function Show-Live {
 }
 
 function Format-Row {
-    # "  |  <glyph> <Name padded>  <text, cut to fit>  <right, flush with the right edge>" - $Glyph is markup
+    # "  |  <glyph> <Name padded>  <text, cut to fit>  <right, flush with the right edge>" - $Glyph is markup.
+    # -Status (with -Warn): a result row - kept for the window too, whole (not cut to the console), see Write-Ui.
     param([string]$Glyph, [string]$Name, [string]$Text = '', [string]$TextColor = 'd', [string]$Right = '',
-          [string]$RightColor = 'd', [int]$NameWidth = 18)
+          [string]$RightColor = 'd', [int]$NameWidth = 18, [string]$Status = '', [switch]$Warn)
     $plain = { param($s) ([string]$s) -replace '\{', '(' -replace '\}', ')' }   # braces would break the markup
+    $row = if ($Status) { @{ Status = $Status; Warn = [bool]$Warn; Name = (& $plain $Name); Text = (& $plain $Text); Right = (& $plain $Right) } } else { $null }
     $w = Get-UiWidth
     $NameWidth = [math]::Max(2, [math]::Min($NameWidth, $w - 7))   # a narrow window: the name gives way first
     $n = Get-Cut (& $plain $Name) ($NameWidth - 1)
@@ -298,6 +325,7 @@ function Format-Row {
         $gap = [math]::Max(2, $w - $used - $t.Length - $Right.Length)
         $line += (' ' * $gap) + $(if ($RightColor) { "{${RightColor}:$Right}" } else { $Right })
     }
+    if ($row) { $row.Markup = $line; $script:UiRow = $row }
     return $line
 }
 
@@ -320,8 +348,10 @@ function Format-Blocks {
 }
 
 function Write-UiPhase {
-    # "  |" then "  |- Name" - the start of a phase on the rail
+    # "  |" then "  |- Name" - the start of a phase on the rail (and in the window)
     param([string]$Name, [string]$Rest = '')
+    $script:UiPhase = $Name
+    Send-GuiEvent 'phase' @{ Name = $Name }
     Write-Ui "  {d:$($script:G.Bar)}"
     Write-Ui ("  {d:$($script:G.Tee)$($script:G.Rule)} {w:$Name}" + $Rest)
 }
@@ -329,20 +359,23 @@ function Write-UiPhase {
 function Show-LiveText {
     # a live line that is just a text: "  |  > restarting Explorer"
     param([string]$Text)
+    Send-GuiEvent 'live' @{ Name = $Text; What = ''; Clock = $false }
     Show-Live (Format-Row -Glyph "{b:$($script:G.Run)}" -Name $Text -NameWidth 60)
 }
 
 function Start-LiveItem {
     # The live line for one step: "  |  > Name   what   mm:ss" - its clock ticks while Update-LiveTick is called.
     # -NoClock while something blocks the script (a download, Start-Process -Wait): a clock stuck at 00:00 looks hung.
+    # (The window keeps its own clock - it is not blocked.)
     param([string]$Name, [string]$What = '', [switch]$NoClock)
     $script:Live = @{ Name = $Name; What = $What; Clock = [System.Diagnostics.Stopwatch]::StartNew(); ShowClock = -not $NoClock }
+    Send-GuiEvent 'live' @{ Name = $Name; What = $What; Clock = $true }
     Update-LiveTick
 }
 
 function Set-LiveWhat {
     param([string]$What, [switch]$NoClock)
-    if ($script:Live) { $script:Live.What = $What; $script:Live.ShowClock = -not $NoClock; Update-LiveTick }
+    if ($script:Live) { $script:Live.What = $What; $script:Live.ShowClock = -not $NoClock; Send-GuiEvent 'what' @{ What = $What }; Update-LiveTick }
 }
 
 function Update-LiveTick {
@@ -356,6 +389,7 @@ function Update-LiveTick {
 function Stop-LiveItem {
     # how long the live step took (seconds; -1 if there was none)
     $s = if ($script:Live) { $script:Live.Clock.Elapsed.TotalSeconds } else { -1 }
+    if ($script:Live) { Send-GuiEvent 'live-end' }
     $script:Live = $null
     return $s
 }
@@ -367,7 +401,7 @@ function Get-ShortName {
 }
 
 function Set-UiNote {
-    # what came of a tweak, for its line on the rail ('7 removed: ...', '64 Hz, already the highest'). -Warn: why it is
+    # what came of a tweak, for its line on the rail ('7 removed', '64 Hz, already the highest'). -Warn: why it is
     # a WARN, in words - it replaces the generic "1 step(s) failed" on the rail and in the summary.
     param([string]$Id, [string]$Text, [switch]$Warn)
     if ($Warn) { $script:UiWarn[$Id] = $Text } else { $script:UiNotes[$Id] = $Text }
@@ -1781,7 +1815,7 @@ $script:Tweaks = @(
           Disable-WinFeature   -Id $id -Name 'WindowsMediaPlayer' -Label 'Windows Media Player Legacy (feature)'
       }
       $n = $script:UiRemoved.Count
-      $note = if ($n) { '{0} removed: {1}' -f $n, ($script:UiRemoved -join ', ') } else { 'nothing left to remove' }
+      $note = if ($n) { '{0} removed' -f $n } else { 'nothing left to remove' }   # which ones: the log (superuser: no list on the line)
       if ($kept) { $note = 'Media Player Legacy kept (the last video player); ' + $note }
       if (-not $script:DryRun) { Set-UiNote $id $note }
   }}
@@ -2060,10 +2094,30 @@ $script:AppNames = @{
     'SavardSoftware.TurboTop'          = 'TurboTop'
     'RARLab.WinRAR'                    = 'WinRAR'
 }
+# The window's app picker (a New user) shows the apps in these groups, in this order - keys as Get-AppChoices gives them
+# (winget ID / direct-app Name / vendor-app Id). An app in no group lands in "Other".
+$script:AppGroups = [ordered]@{
+    'Games'              = @('Valve.Steam', 'EpicGames.EpicGamesLauncher', 'Blizzard.BattleNet', 'Ubisoft.Connect', 'Google Play Games')
+    'Chat & streaming'   = @('Discord.Discord', 'OBSProject.OBSStudio', 'Parsec')
+    'Media'              = @('VideoLAN.VLC', 'FL Studio')
+    'Tools'              = @('RARLab.WinRAR', 'RevoUninstaller.RevoUninstaller', 'Skillbrains.Lightshot', 'CPUID.HWMonitor', 'NZXT.CAM', 'SavardSoftware.TurboTop')
+    'Browser & cloud'    = @('Google Chrome', 'Bitwarden', 'Nextcloud.NextcloudDesktop')
+    'Drivers & hardware' = @('NVIDIA App', 'AMD Chipset Software', 'Intel Chipset Device Software', 'AMD Software Adrenalin', '9PMHP03NJ9QP')
+}
 
 # --------------------------------------------------------------------------------------
 #  Runner + install phase + summary
 # --------------------------------------------------------------------------------------
+function Get-OsName {
+    # "Windows 11 Pro 25H2 {d:(26200)}" - the build in rail markup (dim)
+    param($Os = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue))
+    $osName = ("$($Os.Caption)" -replace '^\s*Microsoft\s+', '').Trim(); if (-not $osName) { $osName = 'Windows' }
+    $ver = Get-RegValue -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name 'DisplayVersion'
+    if ($ver) { $osName += " $ver" }
+    if ($Os.BuildNumber) { $osName += " {d:($($Os.BuildNumber))}" }
+    return $osName
+}
+
 function Write-Banner {
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
     Write-Log INFO  "=========== WIN11-TWEAKS START ==========="
@@ -2073,11 +2127,9 @@ function Write-Banner {
     Write-Log DEBUG ("logfile={0}" -f $script:LogFile)
     # the rail: "  |- WIN11-TEST . Windows 11 Pro 25H2 (26200) . PC . Gele"
     $g = $script:G
-    $osName = ("$($os.Caption)" -replace '^\s*Microsoft\s+', '').Trim(); if (-not $osName) { $osName = 'Windows' }
-    $ver = Get-RegValue -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name 'DisplayVersion'
-    if ($ver) { $osName += " $ver" }
-    if ($os.BuildNumber) { $osName += " {d:($($os.BuildNumber))}" }
+    $osName = Get-OsName -Os $os
     $pcName = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'this PC' }
+    Send-GuiEvent 'banner' @{ Machine = $pcName; Os = (Get-Visible $osName); MachineType = $script:MachineType; User = $script:UserLabel; DryRun = [bool]$script:DryRun; Log = $script:LogFile }
     Write-Ui "  {d:$($g.Bar)}"
     $bits = @($osName, $script:MachineType, $script:UserLabel | ForEach-Object { "{d:$($g.Dot)} $_" })
     Write-Ui ("  {d:$($g.Tee)$($g.Rule)} {w:$pcName} " + ($bits -join ' '))
@@ -2093,7 +2145,9 @@ function Invoke-Tweaks {
     Write-UiPhase $(if ($Late) { 'Finishing' } else { 'Tweaks' })
     $n = 0
     foreach ($t in $list) {
+        Test-GuiStop   # Stop in the window: before the next tweak
         $n++
+        if (-not $Late) { Send-GuiEvent 'progress' @{ Name = $t.Content; N = $n; Total = $list.Count } }
         if ($t.Machine -and $t.Machine -ne $script:MachineType) {   # e.g. Ultimate Performance is PC only
             Write-Log INFO ("Skipping {0} ({1} only)" -f $t.Content, $t.Machine) $t.Id
             $rec = [pscustomobject]@{ Phase='Tweak'; Id=$t.Id; Content=$t.Content; Status='SKIPPED'; Detail="$($t.Machine) only"; Seconds=0 }
@@ -2131,7 +2185,7 @@ function Format-TweakLine {
     $note = if ($Rec.Status -in 'FAILED', 'WARN', 'SKIPPED') { $Rec.Detail } elseif ($script:UiNotes.ContainsKey($Rec.Id)) { $script:UiNotes[$Rec.Id] } else { '' }
     $color = switch ($Rec.Status) { 'FAILED' { 'r' } 'WARN' { 'y' } default { 'd' } }
     $right = switch ($Rec.Status) { 'DRYRUN' { 'dry run' } 'SKIPPED' { '' } default { Format-Span $Rec.Seconds } }
-    return Format-Row -Glyph (Get-Glyph $Rec.Status) -Name (Get-ShortName $Rec.Content) -Text $note -TextColor $color -Right $right -NameWidth 24
+    return Format-Row -Glyph (Get-Glyph $Rec.Status) -Name (Get-ShortName $Rec.Content) -Text $note -TextColor $color -Right $right -NameWidth 24 -Status $Rec.Status
 }
 
 function Write-TweakGroups {
@@ -2159,16 +2213,20 @@ function Write-TweakGroups {
             $st = if (@($bad | Where-Object { $_.Status -eq 'FAILED' })) { 'FAILED' } else { 'WARN' }
             $what = if ($bad[0].Detail) { '{0}: {1}' -f $bad[0].Content, $bad[0].Detail } else { [string]$bad[0].Content }
             if ($bad.Count -gt 1) { $what += " (+$($bad.Count - 1) more)" }
-            Write-Ui (Format-Row -Glyph (Get-Glyph $st) -Name $grp.Name -Text $what -TextColor $(if ($st -eq 'FAILED') { 'r' } else { 'y' }) -Right $time)
+            Write-Ui (Format-Row -Glyph (Get-Glyph $st) -Name $grp.Name -Text $what -TextColor $(if ($st -eq 'FAILED') { 'r' } else { 'y' }) -Right $time -Status $st)
         } elseif ($script:DryRun) {
-            Write-Ui (Format-Row -Glyph (Get-Glyph 'DRYRUN') -Name $grp.Name -Text $text -Right 'dry run')
+            Write-Ui (Format-Row -Glyph (Get-Glyph 'DRYRUN') -Name $grp.Name -Text $text -Right 'dry run' -Status 'DRYRUN')
         } else {
-            Write-Ui (Format-Row -Glyph (Get-Glyph 'OK') -Name $grp.Name -Text $text -Right $time)
+            Write-Ui (Format-Row -Glyph (Get-Glyph 'OK') -Name $grp.Name -Text $text -Right $time -Status 'OK')
         }
     }
     foreach ($only in @($done | Where-Object { $_.Status -eq 'SKIPPED' } | Group-Object Detail)) {
-        Write-Ui (Format-Row -Glyph (Get-Glyph 'SKIPPED') -Name $only.Name -Text ((@($only.Group | ForEach-Object { Get-ShortName $_.Content })) -join ', '))
+        Write-Ui (Format-Row -Glyph (Get-Glyph 'SKIPPED') -Name $only.Name -Text ((@($only.Group | ForEach-Object { Get-ShortName $_.Content })) -join ', ') -Status 'SKIPPED')
     }
+    # the window: the phase is over - how many tweaks were applied and how long they took
+    $ran = @($done | Where-Object { $_.Status -ne 'SKIPPED' -and "$($_.Id)" -notlike 'Trialware.*' })
+    $all = 0.0; foreach ($r in $ran) { if ($r.PSObject.Properties['Seconds']) { $all += [double]$r.Seconds } }
+    Send-GuiEvent 'phase-done' @{ Name = 'Tweaks'; Count = $ran.Count; Time = $(if ($all -gt 0) { Format-Span $all } else { '' }) }
 }
 
 function Get-StartMenuShortcuts {
@@ -2326,7 +2384,7 @@ function Format-ItemLine {
     $color = if ($Status -eq 'FAILED') { 'r' } elseif ($Warn) { 'y' } else { 'd' }
     $right = if ($Status -eq 'DRYRUN') { 'dry run' }
              elseif ($Status -in 'OK', 'FAILED' -and $Seconds -ge 0 -and $Note -ne 'already installed') { Format-Span $Seconds } else { '' }
-    return Format-Row -Glyph (Get-Glyph $Status -Warn:$Warn) -Name $Name -Text $Note -TextColor $color -Right $right -NameWidth 32
+    return Format-Row -Glyph (Get-Glyph $Status -Warn:$Warn) -Name $Name -Text $Note -TextColor $color -Right $right -NameWidth 32 -Status $Status -Warn:$Warn
 }
 
 function Write-AppLine {
@@ -2350,13 +2408,35 @@ function Write-AppLine {
     Write-Ui (Format-ItemLine -Name $Name -Status $Status -Note $note -Seconds $secs -Warn:$warn)
 }
 
+function Get-InstallPlan {
+    # The apps this run will go through, in order - the window lists the ones still to come (queued). The apps the
+    # install phase skips outright (other machine type, not selected, not this vendor's hardware) are not in it.
+    param([string]$Hardware = (Get-Hardware))
+    $plan = [System.Collections.Generic.List[string]]::new()
+    $take = { param($key) -not ($script:NotSelected -and $script:NotSelected.ContainsKey($key)) }
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        if ($script:VCRedists.Count) { $plan.Add("Visual C++ 2005$($script:G.Dash)2022") }
+        foreach ($id in $script:AppsToInstall) {
+            $only = $script:AppMachine[$id]
+            if (($only -and $only -ne $script:MachineType) -or -not (& $take $id)) { continue }
+            $plan.Add($(if ($script:AppNames.ContainsKey($id)) { $script:AppNames[$id] } else { $id }))
+        }
+    }
+    foreach ($d in $script:DirectApps) { if (-not ($d.Machine -and $d.Machine -ne $script:MachineType) -and (& $take $d.Name)) { $plan.Add($d.Name) } }
+    foreach ($a in $script:VendorApps) { if ($Hardware -match $a.Hardware -and (& $take $a.Id)) { $plan.Add($a.Name) } }
+    $plan
+}
+
 function Invoke-InstallPhase {
     Write-Log INFO "=========== INSTALLING APPS ==========="
     Write-UiPhase 'Apps'
     $notSelected = [System.Collections.Generic.List[string]]::new()   # a New user's "n" apps - one rail line at the end
+    $hw = Get-Hardware
+    if ($script:Gui) { Send-GuiEvent 'plan' @{ Apps = @(Get-InstallPlan -Hardware $hw) } }
 
     if (Get-Command winget -ErrorAction SilentlyContinue) {
         if ($script:VCRedists.Count) {   # Visual C++ Redistributables first (apps/games need them) - ONE rail line for all
+            Test-GuiStop
             $vcName = "Visual C++ 2005$($script:G.Dash)2022"; $vc = @(); $k = 0
             Start-LiveItem -Name $vcName -What "0/$($script:VCRedists.Count)"
             foreach ($id in $script:VCRedists) {
@@ -2376,6 +2456,7 @@ function Invoke-InstallPhase {
             }
         }
         foreach ($id in $script:AppsToInstall) {
+            Test-GuiStop   # Stop in the window: before the next app
             $label = if ($script:AppNames.ContainsKey($id)) { $script:AppNames[$id] } else { $id }
             $only = $script:AppMachine[$id]
             if ($only -and $only -ne $script:MachineType) {   # e.g. NZXT CAM is PC only
@@ -2402,6 +2483,7 @@ function Invoke-InstallPhase {
 
     # Non-winget apps (direct vendor download): Bitwarden, Parsec, NVIDIA App (GPU only)
     foreach ($d in $script:DirectApps) {
+        Test-GuiStop
         if ($d.Machine -and $d.Machine -ne $script:MachineType) {   # e.g. the chipset / Radeon drivers are PC only
             Write-Log INFO ("Skipping {0} ({1} only)" -f $d.Name, $d.Machine)
             $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$d.Name; Content=$d.Name; Status='SKIPPED'; Detail="$($d.Machine) only" })
@@ -2427,8 +2509,8 @@ function Invoke-InstallPhase {
 
     # Vendor apps LAST - installed (a New user was asked) ONLY on that vendor's hardware, desktop or laptop alike:
     #   Alienware Command Center -> Alienware / Dell G-series.
-    $hw = Get-Hardware
     foreach ($a in $script:VendorApps) {
+        Test-GuiStop
         if ($hw -notmatch $a.Hardware) {   # NOT a failure - just not this vendor's machine
             Write-Log DEBUG "$($a.Name): skipped (not $($a.Vendor) hardware: '$hw')"
             $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail="not $($a.Vendor) hardware" })
@@ -2444,7 +2526,7 @@ function Invoke-InstallPhase {
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=$st; Detail=$(if ($st -eq 'FAILED' -and $script:ItemFail) { $script:ItemFail } else { $hw }) })
         Write-AppLine -Name $a.Name -Status $st -From $from
     }
-    if ($notSelected.Count) { Write-Ui (Format-Row -Glyph (Get-Glyph 'SKIPPED') -Name 'Not selected' -Text ($notSelected -join ', ') -NameWidth 32) }
+    if ($notSelected.Count) { Write-Ui (Format-Row -Glyph (Get-Glyph 'SKIPPED') -Name 'Not selected' -Text ($notSelected -join ', ') -NameWidth 32 -Status 'SKIPPED') }
 
     # (.NET 3.5 was started in the BACKGROUND before this phase (Start-DotNet35) so it downloads in
     #  parallel; it's finished after this phase (Enable-DotNetFeatures). Desktop icons are per-app above.)
@@ -2464,14 +2546,20 @@ function Start-DotNet35 {
         $script:DotNet35Proc = Start-Process -FilePath "$env:SystemRoot\System32\dism.exe" -WindowStyle Hidden -PassThru `
             -ArgumentList '/Online','/Enable-Feature','/FeatureName:NetFx3','/All','/NoRestart','/Quiet',"/LogPath:$dlog"
         $script:DotNet35Clock = [System.Diagnostics.Stopwatch]::StartNew()   # the rail shows how long it has been downloading
+        Send-GuiEvent 'dotnet' @{ State = 'running' }   # the window: "downloading in the background" next to the apps
     } catch { Write-Log DEBUG ".NET 3.5 background start failed: $($_.Exception.Message)" }
 }
 
 function Format-PhaseLine {
-    # "  |- Name   text                                   right" - a phase that is one line (.NET 3.5)
-    param([string]$Name, [string]$Text, [string]$Right = '')
+    # "  |- Name   text                                   right" - a phase that is one line (.NET 3.5). -Status: its
+    # result, for the window (see Format-Row).
+    param([string]$Name, [string]$Text, [string]$Right = '', [string]$Status = '')
     $line = "  {d:$($script:G.Tee)$($script:G.Rule)} {w:$Name}   $Text"
     if ($Right) { $line += (' ' * [math]::Max(2, (Get-UiWidth) - (Get-Visible $line).Length - $Right.Length)) + "{d:$Right}" }
+    if ($Status) {   # (the window has its own status glyph - not the rail's again at the start of the text)
+        $plain = (Get-Visible $Text) -replace ('^' + [regex]::Escape($script:G.Fail) + '\s+'), ''
+        $script:UiRow = @{ Markup = $line; Status = $Status; Warn = $false; Name = $Name; Text = $plain; Right = $Right }
+    }
     return $line
 }
 
@@ -2481,11 +2569,12 @@ function Enable-DotNetFeatures {
     # still going we WAIT until it fully finishes (live heartbeat, no cap). Then .NET 4 (quiet).
     # The rail: ONE line - ".NET 3.5   ready", "ready at the next restart", or why not.
     $g = $script:G
+    $script:UiPhase = '.NET 3.5'; Send-GuiEvent 'phase' @{ Name = '.NET 3.5' }
     Write-Ui "  {d:$($g.Bar)}"
     if ($script:DryRun) {
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NetFx3'; Content='.NET 3.5'; Status='DRYRUN'; Detail='' })
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NetFx4-AdvSrvs'; Content='.NET 4'; Status='DRYRUN'; Detail='' })
-        Write-Ui (Format-PhaseLine '.NET 3.5' '{d:dry run}')
+        Write-Ui (Format-PhaseLine '.NET 3.5' '{d:dry run}' -Status 'DRYRUN')
         return
     }
     Write-Log INFO "Installing .NET 3.5"
@@ -2503,7 +2592,9 @@ function Enable-DotNetFeatures {
         # keeps going on its own (/NoRestart - no surprise reboot). Console only - it never spams the log file.
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $clock = if ($script:DotNet35Clock) { $script:DotNet35Clock } else { $sw }
+        Send-GuiEvent 'live' @{ Name = '.NET 3.5'; What = 'downloading from Windows Update'; Clock = $true; Since = $clock.Elapsed.TotalSeconds }
         while (-not $script:DotNet35Proc.HasExited) {
+            Test-GuiStop   # Stop in the window: DISM keeps going on its own (/NoRestart), like with Ctrl+C
             if ($script:Ui) {
                 $s = [int][math]::Floor($clock.Elapsed.TotalSeconds)
                 Show-Live (Format-PhaseLine '.NET 3.5' ("{d:downloading from Windows Update $($g.Dot)} {b:" + ('{0:00}:{1:00}' -f [math]::Floor($s / 60), ($s % 60)) + '}'))
@@ -2514,6 +2605,7 @@ function Enable-DotNetFeatures {
             }
         }
         if (-not $script:Ui) { Write-Host ("`r{0}`r" -f (' ' * 78)) -NoNewline }   # wipe the heartbeat line before the final status
+        Send-GuiEvent 'live-end'
         $waited = $sw.Elapsed.TotalSeconds
         Start-Sleep -Milliseconds 500
     }
@@ -2530,18 +2622,18 @@ function Enable-DotNetFeatures {
     $state = "$((Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction SilentlyContinue).State)"
     if ($state -eq 'Enabled') {
         Write-Log OK "Done!"
-        if ($script:DotNet35Proc) { Write-Ui (Format-PhaseLine '.NET 3.5' "ready {d:$($g.Dot) downloaded next to the apps}" $wait) }
-        else { Write-Ui (Format-PhaseLine '.NET 3.5' 'already on') }
+        if ($script:DotNet35Proc) { Write-Ui (Format-PhaseLine '.NET 3.5' "ready {d:$($g.Dot) downloaded next to the apps}" $wait -Status 'OK') }
+        else { Write-Ui (Format-PhaseLine '.NET 3.5' 'already on' -Status 'OK') }
     } elseif ($state -eq 'EnablePending') {
         Write-Log OK "Done! (finishes at the next restart)"; $rec3.Detail = 'finishes at the next restart'
-        Write-Ui (Format-PhaseLine '.NET 3.5' 'ready at the next restart' $wait)
+        Write-Ui (Format-PhaseLine '.NET 3.5' 'ready at the next restart' $wait -Status 'OK')
     } elseif (-not $script:DotNet35Proc) {
         Write-Log WARN "Failed - .NET 3.5 (was not started)"; $st3 = 'FAILED'; $rec3.Detail = 'was not started'
-        Write-Ui (Format-PhaseLine '.NET 3.5' "{r:$($g.Fail) not started, see the log}")
+        Write-Ui (Format-PhaseLine '.NET 3.5' "{r:$($g.Fail) not started, see the log}" -Status 'FAILED')
     } else {
         Write-Log WARN "Failed - .NET 3.5 (DISM exit code $code, state '$state' - see %TEMP%\dism_NetFx3.log)"; $st3 = 'FAILED'
         $rec3.Detail = "DISM exit code $code"
-        Write-Ui (Format-PhaseLine '.NET 3.5' "{r:$($g.Fail) not installed (DISM $code), see the log}" $wait)
+        Write-Ui (Format-PhaseLine '.NET 3.5' "{r:$($g.Fail) not installed (DISM $code), see the log}" $wait -Status 'FAILED')
     }
     $rec3.Status = $st3
     # .NET 4 is already enabled on Win11 -> record quietly (no console clutter); enable only if somehow off.
@@ -2588,7 +2680,7 @@ function Write-Summary {
         Write-Log WARN "A reboot / sign-out is recommended to fully apply the changes."
     }
     # The rail: "Done in 19m 29s   93 OK . 7 skipped . 0 failed", every problem again, what to do next, the log
-    if (-not $script:Ui) { return }
+    # (the window gets the same, as data)
     $gl = $script:G
     $count = @{}; foreach ($r in $script:Results) { $count[[string]$r.Status] = 1 + [int]$count[[string]$r.Status] }
     $parts = [System.Collections.Generic.List[string]]::new()
@@ -2599,21 +2691,29 @@ function Write-Summary {
     $parts.Add($(if ($count['FAILED']) { '{{r:{0} failed}}' -f $count['FAILED'] } else { '0 failed' }))
     $time = if ($script:RunClock) { Format-Span $script:RunClock.Elapsed.TotalSeconds } else { '-' }
     $head = if (-not $script:RunFinished) { "Stopped after $time" } elseif ($script:DryRun) { "Dry run done in $time" } else { "Done in $time" }
-    Write-Ui "  {d:$($gl.Bar)}"
-    Write-Ui ("  {d:$($gl.End)$($gl.Rule)} {w:$head}   " + ($parts -join " {d:$($gl.Dot)} "))
-    foreach ($r in @($script:Results | Where-Object { $_.Status -in 'WARN', 'FAILED' })) {
+    $problems = @(foreach ($r in @($script:Results | Where-Object { $_.Status -in 'WARN', 'FAILED' })) {
         $label = if ($script:AppNames.ContainsKey([string]$r.Id)) { $script:AppNames[[string]$r.Id] } else { [string]$r.Content }
         $why = if ($r.Detail -and $r.Detail -ne 'direct') { ": $($r.Detail)" } else { '' }
-        Write-Ui ('     ' + (Get-Glyph $r.Status) + ' ' + ("$label$why" -replace '[{}]', ''))   # whole - it may hold a link to follow
-    }
-    Write-Ui ''
+        @{ Status = [string]$r.Status; Text = ("$label$why" -replace '[{}]', '') }   # whole - it may hold a link to follow
+    })
+    $dismBusy = $script:DotNet35Proc -and -not $script:DotNet35Proc.HasExited
     $next = @(
-        if ($script:DotNet35Proc -and -not $script:DotNet35Proc.HasExited) { '.NET 3.5 is still installing in the background - no restart until it is done.' }
-        if (-not $script:RunFinished) { $(if ($script:DotNet35Proc -and -not $script:DotNet35Proc.HasExited) { 'Then run the script again to finish the rest.' } else { 'Run the script again to finish the rest.' }) }
+        if ($dismBusy) { '.NET 3.5 is still installing in the background - no restart until it is done.' }
+        if (-not $script:RunFinished) { $(if ($dismBusy) { 'Then run the script again to finish the rest.' } else { 'Run the script again to finish the rest.' }) }
         elseif ($script:DryRun) { 'Dry run - nothing was changed.' }
         elseif ($restart) { 'Restart the PC to finish. Windows completes some changes only at a restart.' }
         else { 'Restart or sign out to apply everything.' }
     )
+    $script:SummaryLine = "$head   " + (Get-Visible ($parts -join " $($gl.Dot) "))
+    Send-GuiEvent 'summary' @{ Head = $head; Ok = [int]$count['OK']; Skipped = [int]$count['SKIPPED']; Warn = [int]$count['WARN']
+        Failed = [int]$count['FAILED']; Background = [int]$count['BACKGROUND']; WouldApply = [int]$count['DRYRUN']; DryRun = [bool]$script:DryRun
+        Finished = [bool]$script:RunFinished; Restart = [bool]($restart -and $script:RunFinished -and -not $dismBusy); Problems = $problems
+        Next = $next; Log = $script:LogFile }
+    if (-not $script:Ui) { return }
+    Write-Ui "  {d:$($gl.Bar)}"
+    Write-Ui ("  {d:$($gl.End)$($gl.Rule)} {w:$head}   " + ($parts -join " {d:$($gl.Dot)} "))
+    foreach ($p in $problems) { Write-Ui ('     ' + (Get-Glyph $p.Status) + ' ' + $p.Text) }
+    Write-Ui ''
     foreach ($line in $next) { Write-Ui "     {y:$($gl.Run)} $line" }
     Write-Ui "       {d:Log}  $($script:LogFile)"
 }
@@ -2780,7 +2880,9 @@ function Test-Interactive {
 }
 
 function Show-Intro {
-    # The rail head and the questions - each on ONE line, the answer typed right after it
+    # The rail head and the questions - each on ONE line, the answer typed right after it. With the window open, the
+    # window asks instead (its Setup screen - Invoke-GuiSetup).
+    if ($script:Gui) { Invoke-GuiSetup; return }
     $g = $script:G; $bar = "  {d:$($g.Bar)}"
     Write-Ui -Always ''
     Write-Ui -Always "  {d:$($g.Top)}  {b:MSUHost}  {w:win11-tweaks} {d:$($script:Version)}"
@@ -2892,10 +2994,913 @@ function Read-AppSelection {
 }
 
 # --------------------------------------------------------------------------------------
+#  The window (variant A of the design page - superuser's pick, 2026-09-28). The run itself does not change: it goes on
+#  here, on the main thread, as always, and only FEEDS the window (Send-GuiEvent -> a queue). The window has its own
+#  thread (an STA runspace with its own WPF dispatcher, $script:GuiCode): it asks the setup questions, shows the run and
+#  can ask the run to stop between two steps (Test-GuiStop). -Console keeps the rail in the console.
+# --------------------------------------------------------------------------------------
+function Get-SessionId {
+    try { return (Get-Process -Id $PID).SessionId } catch { return -1 }
+}
+
+function Test-WpfAvailable {
+    try { Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop; return $true } catch { return $false }
+}
+
+function Test-GuiMode {
+    # The window is for a person at a desktop: not over SSH or from a service (no keyboard, session 0), not with -Console
+    # (the rail in the console), -Detailed (the log on the console) or -Reboot (an unattended run: the console counts
+    # down to the restart), and only where WPF loads
+    if ($script:ConsoleOnly -or $script:Detailed -or $Reboot) { return $false }
+    if (-not (Test-Interactive)) { return $false }
+    if ((Get-SessionId) -eq 0) { return $false }
+    return (Test-WpfAvailable)
+}
+
+function Send-GuiEvent {
+    # One thing for the window to show - a phase, a row, the step running now, the summary - into its queue. No window,
+    # nothing. The run never waits for the window.
+    param([string]$Type, [hashtable]$Data = @{})
+    if (-not $script:Gui) { return }
+    $Data['Type'] = $Type
+    $script:Gui.Shared.Events.Enqueue($Data)
+}
+
+function Test-ConsoleQuiet {
+    # While the window is open it shows the run and the console stays quiet. Closed early: the rail comes back.
+    return [bool]($script:Gui -and -not $script:Gui.Shared.Closed)
+}
+
+function Test-GuiStop {
+    # Stop in the window: the run ends here, between two steps - Main's finally writes the summary, as after Ctrl+C
+    if ($script:Gui -and $script:Gui.Shared.Stop) { throw [System.OperationCanceledException]::new('Stopped from the window') }
+}
+
+function Get-DetectedMachineType {
+    # A battery -> a laptop. The window preselects it; one click changes it.
+    try { if (@(Get-CimInstance Win32_Battery -ErrorAction Stop).Count -gt 0) { return 'Laptop' } } catch { }
+    return 'PC'
+}
+
+function Get-AppGroup {
+    param([string]$Key)
+    foreach ($g in $script:AppGroups.Keys) { if ($script:AppGroups[$g] -contains $Key) { return $g } }
+    return 'Other'
+}
+
+function Get-AppsNotOffered {
+    # What this machine type / hardware is not offered, and why - the window lists them (dim) under its app picker
+    $list = [System.Collections.Generic.List[object]]::new()
+    foreach ($id in $script:AppsToInstall) {
+        $only = $script:AppMachine[$id]
+        if ($only -and $only -ne $script:MachineType) { $list.Add(@{ Name = $(if ($script:AppNames.ContainsKey($id)) { $script:AppNames[$id] } else { $id }); Why = "$only only" }) }
+    }
+    foreach ($d in $script:DirectApps) {
+        if ($d.Machine -and $d.Machine -ne $script:MachineType) { $list.Add(@{ Name = $d.Name; Why = "$($d.Machine) only" }); continue }
+        if ($d.Require) {
+            $met = $false; try { $met = [bool](& $d.Require) } catch { }
+            if (-not $met) { $list.Add(@{ Name = $d.Name; Why = $(if ($d.RequireMsg) { $d.RequireMsg } else { 'not for this PC' }) }) }
+        }
+    }
+    $hw = Get-Hardware
+    foreach ($a in $script:VendorApps) { if ($hw -notmatch $a.Hardware) { $list.Add(@{ Name = $a.Name; Why = "not $($a.Vendor) hardware" }) } }
+    $list
+}
+
+function Get-SetupPayload {
+    # What the window's Setup screen needs: this PC, the detected machine type, the apps a New user is asked about - for
+    # a PC AND for a laptop (one click switches) - with their groups, what always goes in, what is not offered here and
+    # why, and the built-in apps a New user may keep
+    $saved = $script:MachineType
+    $apps = @{}; $not = @{}
+    try {
+        foreach ($mt in 'PC', 'Laptop') {
+            $script:MachineType = $mt
+            $apps[$mt] = @(Get-AppChoices | ForEach-Object { @{ Key = $_.Key; Name = $_.Name; Group = (Get-AppGroup $_.Key) } })
+            $not[$mt] = @(Get-AppsNotOffered)
+        }
+    } finally { $script:MachineType = $saved }
+    $runtimes = @($script:RuntimeApps | ForEach-Object { if ($script:AppNames.ContainsKey($_)) { $script:AppNames[$_] } else { $_ } })
+    $tweaks = @{}; foreach ($mt in 'PC', 'Laptop') { $tweaks[$mt] = @($script:Tweaks | Where-Object { -not $_.Machine -or $_.Machine -eq $mt }).Count }
+    return @{
+        Version = $script:Version; PcName = $(if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'this PC' }); Os = (Get-Visible (Get-OsName))
+        Detected = (Get-DetectedMachineType); Machine = ''   # Machine: preset by -Machine (Invoke-GuiSetup)
+        Apps = $apps; NotOffered = $not; Groups = @($script:AppGroups.Keys) + @('Other'); TweakCount = $tweaks; Log = $script:LogFile
+        Always = @("Visual C++ 2005$($script:G.Dash)2022") + $runtimes + @('.NET 3.5')
+        Keep = @($script:NewUserKeepApps.Keys | ForEach-Object { @{ Key = $_; Name = $script:NewUserKeepApps[$_] } })
+    }
+}
+
+function Set-SetupAnswer {
+    # The window's answer, applied like the console questions: the machine type; a New user's "no" apps (and the direct
+    # apps this PC is not offered - they must not install later either) and kept built-in apps. Gele gets everything.
+    param([hashtable]$Answer)
+    $script:MachineType = if ($Answer.Machine -eq 'Laptop') { 'Laptop' } else { 'PC' }
+    Write-Log INFO ("Machine type: {0}" -f $script:MachineType)
+    if ($Answer.User -ne 'New user') { Write-Log INFO "User: Gele - installing all apps"; $script:UserLabel = 'Gele'; return }
+    $choices = @(Get-AppChoices); $off = @($Answer.Off); $no = 0
+    foreach ($c in $choices) { if ($off -contains $c.Key) { $script:NotSelected[$c.Key] = 'not selected'; $no++ } }
+    foreach ($k in @($Answer.Keep)) { if ($script:NewUserKeepApps.Contains($k)) { $script:KeepApps[$k] = $script:NewUserKeepApps[$k] } }
+    $offered = @($choices | ForEach-Object { $_.Key })
+    foreach ($d in $script:DirectApps) { if ($offered -notcontains $d.Name) { $script:NotSelected[$d.Name] = 'not offered' } }
+    $kept = @($script:NewUserKeepApps.Keys | Where-Object { $script:KeepApps.ContainsKey($_) } | ForEach-Object { $script:NewUserKeepApps[$_] })
+    $keeps = if ($kept) { ', keeps ' + ($kept -join ' + ') } else { '' }
+    Write-Log INFO ("User: New user - {0} of {1} apps selected{2}" -f ($choices.Count - $no), $choices.Count, $keeps)
+    $script:UserLabel = 'New user, {0} of {1} apps' -f ($choices.Count - $no), $choices.Count
+}
+
+function Invoke-GuiSetup {
+    # The questions in the window - PC or laptop, who it is, a New user's apps - on one screen, then Start or Cancel.
+    # Cancel (or closing the window) is "Continue? n": nothing is changed.
+    $p = Get-SetupPayload
+    if ($Machine -eq 'PC' -or $Machine -eq 'Laptop') { $p.Machine = $Machine }
+    Send-GuiEvent 'setup' @{ Payload = $p }
+    $sh = $script:Gui.Shared
+    while (-not $sh.Answer -and -not $sh.Closed) { Start-Sleep -Milliseconds 100 }
+    $a = $sh.Answer
+    if (-not $a -or $a.Cancel) {
+        Write-Log INFO 'Cancelled in the window - nothing was changed.'
+        $script:Cancelled = $true
+        return
+    }
+    Set-SetupAnswer $a
+}
+
+function Start-Gui {
+    # Open the window in its own thread and wait (up to 20 s) until it is up. If it does not open, the console shows
+    # the run, as before.
+    $sh = [hashtable]::Synchronized(@{ Events = [System.Collections.Concurrent.ConcurrentQueue[object]]::new(); Answer = $null
+        Stop = $false; Action = $null; Closed = $false; Ready = $false; Error = $null; CloseRequest = $false })
+    $ps = $null; $rs = $null
+    try {
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.ApartmentState = 'STA'; $rs.ThreadOptions = 'ReuseThread'
+        $rs.Open()
+        $rs.SessionStateProxy.SetVariable('Shared', $sh)
+        $ps = [powershell]::Create(); $ps.Runspace = $rs
+        $null = $ps.AddScript($script:GuiCode + "`nShow-GuiWindow -Shared `$Shared")
+        $handle = $ps.BeginInvoke()
+    } catch {
+        Write-Log WARN "the window could not start ($($_.Exception.Message)) - the console shows the run"
+        try { if ($ps) { $ps.Dispose() }; if ($rs) { $rs.Dispose() } } catch { }
+        return
+    }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while (-not $sh.Ready -and -not $sh.Error -and -not $handle.IsCompleted -and $sw.Elapsed.TotalSeconds -lt 20) { Start-Sleep -Milliseconds 100 }
+    if (-not $sh.Ready -or $sh.Error) {
+        $why = if ($sh.Error) { [string]$sh.Error } elseif ($ps.Streams.Error.Count) { [string]$ps.Streams.Error[0] } elseif ($handle.IsCompleted) { 'it closed' } else { 'no answer in 20 s' }
+        Write-Log WARN "the window did not open ($why) - the console shows the run"
+        $sh.CloseRequest = $true
+        try { $ps.Stop(); $ps.Dispose(); $rs.Dispose() } catch { }
+        return
+    }
+    $script:Gui = @{ Shared = $sh; PowerShell = $ps; Runspace = $rs; Handle = $handle }
+    Write-Log INFO 'the window is open (-Console keeps the rail in the console)'
+}
+
+function Close-Gui {
+    # Let the window go (it closes itself if it is still open) and free its thread
+    if (-not $script:Gui) { return }
+    $g = $script:Gui; $script:Gui = $null
+    $g.Shared.CloseRequest = $true
+    if ($g.Shared.ErrorCount) { Write-Log WARN ("the window: {0} error(s), the last: {1}" -f $g.Shared.ErrorCount, $g.Shared.LastError) }
+    if ($g.Shared.Error) { Write-Log WARN "the window: $($g.Shared.Error)" }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while (-not $g.Handle.IsCompleted -and $sw.Elapsed.TotalSeconds -lt 5) { Start-Sleep -Milliseconds 100 }
+    try { if (-not $g.Handle.IsCompleted) { $g.PowerShell.Stop() }; $g.PowerShell.Dispose(); $g.Runspace.Dispose() } catch { }
+}
+
+function Wait-GuiClose {
+    # The window shows how the run went until it is closed. "Restart now" in it restarts the PC (never in a dry run).
+    if (-not $script:Gui) { return }
+    $sh = $script:Gui.Shared
+    while (-not $sh.Closed -and -not $sh.Action -and -not $script:Gui.Handle.IsCompleted) { Start-Sleep -Milliseconds 200 }
+    $action = $sh.Action; $replayed = [bool]$script:Gui.Replayed
+    Close-Gui
+    if (-not $replayed) {   # (a window that went early: the console already shows the whole rail, the summary with it)
+        if ($script:SummaryLine) { Write-Host ('  ' + $script:SummaryLine) }
+        Write-Host ('  Log  ' + $script:LogFile) -ForegroundColor DarkGray
+    }
+    if ($action -eq 'restart' -and -not $script:DryRun) { Write-Log INFO 'Restart now - from the window'; Restart-Computer -Force }
+}
+
+# The window's own code - it runs in the window's thread (Start-Gui adds the call to Show-GuiWindow), never here. Functions
+# only, so the tests can load it. ASCII only: every glyph is an XML entity (&#xB7;) or a Segoe Fluent Icons code. The
+# look is variant A of the design page: near-black, one line down the left with a dot per phase, one row per app.
+$script:GuiCode = @'
+$GuiC = @{ bg = '#07090D'; line = '#1B2432'; line2 = '#263246'; tx = '#E6EDF6'; tx2 = '#9AA7B8'; tx3 = '#66728A'; blue = '#3D7BFF'
+    ok = '#35C48A'; warn = '#E0A93A'; err = '#FF6B6B'; blue16 = '#293D7BFF'; blue04 = '#0A3D7BFF'; blue10 = '#1A3D7BFF'
+    blue18 = '#2E3D7BFF'; blue26 = '#423D7BFF'; blue55 = '#8C3D7BFF'; err16 = '#29FF6B6B'; err25 = '#40FF6B6B'; foot = '#B30B0F15'
+    hover = '#141B26'; hover2 = '#0F1520'; primary2 = '#5A8FFF'; close = '#C42B1C' }
+$GuiIcons = 'Segoe Fluent Icons, Segoe MDL2 Assets'
+$GuiDot = '&#xB7;'
+$GuiMore = '&#x2026;'
+$GuiNs = "xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'"
+
+function ConvertTo-GuiXml([string]$Text) {
+    # data into XAML: escaped, and every non-ASCII character as an entity (the run's texts carry the rail's dots and dashes)
+    [regex]::Replace([Security.SecurityElement]::Escape($Text), '[\uD800-\uDBFF][\uDC00-\uDFFF]|[^\x20-\x7E]', {
+        param($c)
+        $v = -1; try { $v = [char]::ConvertToUtf32($c.Value, 0) } catch { }
+        if ($v -lt 0x20 -and $v -notin 9, 10, 13) { return ' ' }   # a control character or half a pair: XML has no entity for it
+        '&#x{0:X};' -f $v
+    })
+}
+
+function Get-GuiClock([double]$Seconds) {
+    $s = [int][math]::Floor([math]::Max(0, $Seconds)); '{0:00}:{1:00}' -f [math]::Floor($s / 60), ($s % 60)
+}
+
+# ---- building blocks (XAML text). Text handed to New-GuiText is XML already: the callers escape data (ConvertTo-GuiXml).
+function New-GuiText {
+    param([string]$Text, [string]$Color = $GuiC.tx, [double]$Size = 12.5, [string]$Weight = 'Normal', [string]$Margin = '0', [string]$Extra = '')
+    $va = if ($Extra -match 'VerticalAlignment=') { '' } else { "VerticalAlignment='Center'" }
+    "<TextBlock Text='$Text' Foreground='$Color' FontSize='$Size' FontWeight='$Weight' Margin='$Margin' $va $Extra/>"
+}
+function New-GuiGlyph([string]$Code, [double]$Size, [string]$Color, [string]$Margin = '0') {
+    "<TextBlock Text='&#x$Code;' FontFamily='$GuiIcons' FontSize='$Size' Foreground='$Color' VerticalAlignment='Center' Margin='$Margin'/>"
+}
+function New-GuiHover([string]$Normal, [string]$Hover) {
+    # a Border's background, lighter under the mouse (a local Background would win over the trigger - so it lives here)
+    "<Border.Style><Style TargetType='Border'><Setter Property='Background' Value='$Normal'/><Style.Triggers>" +
+        "<Trigger Property='IsMouseOver' Value='True'><Setter Property='Background' Value='$Hover'/></Trigger></Style.Triggers></Style></Border.Style>"
+}
+function Get-GuiStatusGlyph([string]$Status, [bool]$Warn) {
+    if ($Status -eq 'WARN' -or ($Status -eq 'OK' -and $Warn)) { return (New-GuiText '!' $GuiC.warn 13 'Bold') }
+    if ($Status -eq 'OK') { return (New-GuiGlyph 'E73E' 11 $GuiC.ok) }
+    if ($Status -eq 'FAILED') { return (New-GuiGlyph 'E711' 10 $GuiC.err) }
+    return (New-GuiText $GuiDot $GuiC.tx3 14 'Bold')   # SKIPPED / DRYRUN / BACKGROUND
+}
+function New-GuiButton {
+    param([string]$Text, [string]$Tag, [string]$Glyph = '', [string]$Kind = '', [string]$Trail = '')
+    $bg = 'Transparent'; $hv = $GuiC.hover; $bd = $GuiC.line2; $fg = $GuiC.tx2; $w = 'Medium'; $fx = ''
+    if ($Kind -eq 'primary') {
+        $bg = $GuiC.blue; $hv = $GuiC.primary2; $bd = $GuiC.blue; $fg = '#FFFFFF'; $w = 'SemiBold'
+        $fx = "<Border.Effect><DropShadowEffect Color='$($GuiC.blue)' BlurRadius='18' ShadowDepth='5' Direction='270' Opacity='0.35'/></Border.Effect>"
+    } elseif ($Kind -eq 'danger') { $bg = $GuiC.err16; $hv = $GuiC.err25; $bd = $GuiC.err; $fg = $GuiC.err; $w = 'SemiBold' }
+    $g = if ($Glyph) { New-GuiGlyph $Glyph 12 $fg '0,0,7,0' } else { '' }
+    $t = if ($Trail) { New-GuiGlyph $Trail 10 $fg '8,0,0,0' } else { '' }
+    "<Border Tag='$Tag' Height='32' Padding='14,0' Margin='8,0,0,0' CornerRadius='7' BorderBrush='$bd' BorderThickness='1'>$(New-GuiHover $bg $hv)$fx" +
+        "<StackPanel Orientation='Horizontal' IsHitTestVisible='False'>$g$(New-GuiText $Text $fg 12 $w)$t</StackPanel></Border>"
+}
+function New-GuiNode {
+    # a phase on the rail: its dot (done / warn / fail / live / bg / ask / end / todo), its title, what is on its right,
+    # what is under it
+    param([string]$Kind, [string]$Title, [string]$Right = '', [string]$Inner = '', [switch]$Last)
+    $fill = $GuiC.bg; $stroke = $GuiC.line2; $dash = ''; $fx = ''; $ring = ''
+    switch ($Kind) {
+        'done' { $fill = $GuiC.ok; $stroke = $GuiC.ok }
+        'warn' { $fill = $GuiC.warn; $stroke = $GuiC.warn }
+        'fail' { $fill = $GuiC.err; $stroke = $GuiC.err }
+        'live' {
+            $fill = $GuiC.blue; $stroke = $GuiC.blue
+            $fx = "<Ellipse.Effect><DropShadowEffect Color='$($GuiC.blue)' BlurRadius='14' ShadowDepth='0' Opacity='0.9'/></Ellipse.Effect>"
+            $ring = "<Ellipse Width='19' Height='19' HorizontalAlignment='Left' VerticalAlignment='Top' Margin='-3,2,0,0' Fill='$($GuiC.blue18)'/>"
+        }
+        'bg'  { $stroke = $GuiC.blue; $dash = "StrokeDashArray='1.4 1.2'" }
+        'ask' { $stroke = $GuiC.blue }
+        'end' { $fill = $GuiC.tx; $stroke = $GuiC.tx }
+    }
+    $line = if ($Last) { '' } else { "<Rectangle Width='1' Fill='$($GuiC.line2)' HorizontalAlignment='Left' Margin='6,14,0,-14'/>" }
+    @"
+<Grid Margin='0,0,0,12'>
+  <Grid.ColumnDefinitions><ColumnDefinition Width='30'/><ColumnDefinition/></Grid.ColumnDefinitions>
+  $line$ring
+  <Ellipse Width='11' Height='11' HorizontalAlignment='Left' VerticalAlignment='Top' Margin='1,6,0,0' Fill='$fill' Stroke='$stroke' StrokeThickness='1.5' $dash>$fx</Ellipse>
+  <StackPanel Grid.Column='1'>
+    <DockPanel Height='22' LastChildFill='False'>
+      <StackPanel DockPanel.Dock='Left' Orientation='Horizontal'>$Title</StackPanel>
+      <StackPanel DockPanel.Dock='Right' Orientation='Horizontal'>$Right</StackPanel>
+    </DockPanel>
+    $Inner
+  </StackPanel>
+</Grid>
+"@
+}
+function New-GuiRow {
+    # a row under a phase: glyph, name, note, time - the data escaped here
+    param([string]$Glyph, [string]$Name, [string]$Note = '', [string]$Time = '', [string]$NameColor = $GuiC.tx, [string]$NoteColor = $GuiC.tx3,
+          [string]$Cols = '18,230,*,64', [double]$Size = 12.5, [double]$Height = 22)
+    $cd = ($Cols -split ',' | ForEach-Object { "<ColumnDefinition Width='$_'/>" }) -join ''
+    "<Grid Height='$Height'><Grid.ColumnDefinitions>$cd</Grid.ColumnDefinitions>$Glyph" +
+        (New-GuiText (ConvertTo-GuiXml $Name) $NameColor $Size 'Normal' '0' "Grid.Column='1' TextTrimming='CharacterEllipsis'") +
+        (New-GuiText (ConvertTo-GuiXml $Note) $NoteColor $Size 'Normal' '0,0,8,0' "Grid.Column='2' TextTrimming='CharacterEllipsis'") +
+        (New-GuiText (ConvertTo-GuiXml $Time) $GuiC.tx2 $Size 'Normal' '0' "Grid.Column='3' HorizontalAlignment='Right'") + '</Grid>'
+}
+function New-GuiResultRow($R, [double]$Size = 12.5, [double]$Height = 22) {
+    # a row the run sent: its glyph, name, what came of it (red when it failed, yellow for a warning), its time
+    $noteColor = if ($R.Status -eq 'FAILED') { $GuiC.err } elseif ($R.Status -eq 'WARN' -or $R.Warn) { $GuiC.warn } else { $GuiC.tx3 }
+    $nameColor = if ($R.Status -eq 'SKIPPED') { $GuiC.tx3 } else { $GuiC.tx }
+    New-GuiRow (Get-GuiStatusGlyph ([string]$R.Status) ([bool]$R.Warn)) ([string]$R.Name) ([string]$R.Text) ([string]$R.Right) $nameColor $noteColor '18,230,*,64' $Size $Height
+}
+function New-GuiColRow($R) {
+    # a row of the two-column app list on Done: glyph, name, its time - or why not / what went wrong
+    $why = $R.Status -in 'SKIPPED', 'FAILED' -or $R.Warn
+    $right = if ($why) { [string]$R.Text } else { [string]$R.Right }
+    $rc = if ($R.Status -eq 'FAILED') { $GuiC.err } elseif ($R.Warn) { $GuiC.warn } elseif ($why) { $GuiC.tx3 } else { $GuiC.tx2 }
+    $rs = if ($why) { 10.5 } else { 12 }
+    $nc = if ($R.Status -eq 'SKIPPED') { $GuiC.tx3 } else { $GuiC.tx }
+    "<Grid Height='20'><Grid.ColumnDefinitions><ColumnDefinition Width='18'/><ColumnDefinition/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>" +
+        (Get-GuiStatusGlyph ([string]$R.Status) ([bool]$R.Warn)) +
+        (New-GuiText (ConvertTo-GuiXml ([string]$R.Name)) $nc 12 'Normal' '0' "Grid.Column='1' TextTrimming='CharacterEllipsis'") +
+        (New-GuiText (ConvertTo-GuiXml $right) $rc $rs 'Normal' '10,0,0,0' "Grid.Column='2' MaxWidth='240' TextTrimming='CharacterEllipsis'") + '</Grid>'
+}
+function New-GuiLiveRow([string]$Name, [string]$What, [bool]$Clock) {
+    # the step running now: highlighted, a sliding bar (LiveBar), its clock (LiveClockText) - Start-GuiMotion and
+    # Update-GuiClocks move them between two redraws
+    $clk = if ($Clock) { New-GuiText '00:00' $GuiC.blue 12.5 'SemiBold' '0' "x:Name='LiveClockText' Grid.Column='3' HorizontalAlignment='Right'" } else { '' }
+    $w = if ($What) { New-GuiText (ConvertTo-GuiXml $What) $GuiC.tx2 12.5 'Normal' '0,0,12,0' "TextTrimming='CharacterEllipsis' MaxWidth='230'" } else { '' }
+    @"
+<Border Height='28' Margin='-10,2,-10,2' Padding='10,0' CornerRadius='6' BorderBrush='$($GuiC.blue)' BorderThickness='2,0,0,0'>
+  <Border.Background><LinearGradientBrush StartPoint='0,0' EndPoint='1,0'><GradientStop Color='$($GuiC.blue16)' Offset='0'/><GradientStop Color='$($GuiC.blue04)' Offset='1'/></LinearGradientBrush></Border.Background>
+  <Grid><Grid.ColumnDefinitions><ColumnDefinition Width='18'/><ColumnDefinition Width='230'/><ColumnDefinition/><ColumnDefinition Width='64'/></Grid.ColumnDefinitions>
+    $(New-GuiGlyph 'E768' 9 $GuiC.blue)
+    $(New-GuiText (ConvertTo-GuiXml $Name) $GuiC.tx 12.5 'Bold' '0' "Grid.Column='1' TextTrimming='CharacterEllipsis'")
+    <StackPanel Grid.Column='2' Orientation='Horizontal'>
+      $w
+      <Border Width='120' Height='3' CornerRadius='2' Background='$($GuiC.blue18)' VerticalAlignment='Center' ClipToBounds='True'>
+        <Border x:Name='LiveBar' Width='46' HorizontalAlignment='Left' CornerRadius='2' Background='$($GuiC.blue)'>
+          <Border.Effect><DropShadowEffect Color='$($GuiC.blue)' BlurRadius='8' ShadowDepth='0' Opacity='0.9'/></Border.Effect></Border>
+      </Border>
+    </StackPanel>
+    $clk
+  </Grid>
+</Border>
+"@
+}
+function New-GuiSpinner([double]$Size = 13, [string]$Margin = '0,0,6,0') {
+    # an arc that turns (Start-GuiMotion) - one per screen: it is found by its name
+    "<Viewbox x:Name='Spin' Width='$Size' Height='$Size' Margin='$Margin' VerticalAlignment='Center'><Canvas Width='24' Height='24'>" +
+        "<Path Data='M12,4.5 A7.5,7.5 0 1 1 4.5,12' Stroke='$($GuiC.blue)' StrokeThickness='2.4' StrokeStartLineCap='Round' StrokeEndLineCap='Round'/></Canvas></Viewbox>"
+}
+function Get-GuiTitleBar($M) {
+    $cap = { param($glyph, $tag, $hover)
+        "<Border Tag='$tag' Width='46' WindowChrome.IsHitTestVisibleInChrome='True'>$(New-GuiHover 'Transparent' $hover)$(New-GuiGlyph $glyph 10 $GuiC.tx2)</Border>" }
+    $ver = if ($M.Version) { ' ' + (ConvertTo-GuiXml $M.Version) } else { '' }
+    @"
+<Grid Grid.Row='0' Height='40'>
+  <StackPanel Orientation='Horizontal' Margin='14,0,0,0' VerticalAlignment='Center'>
+    <Viewbox Width='16' Height='16'><Canvas Width='24' Height='24'>
+      <Path Data='M12,2.5 L20.2,7.25 L20.2,16.75 L12,21.5 L3.8,16.75 L3.8,7.25 Z' Fill='#0F1D3A' Stroke='$($GuiC.blue)' StrokeThickness='2' StrokeLineJoin='Round'/>
+    </Canvas></Viewbox>
+    $(New-GuiText 'MSUHost' $GuiC.tx 12.5 'Bold' '9,0,0,0')
+    $(New-GuiText "win11-tweaks$ver" $GuiC.tx3 12.5 'Normal' '9,0,0,0')
+  </StackPanel>
+  <StackPanel Orientation='Horizontal' HorizontalAlignment='Right'>$(& $cap 'E921' 'cap:min' $GuiC.hover)$(& $cap 'E8BB' 'cap:close' $GuiC.close)</StackPanel>
+</Grid>
+"@
+}
+function Get-GuiHeader([string]$Left, [string]$Right) {
+    @"
+<Border Grid.Row='1' BorderBrush='$($GuiC.line)' BorderThickness='0,0,0,1' Padding='28,10,28,16'>
+  <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+    <StackPanel VerticalAlignment='Bottom'>$Left</StackPanel>
+    <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Bottom'>$Right</StackPanel>
+  </Grid>
+</Border>
+"@
+}
+function Get-GuiBody([string]$Inner) {
+    "<ScrollViewer x:Name='BodyScroll' Grid.Row='2' VerticalScrollBarVisibility='Auto' HorizontalScrollBarVisibility='Disabled'><StackPanel Margin='20,14,28,4'>$Inner</StackPanel></ScrollViewer>"
+}
+function Get-GuiFooter([string]$Left, [string]$Right) {
+    @"
+<Border Grid.Row='3' Height='56' BorderBrush='$($GuiC.line)' BorderThickness='0,1,0,0' Background='$($GuiC.foot)' Padding='28,0,20,0'>
+  <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width='Auto'/></Grid.ColumnDefinitions>
+    <Grid VerticalAlignment='Center' Margin='0,0,16,0'>$Left</Grid>
+    <StackPanel Grid.Column='1' Orientation='Horizontal' VerticalAlignment='Center'>$Right</StackPanel>
+  </Grid>
+</Border>
+"@
+}
+function New-GuiTitle([string]$Text, [string]$Color = $GuiC.tx, [string]$Weight = 'Bold') { New-GuiText (ConvertTo-GuiXml $Text) $Color 13 $Weight }
+function New-GuiRight([string]$Text) { New-GuiText (ConvertTo-GuiXml $Text) $GuiC.tx3 12 }
+function Join-GuiText([object[]]$Parts) { (@($Parts) | Where-Object { $_ }) -join " $([char]0xB7) " }
+
+# ---- the model: what the window shows - changed only by the run's events (Update-GuiModel) and the clicks (Invoke-GuiAction)
+function New-GuiModel {
+    @{ Screen = 'wait'; WaitText = 'Getting ready'; Setup = $null; Version = ''; Log = ''
+       Choice = @{ Machine = 'PC'; User = 'Gele'; Off = @{}; Keep = @{} }
+       Banner = @{ Machine = ''; Os = ''; MachineType = ''; User = ''; DryRun = $false }
+       Tweaks = @{ State = 'todo'; Rows = [System.Collections.Generic.List[object]]::new(); Progress = $null; Count = 0; Time = '' }
+       Apps = @{ State = 'todo'; Rows = [System.Collections.Generic.List[object]]::new(); Plan = @() }
+       Net = @{ State = 'todo'; Rows = [System.Collections.Generic.List[object]]::new(); Since = $null }
+       Finishing = @{ State = 'todo'; Rows = [System.Collections.Generic.List[object]]::new() }
+       Live = $null; Summary = $null; RunStart = $null; ConfirmStop = $false; Stopping = $false; Dirty = $true }
+}
+function Get-GuiPhase($M, [string]$Name) {
+    switch ($Name) { 'Tweaks' { return $M.Tweaks } 'Apps' { return $M.Apps } '.NET 3.5' { return $M.Net } 'Finishing' { return $M.Finishing } }
+    return $null
+}
+function Update-GuiModel($M, $Ev) {
+    $M.Dirty = $true
+    $now = [DateTime]::UtcNow
+    switch ([string]$Ev.Type) {
+        'setup' {
+            $p = $Ev.Payload; $M.Setup = $p; $M.Screen = 'setup'; $M.Version = [string]$p.Version; $M.Log = [string]$p.Log
+            $M.Choice.Machine = if ($p.Machine) { [string]$p.Machine } elseif ($p.Detected) { [string]$p.Detected } else { 'PC' }
+            $M.Choice.Keep = @{}; foreach ($k in @($p.Keep)) { if ($k) { $M.Choice.Keep[[string]$k.Key] = $true } }   # Enter = keep, like the console
+        }
+        'banner' {
+            foreach ($k in 'Machine', 'Os', 'MachineType', 'User', 'DryRun') { $M.Banner[$k] = $Ev[$k] }
+            if ($Ev.Log) { $M.Log = [string]$Ev.Log }
+            $M.Screen = 'run'; if (-not $M.RunStart) { $M.RunStart = $now }
+        }
+        'phase' {
+            foreach ($ph in $M.Tweaks, $M.Apps, $M.Net, $M.Finishing) { if ($ph.State -eq 'live') { $ph.State = 'done' } }
+            $ph = Get-GuiPhase $M ([string]$Ev.Name); if ($ph) { $ph.State = 'live' }
+            if ($M.Screen -ne 'run') { $M.Screen = 'run' }
+            if (-not $M.RunStart) { $M.RunStart = $now }
+        }
+        'phase-done' {
+            $ph = Get-GuiPhase $M ([string]$Ev.Name); if ($ph) { $ph.State = 'done' }
+            if ($Ev.Name -eq 'Tweaks') { $M.Tweaks.Count = [int]$Ev.Count; $M.Tweaks.Time = [string]$Ev.Time; $M.Tweaks.Progress = $null }
+        }
+        'progress' { $M.Tweaks.Progress = @{ Name = [string]$Ev.Name; N = [int]$Ev.N; Total = [int]$Ev.Total } }
+        'row'      { $ph = Get-GuiPhase $M ([string]$Ev.Phase); if ($ph) { $ph.Rows.Add($Ev) } }
+        'plan'     { $M.Apps.Plan = @($Ev.Apps) }
+        'dotnet'   { if ($Ev.State -eq 'running' -and $M.Net.State -eq 'todo') { $M.Net.State = 'running'; $M.Net.Since = $now } }
+        'live'     {
+            $since = if ($Ev.Since) { [double]$Ev.Since } else { 0 }
+            $M.Live = @{ Name = [string]$Ev.Name; What = [string]$Ev.What; Clock = [bool]$Ev.Clock; Started = $now.AddSeconds(-$since) }
+        }
+        'what'     { if ($M.Live) { $M.Live.What = [string]$Ev.What } }
+        'live-end' { $M.Live = $null }
+        'summary'  {
+            $M.Summary = $Ev; $M.Screen = 'done'; $M.Live = $null; $M.ConfirmStop = $false; $M.Stopping = $false
+            # stopped: the phase it was in did not get to its end
+            $to = if ($Ev.Finished) { 'done' } else { 'stopped' }
+            foreach ($ph in $M.Tweaks, $M.Apps, $M.Net, $M.Finishing) { if ($ph.State -in 'live', 'running') { $ph.State = $to } }
+            if ($Ev.Log) { $M.Log = [string]$Ev.Log }
+        }
+    }
+}
+
+# ---- the screens: the header (row 1), the body (row 2), the footer (row 3); Get-GuiXaml adds the title bar and the glow
+function Get-GuiKind($Ph) {
+    # the dot of a phase that has run: red if something failed, yellow for a warning or a stop, else green
+    if ($Ph.State -eq 'todo') { return 'todo' }
+    if ($Ph.State -eq 'live') { return 'live' }
+    if (@($Ph.Rows | Where-Object { $_.Status -eq 'FAILED' })) { return 'fail' }
+    if ($Ph.State -eq 'stopped' -or @($Ph.Rows | Where-Object { $_.Status -eq 'WARN' -or $_.Warn })) { return 'warn' }
+    return 'done'
+}
+function Get-GuiBadRows($Ph) {
+    (@($Ph.Rows | Where-Object { $_.Status -in 'WARN', 'FAILED' -or $_.Warn }) | ForEach-Object { New-GuiResultRow $_ }) -join ''
+}
+function Get-GuiWaitParts($M) {
+    (Get-GuiHeader ((New-GuiText 'win11-tweaks' $GuiC.tx 17 'Bold') + (New-GuiText ((ConvertTo-GuiXml $M.WaitText) + $GuiMore) $GuiC.tx3 12 'Normal' '0,3,0,0')) '') +
+    "<StackPanel Grid.Row='2' Orientation='Horizontal' VerticalAlignment='Center' HorizontalAlignment='Center'>$(New-GuiSpinner 16 '0,0,10,0')$(New-GuiText ((ConvertTo-GuiXml $M.WaitText) + $GuiMore) $GuiC.tx3 13)</StackPanel>" +
+    (Get-GuiFooter '' '')
+}
+function Get-GuiSetupParts($M) {
+    $p = $M.Setup; $ch = $M.Choice; $mt = [string]$ch.Machine
+    $opt = { param($on, $label, $hint, $glyph, $tag)
+        $bd = if ($on) { $GuiC.blue } else { $GuiC.line2 }; $th = if ($on) { '2' } else { '1' }
+        $bg = if ($on) { $GuiC.blue10 } else { 'Transparent' }; $hv = if ($on) { $GuiC.blue10 } else { $GuiC.hover2 }
+        $ic = if ($on) { $GuiC.blue } else { $GuiC.tx2 }; $lb = if ($on) { $GuiC.tx } else { $GuiC.tx2 }
+        $h = if ($hint) { New-GuiText (ConvertTo-GuiXml $hint) $GuiC.tx3 11.5 'Normal' '9,0,0,0' } else { '' }
+        $t = if ($tag) { "Tag='$tag' " } else { '' }
+        "<Border $t" + "Height='36' Padding='14,0' Margin='0,0,10,0' CornerRadius='8' BorderBrush='$bd' BorderThickness='$th'>$(New-GuiHover $bg $hv)" +
+            "<StackPanel Orientation='Horizontal' IsHitTestVisible='False'>$(New-GuiGlyph $glyph 14 $ic '0,0,9,0')$(New-GuiText $label $lb 12.5 'SemiBold')$h</StackPanel></Border>"
+    }
+    $chip = { param($name, $on, $tag)
+        if ($on) {
+            "<Border Tag='$tag' Height='26' Padding='8,0,10,0' Margin='0,0,6,6' CornerRadius='6' BorderBrush='$($GuiC.blue55)' BorderThickness='1'>$(New-GuiHover $GuiC.blue10 $GuiC.blue18)" +
+                "<StackPanel Orientation='Horizontal' IsHitTestVisible='False'>$(New-GuiGlyph 'E73E' 10 $GuiC.blue '0,0,6,0')$(New-GuiText (ConvertTo-GuiXml $name) $GuiC.tx 12)</StackPanel></Border>"
+        } else {
+            "<Border Tag='$tag' Height='26' Padding='8,0,10,0' Margin='0,0,6,6' CornerRadius='6' BorderBrush='$($GuiC.line2)' BorderThickness='1'>$(New-GuiHover 'Transparent' $GuiC.hover2)" +
+                "<StackPanel Orientation='Horizontal' IsHitTestVisible='False'><Border Width='10' Height='10' CornerRadius='2' BorderBrush='$($GuiC.line2)' BorderThickness='1.5' Margin='0,0,6,0' VerticalAlignment='Center'/>" +
+                "$(New-GuiText (ConvertTo-GuiXml $name) $GuiC.tx3 12)</StackPanel></Border>"
+        }
+    }
+    $grp = { param($label, $content)
+        "<Grid Margin='0,3,0,0'><Grid.ColumnDefinitions><ColumnDefinition Width='150'/><ColumnDefinition/></Grid.ColumnDefinitions>" +
+            (New-GuiText (ConvertTo-GuiXml $label) $GuiC.tx3 11.5 'Normal' '0,5,0,0' "VerticalAlignment='Top'") + "<WrapPanel Grid.Column='1'>$content</WrapPanel></Grid>"
+    }
+    $q = { param($t) (New-GuiText '?' $GuiC.blue 13 'Bold' '0,0,8,0') + (New-GuiTitle $t) }
+    $hint = { param($type)
+        if ($p.Machine -eq $type) { 'set by -Machine' }
+        elseif (-not $p.Machine -and $p.Detected -eq $type) { if ($type -eq 'Laptop') { 'detected - it has a battery' } else { 'detected - no battery' } }
+        else { '' }
+    }
+    $mtag = { param($type) if ($p.Machine) { '' } else { "pick:machine:$type" } }   # -Machine decided it: no choice here
+    $apps = @($p.Apps[$mt] | Where-Object { $_ })
+    $body = (New-GuiNode 'ask' (& $q 'PC or laptop?') '' ("<StackPanel Orientation='Horizontal' Margin='0,6,0,4'>" +
+                (& $opt ($mt -eq 'PC') 'PC' (& $hint 'PC') 'E7F4' (& $mtag 'PC')) + (& $opt ($mt -eq 'Laptop') 'Laptop' (& $hint 'Laptop') 'E7F8' (& $mtag 'Laptop')) + '</StackPanel>')) +
+            (New-GuiNode 'ask' (& $q 'Who is it?') '' ("<StackPanel Orientation='Horizontal' Margin='0,6,0,4'>" +
+                (& $opt ($ch.User -ne 'New user') 'Gele' 'everything, no questions' 'E77B' 'pick:user:Gele') + (& $opt ($ch.User -eq 'New user') 'New user' 'pick the apps' 'E716' 'pick:user:New user') + '</StackPanel>'))
+    $lock = "<StackPanel Orientation='Horizontal' Height='26'>$(New-GuiGlyph 'E72E' 11 $GuiC.tx3 '0,0,7,0')" +
+            (New-GuiText ((@($p.Always) | ForEach-Object { ConvertTo-GuiXml ([string]$_) }) -join " $GuiDot ") $GuiC.tx3 12) + '</StackPanel>'
+    $notNames = @($p.NotOffered[$mt] | Where-Object { $_ } | ForEach-Object { ConvertTo-GuiXml ([string]$_.Name) })
+    $not = if ($notNames) { & $grp 'Not here' ("<TextBlock Foreground='$($GuiC.tx3)' FontSize='12' Padding='0,5,0,0' TextWrapping='Wrap'>" + ($notNames -join " $GuiDot ") + '</TextBlock>') } else { '' }
+    if ($ch.User -eq 'New user') {
+        $on = @($apps | Where-Object { -not $ch.Off.ContainsKey([string]$_.Key) }).Count
+        $groups = ''
+        foreach ($g in @($p.Groups)) {
+            $in = @($apps | Where-Object { $_.Group -eq $g }); if (-not $in) { continue }
+            $groups += & $grp $g (($in | ForEach-Object { & $chip ([string]$_.Name) (-not $ch.Off.ContainsKey([string]$_.Key)) ('app:' + (ConvertTo-GuiXml ([string]$_.Key))) }) -join '')
+        }
+        $body += New-GuiNode 'ask' (& $q 'Apps') ((New-GuiText "$on" $GuiC.tx 12 'SemiBold') + (New-GuiRight " of $($apps.Count) selected")) ($groups + (& $grp 'Always' $lock) + $not)
+        $keep = (@($p.Keep | Where-Object { $_ }) | ForEach-Object { & $chip ([string]$_.Name) ($ch.Keep.ContainsKey([string]$_.Key)) ('keep:' + (ConvertTo-GuiXml ([string]$_.Key))) }) -join ''
+        $body += New-GuiNode 'ask' (& $q 'Keep Windows apps') (New-GuiRight 'the rest of the built-in apps go') "<WrapPanel Margin='0,4,0,0'>$keep</WrapPanel>" -Last
+        $kept = @(@($p.Keep | Where-Object { $_ }) | Where-Object { $ch.Keep.ContainsKey([string]$_.Key) } | ForEach-Object { [string]$_.Name })
+        $foot = @("$on apps"); if ($kept) { $foot += ($kept -join ' + ') + ' kept' }
+    } else {
+        $body += New-GuiNode 'ask' (& $q 'Apps') (New-GuiRight "all $($apps.Count)") ((New-GuiText 'Everything, as always - no questions.' $GuiC.tx2 12 'Normal' '0,4,0,4') + (& $grp 'Always' $lock) + $not) -Last
+        $foot = @("all $($apps.Count) apps")
+    }
+    if ($p.TweakCount -and $p.TweakCount[$mt]) { $foot += "$($p.TweakCount[$mt]) tweaks" }
+    $kbd = "<Border BorderBrush='$($GuiC.line2)' BorderThickness='1,1,1,2' CornerRadius='5' Padding='7,1' VerticalAlignment='Center'>$(New-GuiText 'Enter' $GuiC.tx2 11)</Border>"
+    $hl = (New-GuiText 'Set up this PC' $GuiC.tx 17 'Bold') + (New-GuiText (ConvertTo-GuiXml (Join-GuiText @($p.PcName, $p.Os))) $GuiC.tx3 12 'Normal' '0,3,0,0')
+    (Get-GuiHeader $hl ($kbd + (New-GuiText 'to start' $GuiC.tx3 12 'Normal' '10,0,0,0'))) +
+    (Get-GuiBody $body) +
+    (Get-GuiFooter (New-GuiText (ConvertTo-GuiXml (Join-GuiText $foot)) $GuiC.tx2 12) ((New-GuiButton 'Cancel' 'act:cancel') + (New-GuiButton 'Start' 'act:start' '' 'primary' 'E76C')))
+}
+function Get-GuiRunParts($M) {
+    $b = $M.Banner
+    $left = (New-GuiText (ConvertTo-GuiXml ([string]$b.Machine)) $GuiC.tx 17 'Bold') +
+            (New-GuiText (ConvertTo-GuiXml (Join-GuiText @($b.Os, $b.MachineType, $b.User))) $GuiC.tx3 12 'Normal' '0,3,0,0') +
+            $(if ($b.DryRun) { New-GuiText 'DRY RUN - nothing will be changed' $GuiC.warn 11.5 'SemiBold' '0,3,0,0' } else { '' })
+    $right = (New-GuiText '00:00' $GuiC.tx 30 'SemiBold' '0' "x:Name='ElapsedText'") + (New-GuiText 'elapsed' $GuiC.tx3 12 'Normal' '10,0,0,4' "VerticalAlignment='Bottom'")
+    # Tweaks: n / N and the tweak now; then its groups (the ones that went wrong as rows)
+    $tw = $M.Tweaks; $twBad = @($tw.Rows | Where-Object { $_.Status -in 'WARN', 'FAILED' -or $_.Warn }).Count
+    if ($tw.State -eq 'live') {
+        $pg = $tw.Progress
+        $twRight = if ($pg) { (New-GuiText "$($pg.N)" $GuiC.tx 12 'SemiBold') + (New-GuiRight " / $($pg.Total)") } else { '' }
+        $twInner = if ($M.Live) { New-GuiLiveRow $M.Live.Name $M.Live.What $M.Live.Clock } elseif ($pg) { New-GuiLiveRow $pg.Name '' $false } else { '' }
+    } elseif ($tw.State -eq 'todo') {
+        $twRight = New-GuiRight 'privacy, apps, Start, taskbar, performance'; $twInner = ''
+    } else {
+        $chips = (@($tw.Rows | Where-Object { $_.Status -in 'OK', 'DRYRUN' -and -not $_.Warn }) | ForEach-Object {
+            $g = if ($_.Status -eq 'DRYRUN') { New-GuiText $GuiDot $GuiC.tx3 12 'Bold' '0,0,5,0' } else { New-GuiGlyph 'E73E' 10 $GuiC.ok '0,0,5,0' }
+            "<StackPanel Orientation='Horizontal' Margin='0,0,14,4'>$g$(New-GuiText (ConvertTo-GuiXml ([string]$_.Name)) $GuiC.tx2 11.5)</StackPanel>" }) -join ''
+        $twInner = "<WrapPanel Margin='0,3,0,2'>$chips</WrapPanel>" + (Get-GuiBadRows $tw)
+        $twRight = New-GuiRight (Join-GuiText @($(if ($b.DryRun) { "$($tw.Count) would apply" } else { "$($tw.Count) applied" }), $tw.Time))
+    }
+    $body = New-GuiNode (Get-GuiKind $tw) (New-GuiTitle 'Tweaks') $twRight $twInner
+    # Apps: the last ones done, the one running now, the next ones - and how many more (it has to fit: no scrolling
+    # while it runs)
+    $ap = $M.Apps; $rows = @($ap.Rows); $plan = @($ap.Plan)
+    $live = if ($M.Live -and $ap.State -eq 'live') { $M.Live } else { $null }
+    $seen = @{}; foreach ($r in $rows) { $seen[[string]$r.Name] = $true }
+    $doneN = @($rows | Where-Object { $plan -contains [string]$_.Name }).Count
+    $skipN = @($rows | Where-Object { $_.Status -eq 'SKIPPED' -and $_.Name -ne 'Not selected' }).Count
+    if ($ap.State -eq 'live') {
+        $queued = @($plan | Where-Object { -not $seen.ContainsKey([string]$_) -and -not ($live -and [string]$_ -eq $live.Name) })
+        $budget = 10 - [math]::Min(3, $twBad)
+        $tail = [math]::Min($rows.Count, 4); $head = [math]::Max(0, [math]::Min($queued.Count, $budget - $tail))
+        $apInner = ''
+        if ($tail -gt 0) { $apInner += (@($rows[($rows.Count - $tail)..($rows.Count - 1)]) | ForEach-Object { New-GuiResultRow $_ }) -join '' }
+        if ($live) { $apInner += New-GuiLiveRow $live.Name $live.What $live.Clock }
+        if ($head -gt 0) { $apInner += (@($queued[0..($head - 1)]) | ForEach-Object { New-GuiRow (New-GuiText $GuiDot $GuiC.line2 14 'Bold') ([string]$_) '' '' $GuiC.tx3 }) -join '' }
+        $more = @(); if ($queued.Count -gt $head) { $more += "+ $($queued.Count - $head) more queued" }; if ($skipN) { $more += "$skipN not for this PC" }
+        if ($more) { $apInner += New-GuiText (ConvertTo-GuiXml (Join-GuiText $more)) $GuiC.tx3 11.5 'Normal' '18,4,0,0' }
+        $apRight = (New-GuiText "$doneN" $GuiC.tx 12 'SemiBold') + (New-GuiRight " / $($plan.Count)")
+    } elseif ($ap.State -eq 'todo') {
+        $apRight = New-GuiRight 'next'; $apInner = ''
+    } else {
+        $inst = @($rows | Where-Object { $_.Status -in 'OK', 'DRYRUN' -and $_.Name -ne 'Not selected' }).Count
+        $apRight = New-GuiRight (Join-GuiText @("$inst $(if ($b.DryRun) { 'would install' } else { 'installed' })", $(if ($skipN) { "$skipN not for this PC" })))
+        $apInner = Get-GuiBadRows $ap
+    }
+    $body += New-GuiNode (Get-GuiKind $ap) (New-GuiTitle 'Apps') $apRight $apInner
+    # .NET 3.5: downloading next to the apps (its own clock), the wait at the end, then its row
+    $nt = $M.Net; $ntKind = Get-GuiKind $nt; $ntInner = ''; $ntRight = ''
+    switch ($nt.State) {
+        'running' {
+            $ntKind = 'bg'
+            $ntRight = (New-GuiSpinner) + (New-GuiRight "downloading in the background $([char]0xB7) ") + (New-GuiText '00:00' $GuiC.tx2 12 'Normal' '0' "x:Name='NetClockText'")
+        }
+        'live' {
+            $ntInner = (@($nt.Rows) | ForEach-Object { New-GuiResultRow $_ }) -join ''
+            if ($M.Live) { $ntInner += New-GuiLiveRow $M.Live.Name $M.Live.What $M.Live.Clock }
+        }
+        'todo' { $ntRight = New-GuiRight 'after the apps' }
+        default {
+            $r = @($nt.Rows | Where-Object { $_.Name -eq '.NET 3.5' })[0]
+            if ($r) { $ntRight = New-GuiRight (Join-GuiText @($r.Text, $r.Right)) }
+            $ntInner = (@($nt.Rows | Where-Object { $_.Name -ne '.NET 3.5' -or $_.Status -eq 'FAILED' }) | ForEach-Object { New-GuiResultRow $_ }) -join ''
+        }
+    }
+    $body += New-GuiNode $ntKind (New-GuiTitle '.NET 3.5') $ntRight $ntInner
+    # Finishing: one row each, the step now
+    $fn = $M.Finishing
+    $fnInner = (@($fn.Rows) | ForEach-Object { New-GuiResultRow $_ }) -join ''
+    if ($M.Live -and $fn.State -eq 'live') { $fnInner += New-GuiLiveRow $M.Live.Name $M.Live.What $M.Live.Clock }
+    $fnRight = if ($fn.State -eq 'todo') { New-GuiRight "old components $([char]0xB7) monitors $([char]0xB7) VBScript" } else { '' }
+    $fnTitle = if ($fn.State -eq 'todo') { New-GuiTitle 'Finishing' $GuiC.tx3 'Medium' } else { New-GuiTitle 'Finishing' }
+    $body += New-GuiNode (Get-GuiKind $fn) $fnTitle $fnRight $fnInner -Last
+    # the footer: where the run is (Apps is the long one), Log / Stop - Stop asks first
+    $seg = { param($ph, $label, $frac, $col)
+        $lc = if ($ph.State -eq 'live') { $GuiC.tx } else { $GuiC.tx3 }
+        $bar = if ($ph.State -in 'done', 'stopped') { "<Border Height='4' CornerRadius='2' Background='$($GuiC.ok)'/>" }
+               elseif ($ph.State -in 'live', 'running') {
+                   $f = [math]::Round([math]::Max(0.04, [math]::Min(1, $frac)), 3)
+                   "<Border Height='4' CornerRadius='2'><Border.Background><LinearGradientBrush StartPoint='0,0' EndPoint='1,0'><GradientStop Color='$($GuiC.blue)' Offset='0'/>" +
+                   "<GradientStop Color='$($GuiC.blue)' Offset='$f'/><GradientStop Color='$($GuiC.line2)' Offset='$f'/><GradientStop Color='$($GuiC.line2)' Offset='1'/></LinearGradientBrush></Border.Background>" +
+                   "<Border.Effect><DropShadowEffect Color='$($GuiC.blue)' BlurRadius='10' ShadowDepth='0' Opacity='0.45'/></Border.Effect></Border>"
+               } else { "<Border Height='4' CornerRadius='2' Background='$($GuiC.line2)'/>" }
+        "<StackPanel Grid.Column='$col' Margin='0,0,6,0'>$bar$(New-GuiText $label $lc 11 'Normal' '0,6,0,0')</StackPanel>"
+    }
+    $twFrac = if ($tw.Progress) { $tw.Progress.N / [math]::Max(1, $tw.Progress.Total) } else { 0 }
+    $apFrac = if ($plan.Count) { $doneN / $plan.Count } else { 0 }
+    $apLabel = if ($ap.State -eq 'todo' -or -not $plan.Count) { 'Apps' } else { "Apps $doneN/$($plan.Count)" }
+    $segXaml = "<Grid Width='560' HorizontalAlignment='Left'><Grid.ColumnDefinitions><ColumnDefinition Width='1*'/><ColumnDefinition Width='3*'/><ColumnDefinition Width='1*'/><ColumnDefinition Width='1*'/></Grid.ColumnDefinitions>" +
+        (& $seg $tw 'Tweaks' $twFrac 0) + (& $seg $ap $apLabel $apFrac 1) + (& $seg $nt '.NET' 0.5 2) + (& $seg $fn 'Finishing' 0.5 3) + '</Grid>'
+    $buttons = if ($M.Stopping) { New-GuiText "Stopping after this step$GuiMore" $GuiC.warn 12 'SemiBold' '0,0,8,0' }
+               elseif ($M.ConfirmStop) { (New-GuiText 'Stop after this step?' $GuiC.tx 12 'SemiBold' '0,0,4,0') + (New-GuiButton 'Keep going' 'act:stop-no') + (New-GuiButton 'Stop' 'act:stop-yes' 'E71A' 'danger') }
+               else { (New-GuiButton 'Log' 'act:log' 'E8A5') + (New-GuiButton 'Stop' 'act:stop') }
+    (Get-GuiHeader $left $right) + (Get-GuiBody $body) + (Get-GuiFooter $segXaml $buttons)
+}
+function Get-GuiDoneParts($M) {
+    $s = $M.Summary; $b = $M.Banner
+    $left = (New-GuiText (ConvertTo-GuiXml ([string]$s.Head)) $GuiC.tx 17 'Bold') +
+            (New-GuiText (ConvertTo-GuiXml (Join-GuiText @($b.Machine, $b.Os))) $GuiC.tx3 12 'Normal' '0,3,0,0')
+    # the score: 95 OK . 7 skipped . 0 failed (a warning, "still installing" when there are some)
+    $num = { param($n, $label, $color) "<Run Text='$n' FontSize='22' FontWeight='Bold' Foreground='$color'/><Run Text=' $label'/>" }
+    $parts = [System.Collections.Generic.List[string]]::new()
+    if ($s.DryRun) { $parts.Add((& $num ([int]$s.WouldApply) 'would apply' $GuiC.tx)) } else { $parts.Add((& $num ([int]$s.Ok) 'OK' $GuiC.ok)) }
+    if ($s.Skipped) { $parts.Add((& $num ([int]$s.Skipped) 'skipped' $GuiC.tx)) }
+    if ($s.Warn) { $parts.Add((& $num ([int]$s.Warn) $(if ($s.Warn -gt 1) { 'warnings' } else { 'warning' }) $GuiC.warn)) }
+    if ($s.Background) { $parts.Add((& $num ([int]$s.Background) 'still installing' $GuiC.warn)) }
+    $parts.Add((& $num ([int]$s.Failed) 'failed' $(if ($s.Failed) { $GuiC.err } else { $GuiC.tx })))
+    $right = "<TextBlock VerticalAlignment='Bottom' FontSize='13' Foreground='$($GuiC.tx2)'>" + ($parts -join "<Run Text=' $GuiDot '/>") + '</TextBlock>'
+    $stopped = { param($ph, $text) if ($ph.State -eq 'stopped') { Join-GuiText @($text, 'stopped') } else { $text } }
+    # Tweaks
+    $tw = $M.Tweaks
+    $twText = if ($tw.State -eq 'todo') { 'did not run' } elseif ($tw.Rows.Count) { Join-GuiText @($(if ($b.DryRun) { "$($tw.Count) would apply" } else { "$($tw.Count) applied" }), $tw.Time) } else { '' }
+    $body = New-GuiNode (Get-GuiKind $tw) (New-GuiTitle 'Tweaks') (New-GuiRight (& $stopped $tw $twText)) (Get-GuiBadRows $tw)
+    # Apps: all of them, in two columns - each with its time, or why not
+    $ap = $M.Apps; $rows = @($ap.Rows)
+    $inst = @($rows | Where-Object { $_.Status -in 'OK', 'DRYRUN' -and $_.Name -ne 'Not selected' }).Count
+    $skipN = @($rows | Where-Object { $_.Status -eq 'SKIPPED' -and $_.Name -ne 'Not selected' }).Count
+    $apText = if ($ap.State -eq 'todo') { 'did not run' } else { Join-GuiText @("$inst $(if ($b.DryRun) { 'would install' } else { 'installed' })", $(if ($skipN) { "$skipN not for this PC" })) }
+    $apInner = ''
+    if ($rows.Count) {
+        $half = [math]::Ceiling($rows.Count / 2)
+        $colA = (@($rows[0..($half - 1)]) | ForEach-Object { New-GuiColRow $_ }) -join ''
+        $colB = if ($rows.Count -gt $half) { (@($rows[$half..($rows.Count - 1)]) | ForEach-Object { New-GuiColRow $_ }) -join '' } else { '' }
+        $apInner = "<Grid Margin='0,2,0,0'><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width='28'/><ColumnDefinition/></Grid.ColumnDefinitions>" +
+                   "<StackPanel Grid.Column='0'>$colA</StackPanel><StackPanel Grid.Column='2'>$colB</StackPanel></Grid>"
+    }
+    $body += New-GuiNode (Get-GuiKind $ap) (New-GuiTitle 'Apps') (New-GuiRight (& $stopped $ap $apText)) $apInner
+    # .NET 3.5: its one line
+    $nt = $M.Net; $r = @($nt.Rows | Where-Object { $_.Name -eq '.NET 3.5' })[0]
+    $ntText = if ($r) { Join-GuiText @($r.Text, $r.Right) } elseif ($s.Background) { 'still installing in the background' } elseif ($nt.State -eq 'todo') { 'did not run' } else { '' }
+    $ntKind = if ($r) { Get-GuiKind $nt } elseif ($s.Background) { 'bg' } else { Get-GuiKind $nt }
+    $ntInner = (@($nt.Rows | Where-Object { $_.Status -in 'WARN', 'FAILED' -and $_.Name -ne '.NET 3.5' }) | ForEach-Object { New-GuiResultRow $_ }) -join ''
+    $body += New-GuiNode $ntKind (New-GuiTitle '.NET 3.5') (New-GuiRight $(if ($r) { $ntText } else { & $stopped $nt $ntText })) $ntInner
+    # Finishing: one row each
+    $fn = $M.Finishing
+    $fnInner = (@($fn.Rows) | ForEach-Object { New-GuiResultRow $_ 12 20 }) -join ''
+    $body += New-GuiNode (Get-GuiKind $fn) (New-GuiTitle 'Finishing') (New-GuiRight (& $stopped $fn $(if ($fn.State -eq 'todo') { 'did not run' } else { '' }))) $fnInner
+    # what went wrong, whole (it may say what to do - or hold a link)
+    $probs = @($s.Problems | Where-Object { $_ })
+    if ($probs) {
+        $pk = if (@($probs | Where-Object { $_.Status -eq 'FAILED' })) { 'fail' } else { 'warn' }
+        $pInner = ($probs | ForEach-Object {
+            "<Grid Margin='0,1,0,1'><Grid.ColumnDefinitions><ColumnDefinition Width='18'/><ColumnDefinition/></Grid.ColumnDefinitions>" +
+            "<Grid Height='18' VerticalAlignment='Top'>$(Get-GuiStatusGlyph ([string]$_.Status) $false)</Grid>" +
+            "<TextBlock Grid.Column='1' Text='$(ConvertTo-GuiXml ([string]$_.Text))' Foreground='$($GuiC.tx2)' FontSize='12' TextWrapping='Wrap' LineHeight='18'/></Grid>"
+        }) -join ''
+        $body += New-GuiNode $pk (New-GuiTitle 'Needs a look') (New-GuiRight "$($probs.Count)") $pInner
+    }
+    # what now: "Restart the PC to finish." - then why, and anything else
+    $next = @($s.Next | Where-Object { $_ }); $first = if ($next.Count) { [string]$next[0] } else { 'Done.' }; $why = @()
+    $cut = $first.IndexOf('. ')
+    if ($cut -gt 0) { $why += $first.Substring($cut + 2); $first = $first.Substring(0, $cut + 1) }
+    if ($next.Count -gt 1) { $why += @($next[1..($next.Count - 1)]) }
+    $icon = if ($s.Restart) { New-GuiGlyph 'E72C' 13 $GuiC.tx '0,0,8,0' } else { New-GuiGlyph 'E946' 13 $GuiC.tx '0,0,8,0' }
+    $whyXaml = ($why | ForEach-Object { New-GuiText (ConvertTo-GuiXml ([string]$_)) $GuiC.tx3 12 'Normal' '21,0,0,0' "TextWrapping='Wrap'" }) -join ''
+    $body += New-GuiNode 'end' ($icon + (New-GuiText (ConvertTo-GuiXml $first) $GuiC.tx 13 'Bold')) '' $whyXaml -Last
+    # the footer: the log, Open log / Close / Restart now
+    $footLeft = "<StackPanel Orientation='Horizontal'>$(New-GuiGlyph 'E8A5' 12 $GuiC.tx3 '0,0,8,0')" +
+                (New-GuiText (ConvertTo-GuiXml ([string]$M.Log)) $GuiC.tx3 12 'Normal' '0' "TextTrimming='CharacterEllipsis'") + '</StackPanel>'
+    $buttons = (New-GuiButton 'Open log' 'act:log') +
+               $(if ($s.Restart) { (New-GuiButton 'Close' 'act:close') + (New-GuiButton 'Restart now' 'act:restart' 'E72C' 'primary') } else { New-GuiButton 'Close' 'act:close' '' 'primary' })
+    (Get-GuiHeader $left $right) + (Get-GuiBody $body) + (Get-GuiFooter $footLeft $buttons)
+}
+function Get-GuiXaml($M) {
+    # the whole window content for the screen the model is on
+    $parts = switch ($M.Screen) { 'setup' { Get-GuiSetupParts $M } 'run' { Get-GuiRunParts $M } 'done' { Get-GuiDoneParts $M } default { Get-GuiWaitParts $M } }
+    @"
+<Border $GuiNs Background='$($GuiC.bg)' BorderBrush='$($GuiC.line)' BorderThickness='1'>
+<Grid>
+  <Grid.Resources>
+    <Style TargetType='ScrollBar'><Setter Property='Width' Value='6'/><Setter Property='MinWidth' Value='6'/><Setter Property='Template'><Setter.Value>
+      <ControlTemplate TargetType='ScrollBar'><Track x:Name='PART_Track' IsDirectionReversed='True'><Track.Thumb><Thumb><Thumb.Template>
+        <ControlTemplate TargetType='Thumb'><Border CornerRadius='3' Background='$($GuiC.line2)'/></ControlTemplate></Thumb.Template></Thumb></Track.Thumb></Track></ControlTemplate>
+    </Setter.Value></Setter></Style>
+  </Grid.Resources>
+  <Grid.RowDefinitions><RowDefinition Height='40'/><RowDefinition Height='Auto'/><RowDefinition Height='*'/><RowDefinition Height='56'/></Grid.RowDefinitions>
+  <Rectangle Grid.RowSpan='4' IsHitTestVisible='False'>
+    <Rectangle.Fill><RadialGradientBrush Center='0.18,-0.08' GradientOrigin='0.18,-0.08' RadiusX='0.6' RadiusY='0.45'>
+      <GradientStop Color='#293D7BFF' Offset='0'/><GradientStop Color='#003D7BFF' Offset='1'/></RadialGradientBrush></Rectangle.Fill>
+  </Rectangle>
+  $(Get-GuiTitleBar $M)
+  $parts
+</Grid>
+</Border>
+"@
+}
+
+# ---- the window itself (WPF). What the handlers need lives in $script: variables - a variable made inside a handler is
+# gone by the time the next one runs.
+function Invoke-GuiRender {
+    # the screen again, from the model: parsed, wired, scrolled back to where it was, its motion and clocks going
+    $m = $script:GuiM; $offset = 0
+    $old = $script:GuiWin.Content
+    if ($old -and $script:GuiScreen -eq $m.Screen) { $sv = $old.FindName('BodyScroll'); if ($sv) { $offset = $sv.VerticalOffset } }
+    $content = [Windows.Markup.XamlReader]::Parse((Get-GuiXaml $m))
+    $script:GuiWin.Content = $content
+    $script:GuiScreen = $m.Screen
+    Connect-GuiHandlers $content
+    if ($offset -gt 0) { $sv = $content.FindName('BodyScroll'); if ($sv) { $sv.ScrollToVerticalOffset($offset) } }
+    Start-GuiMotion $content
+    $m.Dirty = $false
+    $script:GuiLastRender = [DateTime]::UtcNow
+    Update-GuiClocks
+}
+function Start-GuiMotion($Content) {
+    # the live bar slides, the spinner turns - WPF animates them; a redraw picks each up where the last one was
+    try {
+        $t = ([DateTime]::UtcNow - $script:GuiT0).TotalSeconds
+        $bar = $Content.FindName('LiveBar')
+        if ($bar) {
+            $a = New-Object Windows.Media.Animation.DoubleAnimation(0, 74, (New-Object Windows.Duration([TimeSpan]::FromSeconds(1.1))))
+            $a.AutoReverse = $true; $a.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever
+            $a.EasingFunction = New-Object Windows.Media.Animation.SineEase
+            $a.BeginTime = [TimeSpan]::FromSeconds(-($t % 2.2))
+            $tt = New-Object Windows.Media.TranslateTransform; $bar.RenderTransform = $tt
+            $tt.BeginAnimation([Windows.Media.TranslateTransform]::XProperty, $a)
+        }
+        $spin = $Content.FindName('Spin')
+        if ($spin) {
+            $a = New-Object Windows.Media.Animation.DoubleAnimation(0, 360, (New-Object Windows.Duration([TimeSpan]::FromSeconds(1.2))))
+            $a.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever
+            $a.BeginTime = [TimeSpan]::FromSeconds(-($t % 1.2))
+            $rt = New-Object Windows.Media.RotateTransform; $spin.RenderTransformOrigin = New-Object Windows.Point(0.5, 0.5); $spin.RenderTransform = $rt
+            $rt.BeginAnimation([Windows.Media.RotateTransform]::AngleProperty, $a)
+        }
+    } catch { Add-GuiError "motion: $($_.Exception.Message)" }
+}
+function Update-GuiClocks {
+    $c = $script:GuiWin.Content; $m = $script:GuiM; $now = [DateTime]::UtcNow
+    if (-not $c) { return }
+    $e = $c.FindName('ElapsedText'); if ($e -and $m.RunStart) { $e.Text = Get-GuiClock (($now - $m.RunStart).TotalSeconds) }
+    $l = $c.FindName('LiveClockText'); if ($l -and $m.Live) { $l.Text = Get-GuiClock (($now - $m.Live.Started).TotalSeconds) }
+    $n = $c.FindName('NetClockText'); if ($n -and $m.Net.Since) { $n.Text = Get-GuiClock (($now - $m.Net.Since).TotalSeconds) }
+}
+function Connect-GuiHandlers($Root) {
+    # every element with an action tag (act: / pick: / app: / keep: / cap:) gets the hand cursor and a click
+    $stack = [System.Collections.Generic.Stack[object]]::new(); $stack.Push($Root)
+    while ($stack.Count) {
+        $el = $stack.Pop()
+        if ($el -is [Windows.FrameworkElement] -and $el.Tag -is [string] -and $el.Tag -match '^(act|pick|app|keep|cap):') {
+            $el.Cursor = [Windows.Input.Cursors]::Hand
+            $el.Add_MouseLeftButtonUp({ param($s, $e) $e.Handled = $true; Invoke-GuiAction ([string]$s.Tag) })
+        }
+        foreach ($ch in [Windows.LogicalTreeHelper]::GetChildren($el)) { if ($ch -is [Windows.DependencyObject]) { $stack.Push($ch) } }
+    }
+}
+function Add-GuiError([string]$Text) {
+    # the window cannot write the log (another thread): the run logs these when it lets the window go (Close-Gui)
+    $sh = $script:GuiShared; $sh.ErrorCount = 1 + [int]$sh.ErrorCount; $sh.LastError = $Text
+}
+function Close-GuiWindowNow { $script:GuiAllowClose = $true; $script:GuiWin.Close() }
+function Invoke-GuiAction([string]$Tag) {
+    $m = $script:GuiM; $sh = $script:GuiShared
+    switch -Regex ($Tag) {
+        '^cap:min$'           { $script:GuiWin.WindowState = 'Minimized'; return }
+        '^cap:close$'         {
+            if ($m.Screen -eq 'run') { if (-not $m.Stopping) { $m.ConfirmStop = $true } }   # the run goes on: close = stop, asked first
+            else { if ($m.Screen -eq 'setup' -and -not $sh.Answer) { $sh.Answer = @{ Cancel = $true } }; Close-GuiWindowNow; return }
+        }
+        '^pick:machine:(.+)$' { if (-not $m.Setup.Machine) { $m.Choice.Machine = $Matches[1] } }
+        '^pick:user:(.+)$'    { $m.Choice.User = $Matches[1] }
+        '^app:(.+)$'          { $k = $Matches[1]; if ($m.Choice.Off.ContainsKey($k)) { $m.Choice.Off.Remove($k) } else { $m.Choice.Off[$k] = $true } }
+        '^keep:(.+)$'         { $k = $Matches[1]; if ($m.Choice.Keep.ContainsKey($k)) { $m.Choice.Keep.Remove($k) } else { $m.Choice.Keep[$k] = $true } }
+        '^act:start$'         {
+            if ($m.Screen -ne 'setup' -or $sh.Answer) { return }
+            $sh.Answer = @{ Machine = $m.Choice.Machine; User = $m.Choice.User; Off = @($m.Choice.Off.Keys); Keep = @($m.Choice.Keep.Keys) }
+            $m.Screen = 'wait'; $m.WaitText = 'Starting'
+        }
+        '^act:cancel$'        { if (-not $sh.Answer) { $sh.Answer = @{ Cancel = $true } }; Close-GuiWindowNow; return }
+        '^act:stop$'          { if ($m.Screen -eq 'run' -and -not $m.Stopping) { $m.ConfirmStop = $true } }
+        '^act:stop-no$'       { $m.ConfirmStop = $false }
+        '^act:stop-yes$'      { if ($m.Screen -eq 'run') { $sh.Stop = $true; $m.ConfirmStop = $false; $m.Stopping = $true } }
+        '^act:log$'           { if ($m.Log -and (Test-Path -LiteralPath $m.Log)) { try { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $m.Log) } catch { Add-GuiError "log: $($_.Exception.Message)" } }; return }
+        '^act:close$'         { Close-GuiWindowNow; return }
+        '^act:restart$'       { $sh.Action = 'restart'; Close-GuiWindowNow; return }
+    }
+    $m.Dirty = $true
+    Invoke-GuiRender
+}
+function Save-GuiSnapshot([string]$Name) {
+    # test hook (W11T_GUI_SNAP = a folder): the window content as a 2x PNG, straight from WPF
+    $c = $script:GuiWin.Content; if (-not $c -or -not $env:W11T_GUI_SNAP) { return }
+    try {
+        $c.UpdateLayout()
+        $w = [int]($c.ActualWidth * 2); $h = [int]($c.ActualHeight * 2)
+        $rtb = New-Object Windows.Media.Imaging.RenderTargetBitmap($w, $h, 192, 192, [Windows.Media.PixelFormats]::Pbgra32)
+        $rtb.Render($c)
+        $enc = New-Object Windows.Media.Imaging.PngBitmapEncoder; $enc.Frames.Add([Windows.Media.Imaging.BitmapFrame]::Create($rtb))
+        $fs = [IO.File]::Create((Join-Path $env:W11T_GUI_SNAP "$Name.png")); try { $enc.Save($fs) } finally { $fs.Close() }
+    } catch { Add-GuiError "snapshot: $($_.Exception.Message)" }
+}
+function Invoke-GuiTestHooks {
+    # only with the test variables set: W11T_GUI_AUTOSTART (1 = Gele, newuser = New user) presses Start, W11T_GUI_STOP=apps
+    # stops the run in its Apps phase, W11T_GUI_SNAP saves the screens as PNGs, W11T_GUI_AUTOCLOSE closes the window at the end
+    $m = $script:GuiM; $h = $script:GuiHooks; $now = [DateTime]::UtcNow
+    if ($env:W11T_GUI_AUTOSTART -and $m.Screen -eq 'setup' -and -not $h.Started) {
+        if (-not $h.SetupAt) { $h.SetupAt = $now }
+        elseif (($now - $h.SetupAt).TotalSeconds -gt 1.5) {
+            if ($env:W11T_GUI_AUTOSTART -eq 'newuser') { $m.Choice.User = 'New user'; Invoke-GuiRender }
+            Save-GuiSnapshot 'setup'; $h.Started = $true; Invoke-GuiAction 'act:start'
+        }
+    }
+    if ($m.Screen -eq 'run' -and -not $h.Running -and (($m.Apps.State -eq 'live' -and $m.Apps.Rows.Count -ge 3) -or $m.Finishing.State -ne 'todo')) {
+        if ($m.Dirty) { Invoke-GuiRender }
+        Save-GuiSnapshot 'running'; $h.Running = $true
+    }
+    if ($env:W11T_GUI_STOP -eq 'apps' -and $m.Screen -eq 'run' -and $m.Apps.State -eq 'live' -and -not $h.Stopped) {
+        Invoke-GuiAction 'act:stop'; Save-GuiSnapshot 'stop-confirm'; Invoke-GuiAction 'act:stop-yes'; $h.Stopped = $true
+    }
+    if ($m.Screen -eq 'done' -and -not $h.Done) {
+        if (-not $h.DoneAt) { $h.DoneAt = $now }
+        elseif (($now - $h.DoneAt).TotalSeconds -gt 1) {
+            Save-GuiSnapshot 'done'; $h.Done = $true
+            if ($env:W11T_GUI_AUTOCLOSE) { Invoke-GuiAction 'act:close' }
+        }
+    }
+}
+function Show-GuiWindow {
+    # The window's thread: build the window, take the run's events ten times a second, redraw what changed (at most
+    # every 150 ms). Returns when the window is closed ($Shared.Closed). A window that keeps failing to draw closes
+    # itself - the console shows the run then.
+    param($Shared)
+    try {
+        Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+        $script:GuiShared = $Shared; $script:GuiM = New-GuiModel; $script:GuiAllowClose = $false; $script:GuiHooks = @{}
+        $script:GuiLastRender = [DateTime]::MinValue; $script:GuiT0 = [DateTime]::UtcNow; $script:GuiShown = $false; $script:GuiScreen = ''
+        $script:GuiFails = 0
+        # the window keeps its Windows frame (a shadow, Windows 11's round corners); WindowChrome draws our own title bar
+        # over it - a 1px glass edge is what keeps the shadow
+        $script:GuiWin = [Windows.Markup.XamlReader]::Parse(("<Window $GuiNs Title='win11-tweaks' Width='1040' Height='680' ResizeMode='CanMinimize' " +
+            "WindowStartupLocation='CenterScreen' Background='$($GuiC.bg)' Topmost='True' UseLayoutRounding='True' SnapsToDevicePixels='True' " +
+            "TextOptions.TextFormattingMode='Display' FontFamily='Cascadia Mono, Consolas'><WindowChrome.WindowChrome><WindowChrome CaptionHeight='40' " +
+            "ResizeBorderThickness='0' GlassFrameThickness='0,0,0,1' CornerRadius='0' UseAeroCaptionButtons='False'/></WindowChrome.WindowChrome></Window>"))
+        # a small screen (a laptop at 150%): the window fits it, the body scrolls
+        $wa = [Windows.SystemParameters]::WorkArea
+        if ($wa.Height -gt 300 -and $wa.Height - 16 -lt $script:GuiWin.Height) { $script:GuiWin.Height = $wa.Height - 16 }
+        if ($wa.Width -gt 600 -and $wa.Width - 16 -lt $script:GuiWin.Width) { $script:GuiWin.Width = $wa.Width - 16 }
+        $script:GuiWin.Add_ContentRendered({
+            if ($script:GuiShown) { return }
+            $script:GuiShown = $true; $script:GuiShared.Ready = $true
+            # in front once (Topmost only for the start - the console that started it may hold the foreground)
+            try { $null = $script:GuiWin.Activate() } catch { }
+            $script:GuiWin.Topmost = $false
+        })
+        $script:GuiWin.Add_Closing({ param($s, $e)
+            if (-not $script:GuiAllowClose -and $script:GuiM.Screen -eq 'run') {   # Alt+F4 while it runs: Stop, asked first
+                $e.Cancel = $true; if (-not $script:GuiM.Stopping) { $script:GuiM.ConfirmStop = $true; Invoke-GuiRender }
+            }
+        })
+        $script:GuiWin.Add_Closed({ $script:GuiShared.Closed = $true; try { $script:GuiTimer.Stop() } catch { } })
+        $script:GuiWin.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Return' -and $script:GuiM.Screen -eq 'setup') { Invoke-GuiAction 'act:start' } })
+        $script:GuiWin.Dispatcher.Add_UnhandledException({ param($s, $e) Add-GuiError "unhandled: $($e.Exception.Message)"; $e.Handled = $true })
+        $script:GuiTimer = New-Object Windows.Threading.DispatcherTimer
+        $script:GuiTimer.Interval = [TimeSpan]::FromMilliseconds(100)
+        $script:GuiTimer.Add_Tick({
+            $sh = $script:GuiShared; $m = $script:GuiM
+            try {
+                if ($sh.CloseRequest) { Close-GuiWindowNow; return }
+                $ev = $null; $n = 0
+                while ($n -lt 500 -and $sh.Events.TryDequeue([ref]$ev)) { Update-GuiModel $m $ev; $n++ }
+                if ($m.Dirty -and ([DateTime]::UtcNow - $script:GuiLastRender).TotalMilliseconds -ge 150) { Invoke-GuiRender } else { Update-GuiClocks }
+                Invoke-GuiTestHooks
+                $script:GuiFails = 0
+            } catch {
+                Add-GuiError $_.Exception.Message
+                if (++$script:GuiFails -ge 5) { Add-GuiError "closed after 5 failures in a row: $($_.Exception.Message)"; Close-GuiWindowNow }
+            }
+        })
+        Invoke-GuiRender
+        $script:GuiTimer.Start()
+        $null = $script:GuiWin.ShowDialog()
+    } catch {
+        $Shared.Error = $_.Exception.Message
+    } finally { $Shared.Closed = $true }
+}
+'@
+
+# --------------------------------------------------------------------------------------
 #  Main
 # --------------------------------------------------------------------------------------
 try {
     Set-QuickEdit                       # a click into the window must not pause the run (restored in finally)
+    if (Test-GuiMode) { Start-Gui }     # the window (no desktop, -Console, -Detailed, or it fails to open: the console rail)
     Show-Intro
     if ($script:Cancelled) { return }   # user answered "n" to Continue
     $script:RunStarted = $true          # from here on the summary is written - also if the run is stopped (see finally)
@@ -2912,6 +3917,9 @@ try {
     Enable-DotNetFeatures     # finish .NET 3.5 (usually already done) + .NET 4
     Invoke-Tweaks -Late       # last: what must wait for the installers (VBScript) and for .NET 3.5 (old components) - DISM is free again here
     $script:RunFinished = $true
+}
+catch [System.OperationCanceledException] {
+    Write-Log WARN 'Stopped from the window.'   # Stop in the window (Test-GuiStop) - the summary below says what ran
 }
 finally {
     # The summary is written HERE so it also lands when the run is stopped early with Ctrl+C - e.g. during
@@ -2931,6 +3939,11 @@ finally {
     Set-QuickEdit -Restore
     try { Stop-Transcript | Out-Null } catch { }
     if ($script:SavedPrefs) { $ProgressPreference = $script:SavedPrefs.Progress; $WarningPreference = $script:SavedPrefs.Warning }   # the window's own settings
+    # the window: it shows the summary until it is closed (Restart now restarts) - or, cancelled at the start, it goes
+    if ($script:Gui) {
+        if ($script:RunStarted) { Wait-GuiClose }
+        else { Close-Gui; if ($script:Cancelled) { Write-Markup "  {r:Cancelled - nothing was changed.}" } }
+    }
 }
 if ($script:RunFinished -and $Reboot -and -not $script:DryRun) {
     Write-Log WARN "Rebooting in 15s (-Reboot given). Press Ctrl+C to cancel."

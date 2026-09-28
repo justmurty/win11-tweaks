@@ -1,9 +1,10 @@
 # win11-tweaks
 
-A single, no-GUI PowerShell script that applies a fixed set of Windows 11 tweaks,
+A single PowerShell script that applies a fixed set of Windows 11 tweaks,
 then installs a defined application set (winget +
-direct downloads), and finally enables the .NET features. The console shows a compact view of
-the run (see [The console](#the-console)); every detail goes to a log file for later.
+direct downloads), and finally enables the .NET features. A window asks the setup questions and
+shows the run as it goes (see [The window](#the-window)); `-Console` keeps it in the console.
+Every detail goes to a log file for later.
 
 ## What it does
 
@@ -53,7 +54,8 @@ the run (see [The console](#the-console)); every detail goes to a log file for l
     GPU driver Windows only offers 60 Hz, and that driver often arrives during the run (if a screen stayed at
     60 Hz, run the script again once the driver is in).
 
-  New since v1.6.0 (in the one-liner now, in the next release): **a call no longer turns the game
+  New since v1.6.0 (in the one-liner now, in the next release): **a window** that asks the setup
+  questions and shows the run (see [The window](#the-window)), **a call no longer turns the game
   down** (Windows lowers every other sound by 80% while a call runs — set to "Do nothing"), and the
   **clipboard history (Win+V)** is on from the first press (on this PC only, nothing synced to the cloud).
 
@@ -129,12 +131,37 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Invoke-Win11Tweaks.ps1
 Open PowerShell/Terminal **as administrator**, `cd` to the script's folder, and run it. On
 PowerShell 7 use `pwsh` instead of `powershell`.
 
+## The window
+
+The one-liner (and the `.bat`) open a dark window — nothing to install, it is part of the script
+(WPF, built into Windows). Three screens:
+
+- **Set up this PC** — PC or laptop (preselected: a battery means a laptop), who it is (Gele gets
+  everything; a New user picks the apps, grouped, and which built-in Windows apps to keep), what
+  always goes in, what this PC is not offered and why. **Start** (or Enter) / **Cancel** — Cancel
+  changes nothing.
+- **The run** — the clock, then the phases on one line down the left: Tweaks (n / N, then the
+  groups), Apps (the last ones done with their times, the one installing now with its own clock,
+  the next ones), .NET 3.5 (downloading in the background next to the apps), Finishing. **Log**
+  opens the log; **Stop** asks first, then stops after the step running now (an installer that
+  has started finishes) — the summary covers what ran.
+- **Done** — how it went (OK · skipped · failed), every app with its time or why not, what needs a
+  look, what to do now. **Open log**, **Close**, and **Restart now** when Windows needs a restart
+  to finish.
+
+The run itself is the same as in the console — the window only shows it (it has its own thread,
+so it never waits on an installer). While it is open the console stays quiet; at the end the
+console gets the summary line and the log path. Without a desktop (SSH, a service), with
+`-Console`, `-Detailed` or `-Reboot`, or if the window cannot open, the console shows the run
+(below).
+
 ## The console
 
-A rail down the left, from the questions to the result:
+With `-Console` (and wherever there is no window): a rail down the left, from the questions to
+the result:
 
 ```
-  ┌  MSUHost  win11-tweaks 1.6.0
+  ┌  MSUHost  win11-tweaks 1.7.0
   ?  Continue? (Y/n) › y
   ?  Who is it?  1 Gele  2 New user  › 1
   ├─ WIN11-TEST · Windows 11 Pro 25H2 (26200) · PC · Gele
@@ -182,9 +209,10 @@ default Windows 11 shell use; PowerShell 7 has an open bug where Ctrl+C can skip
 |------|--------|
 | `-DryRun` | Log what it WOULD do, change **nothing**. Run this first. |
 | (none) | Actually apply the tweaks + install the apps. |
+| `-Console` | The rail in the console instead of the window. |
 | `-Detailed` | The full log on the console instead of the rail (the log file is always full). |
 | `-Machine PC\|Laptop` | Skip the "PC or Laptop?" question (`Laptop`: Ultimate only on the charger, keeps hibernation and the panel's refresh rate, no NZXT CAM; `PC`: plain Ultimate, no battery tweaks). |
-| `-Reboot` | Reboot 15s after finishing (cancel with Ctrl+C). |
+| `-Reboot` | Reboot 15s after finishing (cancel with Ctrl+C). An unattended run: the console, no window. |
 | `-LogDir <path>` | Different folder for the log (default: the script's folder). |
 
 ## Adding apps

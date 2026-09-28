@@ -3126,9 +3126,28 @@ function Invoke-GuiSetup {
     Set-SetupAnswer $a
 }
 
+function Stop-GuiThread {
+    # Let the window's thread go - never blocking the run: on CloseRequest the window closes itself (its timer). Stuck
+    # anyway: ask it to stop WITHOUT waiting and leave it be - PowerShell.Stop() (and Dispose) wait for a .NET call like
+    # ShowDialog to return, which could be never.
+    param($PowerShell, $Runspace, $Handle, [double]$WaitSec = 5)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($Handle -and -not $Handle.IsCompleted -and $sw.Elapsed.TotalSeconds -lt $WaitSec) { Start-Sleep -Milliseconds 100 }
+    try {
+        if ($Handle -and -not $Handle.IsCompleted) {
+            $null = $PowerShell.BeginStop($null, $null)
+            Write-Log WARN "the window did not close in $WaitSec s - its thread is left to stop on its own"
+            return
+        }
+        if ($PowerShell) { $PowerShell.Dispose() }
+        if ($Runspace) { $Runspace.Dispose() }
+    } catch { Write-Log DEBUG "the window's thread: $($_.Exception.Message)" }
+}
+
 function Start-Gui {
     # Open the window in its own thread and wait (up to 20 s) until it is up. If it does not open, the console shows
     # the run, as before.
+    param([int]$TimeoutSec = 20)
     $sh = [hashtable]::Synchronized(@{ Events = [System.Collections.Concurrent.ConcurrentQueue[object]]::new(); Answer = $null
         Stop = $false; Action = $null; Closed = $false; Ready = $false; Error = $null; CloseRequest = $false })
     $ps = $null; $rs = $null
@@ -3142,16 +3161,16 @@ function Start-Gui {
         $handle = $ps.BeginInvoke()
     } catch {
         Write-Log WARN "the window could not start ($($_.Exception.Message)) - the console shows the run"
-        try { if ($ps) { $ps.Dispose() }; if ($rs) { $rs.Dispose() } } catch { }
+        Stop-GuiThread $ps $rs $null
         return
     }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    while (-not $sh.Ready -and -not $sh.Error -and -not $handle.IsCompleted -and $sw.Elapsed.TotalSeconds -lt 20) { Start-Sleep -Milliseconds 100 }
+    while (-not $sh.Ready -and -not $sh.Error -and -not $handle.IsCompleted -and $sw.Elapsed.TotalSeconds -lt $TimeoutSec) { Start-Sleep -Milliseconds 100 }
     if (-not $sh.Ready -or $sh.Error) {
-        $why = if ($sh.Error) { [string]$sh.Error } elseif ($ps.Streams.Error.Count) { [string]$ps.Streams.Error[0] } elseif ($handle.IsCompleted) { 'it closed' } else { 'no answer in 20 s' }
+        $why = if ($sh.Error) { [string]$sh.Error } elseif ($ps.Streams.Error.Count) { [string]$ps.Streams.Error[0] } elseif ($handle.IsCompleted) { 'it closed' } else { "no answer in $TimeoutSec s" }
         Write-Log WARN "the window did not open ($why) - the console shows the run"
         $sh.CloseRequest = $true
-        try { $ps.Stop(); $ps.Dispose(); $rs.Dispose() } catch { }
+        Stop-GuiThread $ps $rs $handle 3
         return
     }
     $script:Gui = @{ Shared = $sh; PowerShell = $ps; Runspace = $rs; Handle = $handle }
@@ -3165,9 +3184,7 @@ function Close-Gui {
     $g.Shared.CloseRequest = $true
     if ($g.Shared.ErrorCount) { Write-Log WARN ("the window: {0} error(s), the last: {1}" -f $g.Shared.ErrorCount, $g.Shared.LastError) }
     if ($g.Shared.Error) { Write-Log WARN "the window: $($g.Shared.Error)" }
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    while (-not $g.Handle.IsCompleted -and $sw.Elapsed.TotalSeconds -lt 5) { Start-Sleep -Milliseconds 100 }
-    try { if (-not $g.Handle.IsCompleted) { $g.PowerShell.Stop() }; $g.PowerShell.Dispose(); $g.Runspace.Dispose() } catch { }
+    Stop-GuiThread $g.PowerShell $g.Runspace $g.Handle
 }
 
 function Wait-GuiClose {

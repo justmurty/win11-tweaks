@@ -3294,6 +3294,12 @@ function ConvertTo-GuiXml([string]$Text) {
     })
 }
 
+function Get-GuiNow {
+    # Seconds on a clock that only goes forward. Not DateTime: Windows may set the wall clock mid-run - a VM back from a
+    # snapshot, a new PC's first time sync - and the window then showed 2830:02 elapsed (superuser's run, 2026-09-29)
+    [System.Diagnostics.Stopwatch]::GetTimestamp() / [double][System.Diagnostics.Stopwatch]::Frequency
+}
+
 function Get-GuiClock([double]$Seconds) {
     # 0.0, not 0: [math]::Max(0, 3.7) takes the Int32 overload - it rounds 3.7 to 4 first
     $s = [int][math]::Floor([math]::Max(0.0, $Seconds)); '{0:00}:{1:00}' -f [math]::Floor($s / 60), ($s % 60)
@@ -3482,7 +3488,7 @@ function Get-GuiPhase($M, [string]$Name) {
 }
 function Update-GuiModel($M, $Ev) {
     $M.Dirty = $true
-    $now = [DateTime]::UtcNow
+    $now = Get-GuiNow
     switch ([string]$Ev.Type) {
         'setup' {
             $p = $Ev.Payload; $M.Setup = $p; $M.Screen = 'setup'; $M.Version = [string]$p.Version; $M.Log = [string]$p.Log
@@ -3510,7 +3516,7 @@ function Update-GuiModel($M, $Ev) {
         'dotnet'   { if ($Ev.State -eq 'running' -and $M.Net.State -eq 'todo') { $M.Net.State = 'running'; $M.Net.Since = $now } }
         'live'     {
             $since = if ($Ev.Since) { [double]$Ev.Since } else { 0 }
-            $M.Live = @{ Name = [string]$Ev.Name; What = [string]$Ev.What; Clock = [bool]$Ev.Clock; Started = $now.AddSeconds(-$since) }
+            $M.Live = @{ Name = [string]$Ev.Name; What = [string]$Ev.What; Clock = [bool]$Ev.Clock; Started = $now - $since }
         }
         'what'     { if ($M.Live) { $M.Live.What = [string]$Ev.What } }
         'live-end' { $M.Live = $null }
@@ -3807,13 +3813,13 @@ function Invoke-GuiRender {
     if ($offset -gt 0) { $sv = $content.FindName('BodyScroll'); if ($sv) { $sv.ScrollToVerticalOffset($offset) } }
     Start-GuiMotion $content
     $m.Dirty = $false
-    $script:GuiLastRender = [DateTime]::UtcNow
+    $script:GuiLastRender = Get-GuiNow
     Update-GuiClocks
 }
 function Start-GuiMotion($Content) {
     # the live bar slides, the spinner turns - WPF animates them; a redraw picks each up where the last one was
     try {
-        $t = ([DateTime]::UtcNow - $script:GuiT0).TotalSeconds
+        $t = (Get-GuiNow) - $script:GuiT0
         $bar = $Content.FindName('LiveBar')
         if ($bar) {
             $a = New-Object Windows.Media.Animation.DoubleAnimation(0, 74, (New-Object Windows.Duration([TimeSpan]::FromSeconds(1.1))))
@@ -3834,11 +3840,11 @@ function Start-GuiMotion($Content) {
     } catch { Add-GuiError "motion: $($_.Exception.Message)" }
 }
 function Update-GuiClocks {
-    $c = $script:GuiWin.Content; $m = $script:GuiM; $now = [DateTime]::UtcNow
+    $c = $script:GuiWin.Content; $m = $script:GuiM; $now = Get-GuiNow
     if (-not $c) { return }
-    $e = $c.FindName('ElapsedText'); if ($e -and $m.RunStart) { $e.Text = Get-GuiClock (($now - $m.RunStart).TotalSeconds) }
-    $l = $c.FindName('LiveClockText'); if ($l -and $m.Live) { $l.Text = Get-GuiClock (($now - $m.Live.Started).TotalSeconds) }
-    $n = $c.FindName('NetClockText'); if ($n -and $m.Net.Since) { $n.Text = Get-GuiClock (($now - $m.Net.Since).TotalSeconds) }
+    $e = $c.FindName('ElapsedText'); if ($e -and $m.RunStart) { $e.Text = Get-GuiClock ($now - $m.RunStart) }
+    $l = $c.FindName('LiveClockText'); if ($l -and $m.Live) { $l.Text = Get-GuiClock ($now - $m.Live.Started) }
+    $n = $c.FindName('NetClockText'); if ($n -and $m.Net.Since) { $n.Text = Get-GuiClock ($now - $m.Net.Since) }
 }
 function Connect-GuiHandlers($Root) {
     # every element with an action tag (act: / pick: / app: / keep: / cap:) gets the hand cursor and a click
@@ -3900,10 +3906,10 @@ function Save-GuiSnapshot([string]$Name) {
 function Invoke-GuiTestHooks {
     # only with the test variables set: W11T_GUI_AUTOSTART (1 = Gele, newuser = New user) presses Start, W11T_GUI_STOP=apps
     # stops the run in its Apps phase, W11T_GUI_SNAP saves the screens as PNGs, W11T_GUI_AUTOCLOSE closes the window at the end
-    $m = $script:GuiM; $h = $script:GuiHooks; $now = [DateTime]::UtcNow
+    $m = $script:GuiM; $h = $script:GuiHooks; $now = Get-GuiNow
     if ($env:W11T_GUI_AUTOSTART -and $m.Screen -eq 'setup' -and -not $h.Started) {
         if (-not $h.SetupAt) { $h.SetupAt = $now }
-        elseif (($now - $h.SetupAt).TotalSeconds -gt 1.5) {
+        elseif ($now - $h.SetupAt -gt 1.5) {
             if ($env:W11T_GUI_AUTOSTART -eq 'newuser') { $m.Choice.User = 'New user'; Invoke-GuiRender }
             Save-GuiSnapshot 'setup'; $h.Started = $true; Invoke-GuiAction 'act:start'
         }
@@ -3917,7 +3923,7 @@ function Invoke-GuiTestHooks {
     }
     if ($m.Screen -eq 'done' -and -not $h.Done) {
         if (-not $h.DoneAt) { $h.DoneAt = $now }
-        elseif (($now - $h.DoneAt).TotalSeconds -gt 1) {
+        elseif ($now - $h.DoneAt -gt 1) {
             Save-GuiSnapshot 'done'; $h.Done = $true
             if ($env:W11T_GUI_AUTOCLOSE) { Invoke-GuiAction 'act:close' }
         }
@@ -3931,7 +3937,7 @@ function Show-GuiWindow {
     try {
         Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
         $script:GuiShared = $Shared; $script:GuiM = New-GuiModel; $script:GuiAllowClose = $false; $script:GuiHooks = @{}
-        $script:GuiLastRender = [DateTime]::MinValue; $script:GuiT0 = [DateTime]::UtcNow; $script:GuiShown = $false; $script:GuiScreen = ''
+        $script:GuiLastRender = -1e9; $script:GuiT0 = Get-GuiNow; $script:GuiShown = $false; $script:GuiScreen = ''
         $script:GuiFails = 0
         # the window keeps its Windows frame (a shadow, Windows 11's round corners); WindowChrome draws our own title bar
         # over it - a 1px glass edge is what keeps the shadow
@@ -3966,7 +3972,7 @@ function Show-GuiWindow {
                 if ($sh.CloseRequest) { Close-GuiWindowNow; return }
                 $ev = $null; $n = 0
                 while ($n -lt 500 -and $sh.Events.TryDequeue([ref]$ev)) { Update-GuiModel $m $ev; $n++ }
-                if ($m.Dirty -and ([DateTime]::UtcNow - $script:GuiLastRender).TotalMilliseconds -ge 150) { Invoke-GuiRender } else { Update-GuiClocks }
+                if ($m.Dirty -and (Get-GuiNow) - $script:GuiLastRender -ge 0.15) { Invoke-GuiRender } else { Update-GuiClocks }
                 Invoke-GuiTestHooks
                 $script:GuiFails = 0
             } catch {

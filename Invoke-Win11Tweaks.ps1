@@ -3033,8 +3033,17 @@ function Send-GuiEvent {
     # nothing. The run never waits for the window.
     param([string]$Type, [hashtable]$Data = @{})
     if (-not $script:Gui) { return }
+    Write-GuiClicks
     $Data['Type'] = $Type
     $script:Gui.Shared.Events.Enqueue($Data)
+}
+
+function Write-GuiClicks {
+    # What was pressed in the window, with its time - into the log (the window's thread cannot write it). Picked up
+    # whenever the run sends the window something, and when it lets the window go (Close-Gui).
+    if (-not $script:Gui -or -not $script:Gui.Shared.Clicks) { return }
+    $c = $null
+    while ($script:Gui.Shared.Clicks.TryDequeue([ref]$c)) { Write-Log INFO "window: $c" }
 }
 
 function Test-ConsoleQuiet {
@@ -3089,7 +3098,7 @@ function Exit-Console {
 
 function Test-GuiStop {
     # Stop in the window: the run ends here, between two steps - Main's finally writes the summary, as after Ctrl+C
-    if ($script:Gui -and $script:Gui.Shared.Stop) { throw [System.OperationCanceledException]::new('Stopped from the window') }
+    if ($script:Gui -and $script:Gui.Shared.Stop) { Write-GuiClicks; throw [System.OperationCanceledException]::new('Stopped from the window') }
 }
 
 function Get-DetectedMachineType {
@@ -3200,12 +3209,40 @@ function Stop-GuiThread {
     } catch { Write-Log DEBUG "the window's thread: $($_.Exception.Message)" }
 }
 
+function Find-CascadiaMono {
+    # Cascadia Mono on this PC: in Windows' own fonts, or lent by the Windows Terminal app (Windows 11) - the newest one
+    $inbox = Join-Path "$env:SystemRoot\Fonts" 'CascadiaMono.ttf'
+    if (Test-Path -LiteralPath $inbox) { return $inbox }
+    Get-ChildItem "$env:ProgramFiles\WindowsApps" -Directory -Filter 'Microsoft.WindowsTerminal_*_x64__8wekyb3d8bbwe' -ErrorAction SilentlyContinue |
+        Sort-Object CreationTime -Descending | ForEach-Object { Join-Path $_.FullName 'CascadiaMono.ttf' } |
+        Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+}
+
+function Get-GuiTextFont {
+    # The window's text font: Cascadia Mono - from OUR copy. Windows gets it from the Windows Terminal app, and the Store
+    # may update that app mid-run (a new PC's first hour): the old font file goes, and a window still drawing with it
+    # cannot draw text any more (superuser's run, 2026-09-29: black at the next redraw, 78,226 errors). Our copy cannot
+    # go. No Cascadia Mono here: Consolas (a Windows font).
+    try {
+        $src = Find-CascadiaMono
+        if (-not $src) { Write-Log DEBUG 'window font: no Cascadia Mono on this PC - Consolas'; return 'Consolas' }
+        $dir = Join-Path (Join-Path $env:LOCALAPPDATA 'win11-tweaks') 'fonts'
+        $null = New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop
+        $dst = Join-Path $dir 'CascadiaMono.ttf'
+        try { Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop }
+        catch { if (-not (Test-Path -LiteralPath $dst)) { throw } }   # in use by another run's window: that copy is the same font
+        Write-Log DEBUG "window font: our copy of Cascadia Mono (from $src)"
+        return ('{0}#Cascadia Mono, Consolas' -f [Uri]::new($dir.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar, [UriKind]::Absolute).AbsoluteUri)
+    } catch { Write-Log DEBUG "window font: Consolas ($($_.Exception.Message))"; return 'Consolas' }
+}
+
 function Start-Gui {
     # Open the window in its own thread and wait (up to 20 s) until it is up. If it does not open, the console shows
     # the run, as before.
     param([int]$TimeoutSec = 20)
     $sh = [hashtable]::Synchronized(@{ Events = [System.Collections.Concurrent.ConcurrentQueue[object]]::new(); Answer = $null
-        Stop = $false; Action = $null; Closed = $false; Ready = $false; Error = $null; CloseRequest = $false })
+        Stop = $false; Action = $null; Closed = $false; Ready = $false; Error = $null; CloseRequest = $false
+        Clicks = [System.Collections.Concurrent.ConcurrentQueue[string]]::new(); TextFont = (Get-GuiTextFont) })
     $ps = $null; $rs = $null
     try {
         $rs = [runspacefactory]::CreateRunspace()
@@ -3237,9 +3274,11 @@ function Start-Gui {
 function Close-Gui {
     # Let the window go (it closes itself if it is still open) and free its thread
     if (-not $script:Gui) { return }
+    Write-GuiClicks
     $g = $script:Gui; $script:Gui = $null
     $g.Shared.CloseRequest = $true
     if ($g.Shared.ErrorCount) { Write-Log WARN ("the window: {0} error(s), the last: {1}" -f $g.Shared.ErrorCount, $g.Shared.LastError) }
+    if ($g.Shared.FirstError) { Write-Log WARN "the window's first error: $($g.Shared.FirstError)" }
     if ($g.Shared.Error) { Write-Log WARN "the window: $($g.Shared.Error)" }
     Stop-GuiThread $g.PowerShell $g.Runspace $g.Handle
 }
@@ -3863,8 +3902,37 @@ function Add-GuiError([string]$Text) {
     $sh = $script:GuiShared; $sh.ErrorCount = 1 + [int]$sh.ErrorCount; $sh.LastError = $Text
 }
 function Close-GuiWindowNow { $script:GuiAllowClose = $true; $script:GuiWin.Close() }
+function Set-GuiFallbackFont { $script:GuiWin.FontFamily = New-Object Windows.Media.FontFamily('Consolas') }
+function Register-GuiRenderFailure {
+    # A window that cannot draw fails on every frame (a font file gone from under it, 2026-09-29). 10 failures within
+    # 3 s: its text font goes back to Consolas (a Windows font) and it draws again; still failing: the window goes and
+    # the console shows the run. Never a black window that cannot even be closed.
+    $now = Get-GuiNow
+    $script:GuiFailTimes = @(@($script:GuiFailTimes) | Where-Object { $now - $_ -lt 3 }) + @($now)
+    if ($script:GuiFailTimes.Count -lt 10) { return }
+    $script:GuiFailTimes = @()
+    if (-not $script:GuiFontFallback) {
+        $script:GuiFontFallback = $true
+        Add-GuiError 'the window could not draw - its text font is Consolas now'
+        try { Set-GuiFallbackFont; Invoke-GuiRender } catch { }
+    } else {
+        Add-GuiError 'the window still could not draw - it closed, the console shows the run'
+        Close-GuiWindowNow
+    }
+}
+function Add-GuiClick([string]$Tag) {
+    # a button pressed, for the run's log (Write-GuiClicks)
+    $what = switch ($Tag) {
+        'act:start' { 'Start' } 'act:cancel' { 'Cancel' } 'act:log' { 'Log opened' } 'act:close' { 'Close' } 'act:restart' { 'Restart now' }
+        'act:stop' { 'Stop pressed - it asks "Stop after this step?"' } 'act:stop-yes' { 'Stop confirmed - stops after this step' }
+        'act:stop-no' { 'Keep going' } 'cap:close' { 'the X (close) - during the run it asks to stop' } 'cap:min' { 'minimised' }
+        'key:alt-f4' { 'Alt+F4 - during the run it asks to stop' } default { $null }
+    }
+    if ($what -and $script:GuiShared.Clicks) { $script:GuiShared.Clicks.Enqueue(('{0} {1}' -f (Get-Date).ToString('HH:mm:ss'), $what)) }
+}
 function Invoke-GuiAction([string]$Tag) {
     $m = $script:GuiM; $sh = $script:GuiShared
+    Add-GuiClick $Tag
     switch -Regex ($Tag) {
         '^cap:min$'           { $script:GuiWin.WindowState = 'Minimized'; return }
         '^cap:close$'         {
@@ -3938,12 +4006,12 @@ function Show-GuiWindow {
         Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
         $script:GuiShared = $Shared; $script:GuiM = New-GuiModel; $script:GuiAllowClose = $false; $script:GuiHooks = @{}
         $script:GuiLastRender = -1e9; $script:GuiT0 = Get-GuiNow; $script:GuiShown = $false; $script:GuiScreen = ''
-        $script:GuiFails = 0
+        $script:GuiFails = 0; $script:GuiFailTimes = @(); $script:GuiFontFallback = $false
         # the window keeps its Windows frame (a shadow, Windows 11's round corners); WindowChrome draws our own title bar
         # over it - a 1px glass edge is what keeps the shadow
         $script:GuiWin = [Windows.Markup.XamlReader]::Parse(("<Window $GuiNs Title='win11-tweaks' Width='1040' Height='680' ResizeMode='CanMinimize' " +
             "WindowStartupLocation='CenterScreen' Background='$($GuiC.bg)' Topmost='True' UseLayoutRounding='True' SnapsToDevicePixels='True' " +
-            "TextOptions.TextFormattingMode='Display' FontFamily='Cascadia Mono, Consolas'><WindowChrome.WindowChrome><WindowChrome CaptionHeight='40' " +
+            "TextOptions.TextFormattingMode='Display' FontFamily='Consolas'><WindowChrome.WindowChrome><WindowChrome CaptionHeight='40' " +
             "ResizeBorderThickness='0' GlassFrameThickness='0,0,0,1' CornerRadius='0' UseAeroCaptionButtons='False'/></WindowChrome.WindowChrome></Window>"))
         # a small screen (a laptop at 150%): the window fits it, the body scrolls
         $wa = [Windows.SystemParameters]::WorkArea
@@ -3958,12 +4026,19 @@ function Show-GuiWindow {
         })
         $script:GuiWin.Add_Closing({ param($s, $e)
             if (-not $script:GuiAllowClose -and $script:GuiM.Screen -eq 'run') {   # Alt+F4 while it runs: Stop, asked first
-                $e.Cancel = $true; if (-not $script:GuiM.Stopping) { $script:GuiM.ConfirmStop = $true; Invoke-GuiRender }
+                $e.Cancel = $true; Add-GuiClick 'key:alt-f4'; if (-not $script:GuiM.Stopping) { $script:GuiM.ConfirmStop = $true; Invoke-GuiRender }
             }
         })
         $script:GuiWin.Add_Closed({ $script:GuiShared.Closed = $true; try { $script:GuiTimer.Stop() } catch { } })
         $script:GuiWin.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Return' -and $script:GuiM.Screen -eq 'setup') { Invoke-GuiAction 'act:start' } })
-        $script:GuiWin.Dispatcher.Add_UnhandledException({ param($s, $e) Add-GuiError "unhandled: $($e.Exception.Message)"; $e.Handled = $true })
+        # the text font: our own copy of Cascadia Mono (Start-Gui) - set in code, a file:/// location in XAML would need escaping
+        try { $script:GuiWin.FontFamily = New-Object Windows.Media.FontFamily($(if ($Shared.TextFont) { [string]$Shared.TextFont } else { 'Consolas' })) } catch { }
+        $script:GuiWin.Dispatcher.Add_UnhandledException({ param($s, $e)
+            $e.Handled = $true
+            if (-not $script:GuiShared.FirstError) { $script:GuiShared.FirstError = ((($e.Exception.ToString() -split "`r?`n") | Select-Object -First 6) -join ' | ') }
+            Add-GuiError "unhandled: $($e.Exception.Message)"
+            Register-GuiRenderFailure
+        })
         $script:GuiTimer = New-Object Windows.Threading.DispatcherTimer
         $script:GuiTimer.Interval = [TimeSpan]::FromMilliseconds(100)
         $script:GuiTimer.Add_Tick({

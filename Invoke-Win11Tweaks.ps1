@@ -28,8 +28,8 @@
     hardware, not by this answer.) If omitted: ask interactively, or default to 'PC' when non-interactive.
 
 .PARAMETER LogDir
-    Directory for the log file. Default: the script's own folder (fallback: Desktop
-    if the script folder is unknown/unwritable). The log lands right next to the script.
+    Directory for the log file. Default: %TEMP%\win11-tweaks (the Temporary Files tweak leaves it
+    alone; fallback: the Desktop if it cannot be written).
 
 .PARAMETER Console
     The rail in this console instead of the window. The console is also what you get without a
@@ -153,7 +153,7 @@ if (-not $isAdmin) {
             $null = New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop
             $scriptFile = Join-Path $dir 'Invoke-Win11Tweaks.ps1'
             Invoke-WebRequest -Uri $SelfUrl -OutFile $scriptFile -UseBasicParsing -ErrorAction Stop
-            $fwd = @('-LogDir', ('"{0}"' -f [Environment]::GetFolderPath('Desktop')))
+            $fwd = @()   # (the log goes to %TEMP%\win11-tweaks - Get-DefaultLogDir)
         }
         $argList = @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-NoExit','-File',('"{0}"' -f $scriptFile)) + $fwd + @('-Relaunched')   # -NoLogo: the rail starts at the top
         Start-Process -FilePath $psExe -Verb RunAs -ArgumentList $argList
@@ -171,10 +171,23 @@ if (-not (Test-Path 'HKU:\')) {
     New-PSDrive -PSProvider Registry -Name HKU -Root HKEY_USERS -Scope Script -ErrorAction SilentlyContinue | Out-Null
 }
 
-# Log file lands in the SAME folder as the script (easy to find & send back).
-if (-not $LogDir) {
-    $LogDir = if ($PSScriptRoot) { $PSScriptRoot } else { [Environment]::GetFolderPath('Desktop') }
+function Clear-TempFolder {
+    # Everything in a temp folder goes - but our logs: %TEMP%\win11-tweaks (or win11-tweaks_* right in TEMP with
+    # -LogDir %TEMP%), this run's log among them
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return }
+    Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne 'win11-tweaks' -and $_.Name -notlike 'win11-tweaks_*' } |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+function Get-DefaultLogDir {
+    # The logs: %TEMP%\win11-tweaks - out of the way, not on the Desktop (superuser, 2026-09-29). The Temporary Files
+    # tweak leaves that folder alone, so this run's log and the earlier ones stay. No TEMP: the Desktop.
+    if ($env:TEMP) { return (Join-Path $env:TEMP 'win11-tweaks') }
+    return [Environment]::GetFolderPath('Desktop')
+}
+if (-not $LogDir) { $LogDir = Get-DefaultLogDir }
 try { New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction Stop | Out-Null }
 catch { $LogDir = [Environment]::GetFolderPath('Desktop') }
 $script:LogFile = Join-Path $LogDir ("win11-tweaks_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
@@ -1268,9 +1281,9 @@ $script:Tweaks = @(
 
   # Temporary Files ---------------------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksDeleteTempFiles'; Content='Temporary Files - Remove'; Category='Essential'; Apply={
-      Invoke-Step -Id 'WPFTweaksDeleteTempFiles' -Description 'erase TEMP folders' -Action {
-          Remove-Item -Path "$Env:Temp\*"            -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item -Path "$Env:SystemRoot\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+      Invoke-Step -Id 'WPFTweaksDeleteTempFiles' -Description 'erase TEMP folders (not our log folder, win11-tweaks)' -Action {
+          Clear-TempFolder $Env:Temp
+          Clear-TempFolder "$Env:SystemRoot\Temp"
       }
   }}
 

@@ -191,13 +191,15 @@ the console instead (the old view).
 
 ## The log
 
-The log is written **in the same folder as the script**, named:
+The log is written to **`%TEMP%\win11-tweaks\`** (out of the way - not on the Desktop), named:
 
 ```
 win11-tweaks_YYYYMMDD_HHMMSS.log
 ```
 
-The console shows the log path at the end. Lines are timestamped and levelled
+The window shows the log path (and opens it: **Log** / **Open log**), the console shows it at the end. The
+script's own "Temporary Files" cleanup leaves that folder alone, so earlier runs' logs stay too.
+`-LogDir <folder>` puts the log elsewhere. Lines are timestamped and levelled
 (`[DEBUG] [INFO] [OK] [WARN] [ERROR]`), with a summary table at the end. A compact
 `*_results.txt` is written alongside it. The log file always has every detail (use `-Detailed`
 to see it on the console as the run goes).
@@ -218,7 +220,7 @@ default Windows 11 shell use; PowerShell 7 has an open bug where Ctrl+C can skip
 | `-Detailed` | The full log on the console instead of the rail (the log file is always full). |
 | `-Machine PC\|Laptop` | Skip the "PC or Laptop?" question (`Laptop`: Ultimate only on the charger, keeps hibernation and the panel's refresh rate, no NZXT CAM; `PC`: plain Ultimate, no battery tweaks). |
 | `-Reboot` | Reboot 15s after finishing (cancel with Ctrl+C). An unattended run: the console, no window. |
-| `-LogDir <path>` | Different folder for the log (default: the script's folder). |
+| `-LogDir <path>` | Different folder for the log (default: `%TEMP%\win11-tweaks`). |
 
 ## Adding apps
 

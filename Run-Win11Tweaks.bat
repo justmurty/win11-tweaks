@@ -4,7 +4,7 @@ REM  win11-tweaks launcher
 REM  - Self-elevates (UAC), then runs Invoke-Win11Tweaks.ps1 in a
 REM    visible window so you can watch the progress live.
 REM  - Keeps the window open at the end (press a key to close).
-REM  - The log file is written next to the script: win11-tweaks_*.log
+REM  - The log file is written to %TEMP%\win11-tweaks\win11-tweaks_*.log
 REM
 REM  Usage:
 REM    Double-click            -> real run (applies tweaks + installs apps)
@@ -47,7 +47,7 @@ set "RC=%errorlevel%"
 echo.
 echo ============================================================
 echo   Finished ^(exit %RC%^).
-echo   Log file is next to the script:  %HERE%win11-tweaks_*.log
+echo   Log file:  %TEMP%\win11-tweaks\win11-tweaks_*.log
 echo ============================================================
 echo.
 pause

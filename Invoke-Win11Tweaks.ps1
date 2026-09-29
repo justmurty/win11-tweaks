@@ -148,7 +148,7 @@ if (-not $isAdmin) {
             # running via `irm | iex` (no file) -> save the script to a file and relaunch THAT. NOT a new
             # PowerShell with the download-and-run command on its command line: that's exactly what malware
             # does, and Microsoft Defender's ML blocks it as a threat (typed at a prompt it's fine - spawned
-            # it isn't). Outside TEMP, which the "Temporary Files" tweak empties; the log stays on the Desktop.
+            # it isn't). Outside TEMP, which the "Temporary Files" tweak empties (all but its win11-tweaks log folder).
             $dir = Join-Path $env:LOCALAPPDATA 'win11-tweaks'
             $null = New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop
             $scriptFile = Join-Path $dir 'Invoke-Win11Tweaks.ps1'

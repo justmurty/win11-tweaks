@@ -54,7 +54,7 @@ Every detail goes to a log file for later.
     GPU driver Windows only offers 60 Hz, and that driver often arrives during the run (if a screen stayed at
     60 Hz, run the script again once the driver is in).
 
-  New since v1.6.0 (in the one-liner now, in the next release): **a window** that asks the setup
+  New in v1.7.0: **a window** that asks the setup
   questions and shows the run (see [The window](#the-window)), **a call no longer turns the game
   down** (Windows lowers every other sound by 80% while a call runs — set to "Do nothing"), and the
   **clipboard history (Win+V)** is on from the first press (on this PC only, nothing synced to the cloud).

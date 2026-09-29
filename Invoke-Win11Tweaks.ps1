@@ -927,6 +927,37 @@ public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint M
     }
 }
 
+function Get-ForegroundProcess {
+    # The process whose window is in front (it has the keyboard) - $null when there is none, or no desktop
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'Native.Foreground').Type) {
+            Add-Type -Namespace Native -Name Foreground -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern System.IntPtr GetForegroundWindow();
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern uint GetWindowThreadProcessId(System.IntPtr hWnd, out uint processId);
+'@ -ErrorAction Stop
+        }
+        $h = [Native.Foreground]::GetForegroundWindow()
+        if ($h -eq [IntPtr]::Zero) { return $null }
+        $fgPid = [uint32]0; $null = [Native.Foreground]::GetWindowThreadProcessId($h, [ref]$fgPid)
+        return (Get-Process -Id $fgPid -ErrorAction Stop)
+    } catch { return $null }
+}
+
+function Clear-StuckSearch {
+    # Windows' Search window can be stuck in front of everything when a run ends: invisible, yet it takes every click
+    # over the middle of the screen (superuser's run 2026-09-29: the Done screen's "Open log" / "Close" did nothing - the
+    # clicks went to SearchHost; "Restart now", just outside it, worked). Search in front at the end: close it (Windows
+    # starts it again for the next search). Anything else in front is left alone.
+    $p = Get-ForegroundProcess
+    Write-Log DEBUG ('the end: in front is {0}' -f $(if ($p) { "$($p.ProcessName) (pid $($p.Id))" } else { 'nothing' }))
+    if (-not $p -or $p.ProcessName -ne 'SearchHost') { return }
+    if ($script:DryRun) { Write-Log DEBUG '[DRYRUN] would close Windows Search (stuck in front of everything)'; return }
+    try { Stop-Process -Id $p.Id -Force -ErrorAction Stop; Write-Log INFO 'Windows Search was stuck in front of everything (it takes the clicks) - closed it; Windows starts it again for the next search' }
+    catch { Write-Log WARN "Windows Search is stuck in front of everything and could not be closed: $($_.Exception.Message)" }
+}
+
 function Test-AppInstalled {
     # Return $true if the package is already installed, so Install-App can skip it.
     #  - winget list uses a locale-independent EXIT CODE (0 = found) -> catches winget-tracked installs.
@@ -4145,6 +4176,7 @@ finally {
         }
         Write-Summary
         Write-Log INFO ("=========== WIN11-TWEAKS {0} ===========" -f $(if ($script:RunFinished) { 'DONE' } else { 'STOPPED' }))
+        Clear-StuckSearch   # a stuck Windows Search takes the clicks meant for the Done screen (and the desktop)
     }
     # The Pin-Taskbar helper is normally deleted by the Chrome pin - but not when Chrome was left out (New user)
     # or the run was stopped before it. Don't leave it in TEMP.

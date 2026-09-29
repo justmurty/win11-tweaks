@@ -150,10 +150,12 @@ The one-liner (and the `.bat`) open a dark window — nothing to install, it is 
   to finish.
 
 The run itself is the same as in the console — the window only shows it (it has its own thread,
-so it never waits on an installer). While it is open the console stays quiet; at the end the
-console gets the summary line and the log path. Without a desktop (SSH, a service), with
-`-Console`, `-Detailed` or `-Reboot`, or if the window cannot open, the console shows the run
-(below).
+so it never waits on an installer). Once the window is up, the PowerShell window hides behind it:
+the one the one-liner opens for the run closes with the window at the end; your own PowerShell
+window (or the `.bat`'s) comes back with the summary line and the log path. If the window goes
+early or has an error, the console comes back and shows the run. Without a desktop (SSH, a
+service), with `-Console`, `-Detailed` or `-Reboot`, or if the window cannot open, the console
+shows the run (below).
 
 ## The console
 

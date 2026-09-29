@@ -48,7 +48,8 @@ param(
     [switch]$Detailed,   # full/debug console output (default: concise, human-friendly; the LOG FILE is always full)
     [string]$Machine,   # 'PC' or 'Laptop' (validated in Show-Intro, NOT via [ValidateSet] - that breaks `irm|iex`)
     [string]$LogDir,
-    [switch]$Console    # the rail in this console instead of the window
+    [switch]$Console,   # the rail in this console instead of the window
+    [switch]$Relaunched # internal: set by the elevation relaunch below - that console is the run's own, it goes with the window
 )
 
 $ErrorActionPreference = 'Continue'
@@ -104,6 +105,10 @@ $script:Gui                  = $null   # while the window is open: @{ Shared; Po
 $script:UiRow                = $null   # the row the last rail formatter built, for the window (Write-Ui sends it with its line)
 $script:UiPhase              = ''      # the phase the rail is in (Tweaks / Apps / .NET 3.5 / Finishing) - rows go under it
 $script:SummaryLine          = ''      # "Done in 19m 51s . 95 OK . 7 skipped . 0 failed" - for the console when the window closes
+$script:Relaunched           = [bool]$Relaunched   # this console was opened by the elevation relaunch, only for the run
+$script:ConsoleHidden        = $false  # the console is hidden behind the window (Set-ConsoleWindow)
+$script:MainEnded            = $false  # Main got to its end - or was stopped / cancelled; not an error
+$script:ExitWhenDone         = $false  # the run's own console closes at the very end (Exit-Console)
 # Console glyphs - made at run time, so this file stays pure ASCII. Only characters Cascadia Mono AND Consolas have: the
 # old console (conhost) has no fallback font, so anything else (rounded corners, check marks, braille spinners) shows as a box.
 $script:G = @{
@@ -150,7 +155,7 @@ if (-not $isAdmin) {
             Invoke-WebRequest -Uri $SelfUrl -OutFile $scriptFile -UseBasicParsing -ErrorAction Stop
             $fwd = @('-LogDir', ('"{0}"' -f [Environment]::GetFolderPath('Desktop')))
         }
-        $argList = @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-NoExit','-File',('"{0}"' -f $scriptFile)) + $fwd   # -NoLogo: the rail starts at the top
+        $argList = @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-NoExit','-File',('"{0}"' -f $scriptFile)) + $fwd + @('-Relaunched')   # -NoLogo: the rail starts at the top
         Start-Process -FilePath $psExe -Verb RunAs -ArgumentList $argList
         exit   # elevated instance launched -> close THIS original (non-admin) window
     } catch {
@@ -278,6 +283,7 @@ function Write-Ui {
     if ($script:Gui -and $script:Gui.Shared.Closed -and -not $script:Gui.Replayed) {
         # the window went before the end (it failed): the console takes over - with the rail so far, once
         $script:Gui.Replayed = $true
+        Set-ConsoleWindow -Show
         foreach ($l in $script:UiLines) { Write-Markup $l }
     }
     $script:UiLines.Add($Markup)
@@ -3031,6 +3037,35 @@ function Test-ConsoleQuiet {
     return [bool]($script:Gui -and -not $script:Gui.Shared.Closed)
 }
 
+function Set-ConsoleWindow {
+    # The console behind the window: hidden while the window shows the run (superuser: "only the window"), shown again
+    # when it is needed - the window went early, or it is your own console at the end. -Show only undoes our own hide.
+    # (Windows Terminal may only minimise it.) No console (SSH, ISE): nothing.
+    param([switch]$Show)
+    if ($Show -and -not $script:ConsoleHidden) { return }
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'Native.ConsoleWindow').Type) {
+            Add-Type -Namespace Native -Name ConsoleWindow -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll")]
+public static extern System.IntPtr GetConsoleWindow();
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+'@ -ErrorAction Stop
+        }
+        $h = [Native.ConsoleWindow]::GetConsoleWindow()
+        if ($h -eq [IntPtr]::Zero) { return }
+        $null = [Native.ConsoleWindow]::ShowWindow($h, $(if ($Show) { 5 } else { 0 }))   # SW_SHOW / SW_HIDE
+        $script:ConsoleHidden = -not $Show
+        Write-Log DEBUG $(if ($Show) { 'console shown again' } else { 'console hidden behind the window' })
+    } catch { Write-Log DEBUG "console window left as is: $($_.Exception.Message)" }
+}
+
+function Exit-Console {
+    # The console the elevation relaunch opened (its -NoExit would keep it) goes with the window - nothing left in it
+    Write-Log DEBUG 'the run is over and its window closed - its own console closes too'
+    [Environment]::Exit(0)
+}
+
 function Test-GuiStop {
     # Stop in the window: the run ends here, between two steps - Main's finally writes the summary, as after Ctrl+C
     if ($script:Gui -and $script:Gui.Shared.Stop) { throw [System.OperationCanceledException]::new('Stopped from the window') }
@@ -3175,6 +3210,7 @@ function Start-Gui {
     }
     $script:Gui = @{ Shared = $sh; PowerShell = $ps; Runspace = $rs; Handle = $handle }
     Write-Log INFO 'the window is open (-Console keeps the rail in the console)'
+    Set-ConsoleWindow   # only the window from now on
 }
 
 function Close-Gui {
@@ -3189,12 +3225,17 @@ function Close-Gui {
 
 function Wait-GuiClose {
     # The window shows how the run went until it is closed. "Restart now" in it restarts the PC (never in a dry run).
+    # -Quiet: the console was opened only for the run (the elevation relaunch) - when the window saw the run to its end
+    # without errors, the console goes too (Exit-Console at the very end); else it comes back with the summary and log.
+    param([switch]$Quiet)
     if (-not $script:Gui) { return }
     $sh = $script:Gui.Shared
     while (-not $sh.Closed -and -not $sh.Action -and -not $script:Gui.Handle.IsCompleted) { Start-Sleep -Milliseconds 200 }
     $action = $sh.Action; $replayed = [bool]$script:Gui.Replayed
     Close-Gui
-    if (-not $replayed) {   # (a window that went early: the console already shows the whole rail, the summary with it)
+    if ($Quiet -and -not $replayed -and -not $sh.Error -and -not $sh.ErrorCount) { $script:ExitWhenDone = $true }
+    elseif (-not $replayed) {   # (a window that went early: the console already shows the whole rail, the summary with it)
+        Set-ConsoleWindow -Show
         if ($script:SummaryLine) { Write-Host ('  ' + $script:SummaryLine) }
         Write-Host ('  Log  ' + $script:LogFile) -ForegroundColor DarkGray
     }
@@ -3920,7 +3961,7 @@ try {
     Set-QuickEdit                       # a click into the window must not pause the run (restored in finally)
     if (Test-GuiMode) { Start-Gui }     # the window (no desktop, -Console, -Detailed, or it fails to open: the console rail)
     Show-Intro
-    if ($script:Cancelled) { return }   # user answered "n" to Continue
+    if ($script:Cancelled) { $script:MainEnded = $true; return }   # user answered "n" to Continue
     $script:RunStarted = $true          # from here on the summary is written - also if the run is stopped (see finally)
     $script:RunClock = [System.Diagnostics.Stopwatch]::StartNew()
     Write-Banner
@@ -3935,9 +3976,11 @@ try {
     Enable-DotNetFeatures     # finish .NET 3.5 (usually already done) + .NET 4
     Invoke-Tweaks -Late       # last: what must wait for the installers (VBScript) and for .NET 3.5 (old components) - DISM is free again here
     $script:RunFinished = $true
+    $script:MainEnded = $true
 }
 catch [System.OperationCanceledException] {
     Write-Log WARN 'Stopped from the window.'   # Stop in the window (Test-GuiStop) - the summary below says what ran
+    $script:MainEnded = $true
 }
 finally {
     # The summary is written HERE so it also lands when the run is stopped early with Ctrl+C - e.g. during
@@ -3958,10 +4001,21 @@ finally {
     try { Stop-Transcript | Out-Null } catch { }
     if ($script:SavedPrefs) { $ProgressPreference = $script:SavedPrefs.Progress; $WarningPreference = $script:SavedPrefs.Warning }   # the window's own settings
     # the window: it shows the summary until it is closed (Restart now restarts) - or, cancelled at the start, it goes
+    # (the console the relaunch opened goes with it - unless something went wrong: then it shows what)
     if ($script:Gui) {
-        if ($script:RunStarted) { Wait-GuiClose }
-        else { Close-Gui; if ($script:Cancelled) { Write-Markup "  {r:Cancelled - nothing was changed.}" } }
+        $quiet = $script:Relaunched -and $script:MainEnded
+        if ($script:RunStarted) { Wait-GuiClose -Quiet:$quiet }
+        else {
+            $gsh = $script:Gui.Shared
+            Close-Gui
+            if ($quiet -and $script:Cancelled -and -not $gsh.Error -and -not $gsh.ErrorCount) { $script:ExitWhenDone = $true }
+            else { Set-ConsoleWindow -Show; if ($script:Cancelled) { Write-Markup "  {r:Cancelled - nothing was changed.}" } }
+        }
     }
+    if (-not $script:ExitWhenDone) { Set-ConsoleWindow -Show }   # whatever happened: never leave the console hidden
+    # HERE, not after the finally: Cancel leaves Main with `return`, and that skips everything after it (no -Reboot
+    # with the window, so nothing is lost)
+    if ($script:ExitWhenDone) { Exit-Console }
 }
 if ($script:RunFinished -and $Reboot -and -not $script:DryRun) {
     Write-Log WARN "Rebooting in 15s (-Reboot given). Press Ctrl+C to cancel."

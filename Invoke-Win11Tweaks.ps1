@@ -280,12 +280,7 @@ function Write-Ui {
     param([string]$Markup = '', [switch]$Always)
     if (-not ($script:Ui -or $Always)) { return }
     Clear-Live
-    if ($script:Gui -and $script:Gui.Shared.Closed -and -not $script:Gui.Replayed) {
-        # the window went before the end (it failed): the console takes over - with the rail so far, once
-        $script:Gui.Replayed = $true
-        Set-ConsoleWindow -Show
-        foreach ($l in $script:UiLines) { Write-Markup $l }
-    }
+    Resume-Console
     $script:UiLines.Add($Markup)
     $r = $script:UiRow; $script:UiRow = $null
     if ($r -and $r.Markup -eq $Markup) {
@@ -294,11 +289,21 @@ function Write-Ui {
     Write-Markup $Markup
 }
 
+function Resume-Console {
+    # The window went before the end (it failed): the console takes over - shown again, with the rail so far, once.
+    # From Write-Ui AND Show-Live: a long step (the .NET 3.5 wait) only redraws its live line.
+    if (-not ($script:Gui -and $script:Gui.Shared.Closed -and -not $script:Gui.Replayed)) { return }
+    $script:Gui.Replayed = $true
+    Set-ConsoleWindow -Show
+    foreach ($l in $script:UiLines) { Write-Markup $l }
+}
+
 function Show-Live {
     # The live line: the step running now, redrawn in place on ONE console line (padded, so a shorter text leaves
     # nothing of the longer one behind)
     param([string]$Markup)
     if (-not $script:Ui) { return }
+    Resume-Console
     $script:UiLive = $Markup
     if ((Test-ConsoleQuiet) -or -not (Test-LiveConsole)) { return }
     $w = Get-UiWidth
@@ -3037,26 +3042,42 @@ function Test-ConsoleQuiet {
     return [bool]($script:Gui -and -not $script:Gui.Shared.Closed)
 }
 
-function Set-ConsoleWindow {
-    # The console behind the window: hidden while the window shows the run (superuser: "only the window"), shown again
-    # when it is needed - the window went early, or it is your own console at the end. -Show only undoes our own hide.
-    # (Windows Terminal may only minimise it.) No console (SSH, ISE): nothing.
-    param([switch]$Show)
-    if ($Show -and -not $script:ConsoleHidden) { return }
-    try {
-        if (-not ([System.Management.Automation.PSTypeName]'Native.ConsoleWindow').Type) {
-            Add-Type -Namespace Native -Name ConsoleWindow -MemberDefinition @'
+function Get-ConsoleInfo {
+    # This process's console window and how many programs share the console (the .bat: cmd.exe + powershell.exe = 2)
+    if (-not ([System.Management.Automation.PSTypeName]'Native.ConsoleWindow').Type) {
+        Add-Type -Namespace Native -Name ConsoleWindow -MemberDefinition @'
 [System.Runtime.InteropServices.DllImport("kernel32.dll")]
 public static extern System.IntPtr GetConsoleWindow();
+[System.Runtime.InteropServices.DllImport("kernel32.dll")]
+public static extern uint GetConsoleProcessList(uint[] processList, uint processCount);
 [System.Runtime.InteropServices.DllImport("user32.dll")]
 public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
 '@ -ErrorAction Stop
-        }
-        $h = [Native.ConsoleWindow]::GetConsoleWindow()
-        if ($h -eq [IntPtr]::Zero) { return }
-        $null = [Native.ConsoleWindow]::ShowWindow($h, $(if ($Show) { 5 } else { 0 }))   # SW_SHOW / SW_HIDE
-        $script:ConsoleHidden = -not $Show
-        Write-Log DEBUG $(if ($Show) { 'console shown again' } else { 'console hidden behind the window' })
+    }
+    $list = New-Object 'uint32[]' 16
+    return @{ Handle = [Native.ConsoleWindow]::GetConsoleWindow(); Processes = [int][Native.ConsoleWindow]::GetConsoleProcessList($list, 16) }
+}
+
+function Set-ConsoleVisible {
+    # SW_SHOW / SW_HIDE; returns whether the window WAS visible
+    param([IntPtr]$Handle, [bool]$Visible)
+    return [bool][Native.ConsoleWindow]::ShowWindow($Handle, $(if ($Visible) { 5 } else { 0 }))
+}
+
+function Set-ConsoleWindow {
+    # The console behind the window: hidden while the window shows the run (superuser: "only the window"), shown again
+    # when it is needed - the window went early, or it is your own console at the end. Only a console that is this
+    # run's alone (not the .bat's, where cmd waits on a `pause` - it must never be left hidden) and only if it was
+    # visible: -Show undoes our own hide, nothing else. (Windows Terminal may keep its window.) No console: nothing.
+    param([switch]$Show)
+    if ($Show -and -not $script:ConsoleHidden) { return }
+    try {
+        $c = Get-ConsoleInfo
+        if ($c.Handle -eq [IntPtr]::Zero) { return }
+        if ($Show) { $null = Set-ConsoleVisible $c.Handle $true; $script:ConsoleHidden = $false; Write-Log DEBUG 'console shown again'; return }
+        if ($c.Processes -gt 1) { Write-Log DEBUG "console shared with another program ($($c.Processes) - the .bat's cmd) - left as it is"; return }
+        $script:ConsoleHidden = Set-ConsoleVisible $c.Handle $false
+        if ($script:ConsoleHidden) { Write-Log DEBUG 'console hidden behind the window' }
     } catch { Write-Log DEBUG "console window left as is: $($_.Exception.Message)" }
 }
 
@@ -3239,7 +3260,15 @@ function Wait-GuiClose {
         if ($script:SummaryLine) { Write-Host ('  ' + $script:SummaryLine) }
         Write-Host ('  Log  ' + $script:LogFile) -ForegroundColor DarkGray
     }
-    if ($action -eq 'restart' -and -not $script:DryRun) { Write-Log INFO 'Restart now - from the window'; Restart-Computer -Force }
+    if ($action -eq 'restart' -and -not $script:DryRun) {
+        Write-Log INFO 'Restart now - from the window'
+        try { Restart-Computer -Force -ErrorAction Stop }
+        catch {   # (e.g. another user is signed in) - the console that was about to close stays to say so
+            Write-Log ERROR "Restart now failed: $($_.Exception.Message)"
+            if ($script:ExitWhenDone) { $script:ExitWhenDone = $false; Set-ConsoleWindow -Show; if ($script:SummaryLine) { Write-Host ('  ' + $script:SummaryLine) } }
+            Write-Host "  Restart now failed: $($_.Exception.Message) - restart the PC yourself." -ForegroundColor Yellow
+        }
+    }
 }
 
 # The window's own code - it runs in the window's thread (Start-Gui adds the call to Show-GuiWindow), never here. Functions

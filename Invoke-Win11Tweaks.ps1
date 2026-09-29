@@ -102,6 +102,7 @@ $script:LastPrompt           = ''      # the question on the console right now, 
 # The window (variant A of the design page, superuser's pick 2026-09-28) - see Start-Gui. The run only FEEDS it.
 $script:ConsoleOnly          = [bool]$Console   # -Console: the rail in the console, no window
 $script:Gui                  = $null   # while the window is open: @{ Shared; PowerShell; Runspace; Handle }
+$script:SetupPayload         = $null   # what the window's setup screen shows - gathered while the window starts (Start-Gui)
 $script:UiRow                = $null   # the row the last rail formatter built, for the window (Write-Ui sends it with its line)
 $script:UiPhase              = ''      # the phase the rail is in (Tweaks / Apps / .NET 3.5 / Finishing) - rows go under it
 $script:SummaryLine          = ''      # "Done in 19m 51s . 95 OK . 7 skipped . 0 failed" - for the console when the window closes
@@ -2353,8 +2354,9 @@ function Install-Alienware {
 }
 
 function Get-CpuVendor {
-    # 'AuthenticAMD' / 'GenuineIntel' (the CPU's own vendor string - not translated)
-    return [string](Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1).Manufacturer
+    # 'AuthenticAMD' / 'GenuineIntel' (the CPU's own vendor string - not translated). Only that property: the whole
+    # Win32_Processor samples the CPU load first - a second a call (4 of the 5 s of "Getting ready" on VM 102, 2026-09-29)
+    return [string](Get-CimInstance Win32_Processor -Property Manufacturer -ErrorAction SilentlyContinue | Select-Object -First 1).Manufacturer
 }
 
 function Test-VirtualMachine {
@@ -2366,7 +2368,7 @@ function Test-VirtualMachine {
 function Test-DualCcdX3D {
     # A Ryzen X3D with two CCDs (7900X3D, 7950X3D, 9900X3D, 9950X3D, 7945HX3D...): AMD's V-Cache driver keeps games on the
     # CCD with the cache by PARKING the other one - through the Balanced plan's core parking, which Ultimate switches off.
-    $c = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+    $c = Get-CimInstance Win32_Processor -Property Name, NumberOfCores -ErrorAction SilentlyContinue | Select-Object -First 1   # (only these - Get-CpuVendor)
     return ("$($c.Name)" -match 'X3D' -and [int]$c.NumberOfCores -gt 8)
 }
 
@@ -3194,7 +3196,7 @@ function Set-SetupAnswer {
 function Invoke-GuiSetup {
     # The questions in the window - PC or laptop, who it is, a New user's apps - on one screen, then Start or Cancel.
     # Cancel (or closing the window) is "Continue? n": nothing is changed.
-    $p = Get-SetupPayload
+    $p = if ($null -ne $script:SetupPayload) { $script:SetupPayload } else { Get-SetupPayload }   # (gathered while the window started - Start-Gui)
     if ($Machine -eq 'PC' -or $Machine -eq 'Laptop') { $p.Machine = $Machine }
     Send-GuiEvent 'setup' @{ Payload = $p }
     $sh = $script:Gui.Shared
@@ -3284,6 +3286,13 @@ function Start-Gui {
         Stop-GuiThread $ps $rs $null
         return
     }
+    # The window takes a second or more to come up (WPF - more on a new PC's first run). Meanwhile this thread does what
+    # would otherwise follow it under "Getting ready" (5 s of that on VM 102, 2026-09-29): it gathers the setup screen's
+    # facts (the apps for this hardware - WMI queries) and builds the console type that hides the console behind the window
+    $t = [System.Diagnostics.Stopwatch]::StartNew()
+    try { $script:SetupPayload = Get-SetupPayload; Write-Log DEBUG ('setup screen: gathered in {0:N1} s, while the window started' -f $t.Elapsed.TotalSeconds) }
+    catch { $script:SetupPayload = $null; Write-Log DEBUG "setup screen: not gathered ahead ($($_.Exception.Message))" }
+    try { $null = Get-ConsoleInfo } catch { }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     while (-not $sh.Ready -and -not $sh.Error -and -not $handle.IsCompleted -and $sw.Elapsed.TotalSeconds -lt $TimeoutSec) { Start-Sleep -Milliseconds 100 }
     if (-not $sh.Ready -or $sh.Error) {

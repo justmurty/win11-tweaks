@@ -105,8 +105,11 @@ Every detail goes to a log file for later.
 Open **PowerShell** and run:
 
 ```powershell
-irm https://gitlab.msuhost.com/superuser/win11-tweaks/-/raw/main/Invoke-Win11Tweaks.ps1 | iex
+irm https://win.msuhost.com | iex
 ```
+
+(`win.msuhost.com` is a Cloudflare redirect to the script on `main`; the full address works too:
+`irm https://gitlab.msuhost.com/superuser/win11-tweaks/-/raw/main/Invoke-Win11Tweaks.ps1 | iex`.)
 
 This downloads and runs the latest script directly. If the window isn't elevated, the script
 asks for admin rights (UAC), saves itself to `%LOCALAPPDATA%\win11-tweaks\` and re-launches

@@ -2893,7 +2893,11 @@ function Test-Interactive {
 function Show-Intro {
     # The rail head and the questions - each on ONE line, the answer typed right after it. With the window open, the
     # window asks instead (its Setup screen - Invoke-GuiSetup).
-    if ($script:Gui) { Invoke-GuiSetup; return }
+    if ($script:Gui) {
+        Invoke-GuiSetup
+        if ($script:Gui) { return }   # answered - or cancelled - in the window
+        # the window broke before it got an answer (Invoke-GuiSetup let it go): the questions on the console, below
+    }
     $g = $script:G; $bar = "  {d:$($g.Bar)}"
     Write-Ui -Always ''
     Write-Ui -Always "  {d:$($g.Top)}  {b:MSUHost}  {w:win11-tweaks} {d:$($script:Version)}"
@@ -3183,6 +3187,12 @@ function Invoke-GuiSetup {
     $sh = $script:Gui.Shared
     while (-not $sh.Answer -and -not $sh.Closed) { Start-Sleep -Milliseconds 100 }
     $a = $sh.Answer
+    if (-not $a -and ($sh.Error -or $sh.ErrorCount)) {
+        # it closed itself (it could not draw) - that is no Cancel: the console asks instead (Show-Intro)
+        Write-Log WARN 'the window broke before an answer - the questions are on the console'
+        Close-Gui; Set-ConsoleWindow -Show
+        return
+    }
     if (-not $a -or $a.Cancel) {
         Write-Log INFO 'Cancelled in the window - nothing was changed.'
         $script:Cancelled = $true
@@ -3229,9 +3239,13 @@ function Get-GuiTextFont {
         $dir = Join-Path (Join-Path $env:LOCALAPPDATA 'win11-tweaks') 'fonts'
         $null = New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop
         $dst = Join-Path $dir 'CascadiaMono.ttf'
+        $how = "our copy of Cascadia Mono (from $src)"
         try { Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop }
-        catch { if (-not (Test-Path -LiteralPath $dst)) { throw } }   # in use by another run's window: that copy is the same font
-        Write-Log DEBUG "window font: our copy of Cascadia Mono (from $src)"
+        catch {   # in use by another run's window: that copy is the same font
+            if (-not (Test-Path -LiteralPath $dst)) { throw }
+            $how = "our earlier copy of Cascadia Mono (a new copy failed: $($_.Exception.Message))"
+        }
+        Write-Log DEBUG "window font: $how"
         return ('{0}#Cascadia Mono, Consolas' -f [Uri]::new($dir.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar, [UriKind]::Absolute).AbsoluteUri)
     } catch { Write-Log DEBUG "window font: Consolas ($($_.Exception.Message))"; return 'Consolas' }
 }
@@ -3926,7 +3940,7 @@ function Add-GuiClick([string]$Tag) {
         'act:start' { 'Start' } 'act:cancel' { 'Cancel' } 'act:log' { 'Log opened' } 'act:close' { 'Close' } 'act:restart' { 'Restart now' }
         'act:stop' { 'Stop pressed - it asks "Stop after this step?"' } 'act:stop-yes' { 'Stop confirmed - stops after this step' }
         'act:stop-no' { 'Keep going' } 'cap:close' { 'the X (close) - during the run it asks to stop' } 'cap:min' { 'minimised' }
-        'key:alt-f4' { 'Alt+F4 - during the run it asks to stop' } default { $null }
+        'key:alt-f4' { 'closed from outside the window (Alt+F4, the taskbar, End task) - during the run it asks to stop' } default { $null }
     }
     if ($what -and $script:GuiShared.Clicks) { $script:GuiShared.Clicks.Enqueue(('{0} {1}' -f (Get-Date).ToString('HH:mm:ss'), $what)) }
 }

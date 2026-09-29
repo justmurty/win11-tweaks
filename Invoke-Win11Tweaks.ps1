@@ -3481,8 +3481,14 @@ function New-GuiSpinner([double]$Size = 13, [string]$Margin = '0,0,6,0') {
         "<Path Data='M12,4.5 A7.5,7.5 0 1 1 4.5,12' Stroke='$($GuiC.blue)' StrokeThickness='2.4' StrokeStartLineCap='Round' StrokeEndLineCap='Round'/></Canvas></Viewbox>"
 }
 function Get-GuiTitleBar($M) {
-    $cap = { param($glyph, $tag, $hover)
-        "<Border Tag='$tag' Width='46' WindowChrome.IsHitTestVisibleInChrome='True'>$(New-GuiHover 'Transparent' $hover)$(New-GuiGlyph $glyph 10 $GuiC.tx2)</Border>" }
+    # min / close like Windows' own: the glyph in the middle of its 46 px box, the box lit under the mouse, the X white on
+    # red (the glyph takes its colour from the box - TextElement.Foreground - so the trigger can change it)
+    $cap = { param($glyph, $tag, $hover, $hoverFg)
+        "<Border Tag='$tag' Width='46' WindowChrome.IsHitTestVisibleInChrome='True'><Border.Style><Style TargetType='Border'>" +
+            "<Setter Property='Background' Value='Transparent'/><Setter Property='TextElement.Foreground' Value='$($GuiC.tx2)'/><Style.Triggers>" +
+            "<Trigger Property='IsMouseOver' Value='True'><Setter Property='Background' Value='$hover'/><Setter Property='TextElement.Foreground' Value='$hoverFg'/>" +
+            "</Trigger></Style.Triggers></Style></Border.Style>" +
+            "<TextBlock Text='&#x$glyph;' FontFamily='$GuiIcons' FontSize='10' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>" }
     $ver = if ($M.Version) { ' ' + (ConvertTo-GuiXml $M.Version) } else { '' }
     @"
 <Grid Grid.Row='0' Height='40'>
@@ -3493,7 +3499,7 @@ function Get-GuiTitleBar($M) {
     $(New-GuiText 'MSUHost' $GuiC.tx 12.5 'Bold' '9,0,0,0')
     $(New-GuiText "win11-tweaks$ver" $GuiC.tx3 12.5 'Normal' '9,0,0,0')
   </StackPanel>
-  <StackPanel Orientation='Horizontal' HorizontalAlignment='Right'>$(& $cap 'E921' 'cap:min' $GuiC.hover)$(& $cap 'E8BB' 'cap:close' $GuiC.close)</StackPanel>
+  <StackPanel Orientation='Horizontal' HorizontalAlignment='Right'>$(& $cap 'E921' 'cap:min' $GuiC.hover $GuiC.tx)$(& $cap 'E8BB' 'cap:close' $GuiC.close '#FFFFFF')</StackPanel>
 </Grid>
 "@
 }

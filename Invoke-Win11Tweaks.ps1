@@ -4163,7 +4163,7 @@ function Get-GuiSetupParts($M) {
     $act = $p.Activation
     if ($act -and -not $act.Activated) {   # Windows not activated (superuser, 2026-09-30): a box that opens Settings > Activation at Start
         $wRight = (New-GuiText 'not activated' $GuiC.warn 12) + (New-GuiRight (' {0} {1}' -f [char]0xB7, [string]$act.Edition))   # (New-GuiRight escapes)
-        $body += New-GuiNode 'notice' (New-GuiTitle 'Windows') $wRight (& $row 'Activation' (& $chip 'Add the key and activate' ([bool]$ch.OpenActivation) 'pick:activation') '' '')
+        $body += New-GuiNode 'notice' (New-GuiTitle 'Windows') $wRight (& $row 'Activation' (& $chip 'Windows 11 Pro' ([bool]$ch.OpenActivation) 'pick:activation') '' '')
     }
     $body += New-GuiNode 'ask' (& $q 'Apps') $right $rows -Last
     $foot = @($(if ($apps.Count -and $on -eq $apps.Count) { "all $on apps" } else { "$on apps" }))

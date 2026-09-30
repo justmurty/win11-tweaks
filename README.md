@@ -80,14 +80,17 @@ Every detail goes to a log file for later.
   they are.
 - The window lists **every app, picked**: click one to leave it out, a row's name (Games, Tools...) for
   the whole row, **Deselect all** / **Select all**. **Drivers & hardware** lists only what this PC's
-  hardware needs. The apps taken off show as SKIPPED "not selected".
-  Visual C++, DirectX and .NET 3.5 always go in. On the console (no window) everything goes in.
+  hardware needs. The run lists only what it installs: the apps taken off, and the ones for hardware
+  this PC does not have, are in the log only. Visual C++, DirectX (Microsoft's End-User Runtime - the
+  D3DX / XInput / XAudio files older games and MSI Afterburner need) and .NET 3.5 always go in. On the
+  console (no window) everything goes in.
 - Then the **install phase**: **12 Visual C++ redists** + **20 winget apps**
   (incl. VLC, Lightshot, TurboTop, WinRAR, TreeSize, qBittorrent, MSI Afterburner; **iTunes** and **Apple
   Devices** from the Microsoft Store, the way Apple offers them for Windows 11; **NZXT CAM** only
   where an NZXT device is found) + **direct downloads** from the vendor (**Google Chrome**, **Bitwarden**,
   **Parsec**, **Google Play Games**, **FL Studio**, **U.GG**, **Rockstar Games Launcher**, **Razer
-  Synapse** — Razer's own parts, silent —, **Vencord** into the signed-in user's Discord; **NVIDIA App**
+  Synapse** — just Synapse and Razer App Engine it runs on, silent —, **Vencord** into the signed-in
+  user's Discord; **NVIDIA App**
   only if an NVIDIA GPU is present — found by its PCI ID, so also before its driver is in) + on a PC the
   **drivers from the maker's own site** (not Windows Update), picked by the hardware: **AMD Chipset
   Software** on a Ryzen board, **Intel Chipset Device Software** on an Intel one plus **Intel Driver &
@@ -166,7 +169,7 @@ The one-liner (and the `.bat`) open a dark window — nothing to install, it is 
   the next ones), .NET 3.5 (downloading in the background next to the apps), Finishing. **Log**
   opens the log; **Stop** asks first, then stops after the step running now (an installer that
   has started finishes) — the summary covers what ran.
-- **Done** — how it went (OK · skipped · failed), every app with its time or why not, what needs a
+- **Done** — how it went (OK · skipped · failed), every app it installed with its time, what needs a
   look, what to do now. **Open log**, **Close**, and **Restart now** when Windows needs a restart
   to finish.
 
@@ -256,7 +259,7 @@ hardware only goes in `$script:HardwareApps` (with its check).
   GPU is present.
 - **Vencord** comes from the Vencord organisation's GitHub releases (its command-line installer — not
   code-signed, Vencord says so on its page). It patches the signed-in user's Discord and closes
-  Discord for that; without Discord it is SKIPPED "needs Discord".
+  Discord for that; without Discord it is left out (the log says "needs Discord").
 - Some direct installers return a non-standard exit code even on success (FL Studio returns
   `1223`), so the script verifies the actual install via Add/Remove Programs instead of trusting
   the exit code.

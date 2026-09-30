@@ -21,11 +21,12 @@
     run: the console shows it (no window).
 
 .PARAMETER Machine
-    'PC' or 'Laptop'. Skips the interactive "PC or Laptop?" question at startup. A laptop skips
-    the PC-only items: the Ultimate Performance power plan (a laptop gets Ultimate on the charger +
-    Balanced on battery instead), hibernation off, the highest monitor refresh rate and NZXT CAM; a PC
-    skips the laptop-only items (that power plan, no network while asleep on battery). (Alienware Command Center goes by the actual
-    hardware, not by this answer.) If omitted: ask interactively, or default to 'PC' when non-interactive.
+    'PC' or 'Laptop' - overrides what the script detects (the case and the firmware say it; a battery
+    only when they say nothing - a desktop's UPS is a battery to Windows too). A laptop skips the PC-only
+    items: the Ultimate Performance power plan (a laptop keeps Windows' own plan), hibernation off, the
+    highest monitor refresh rate and the chipset / Radeon drivers; a PC skips the laptop-only items (no
+    network while asleep on battery). The apps for hardware (NZXT CAM, Alienware Command Center, Armoury
+    Crate...) go by the hardware itself, not by this.
 
 .PARAMETER LogDir
     Directory for the log file. Default: %TEMP%\win11-tweaks (the Temporary Files tweak leaves it
@@ -66,20 +67,21 @@ $script:Detailed             = [bool]$Detailed
 $script:NeedExplorerRestart  = $false
 $script:NeedIconCacheClear   = $false
 $script:Cancelled            = $false   # set by Show-Intro if the user answers "n" (avoids `exit`, which kills an iex host)
-$script:MachineType          = ''      # 'PC' or 'Laptop' - resolved in Show-Intro; a laptop skips the PC-only tweaks/apps
+$script:MachineType          = ''      # 'PC' or 'Laptop' - detected (or -Machine) before the run; a laptop skips the PC-only tweaks/apps
 $script:WarnCount            = 0       # WARN lines logged so far - a tweak that logs one is reported WARN, not OK
 $script:RunStarted           = $false  # past the intro -> Main's finally writes the summary (also after Ctrl+C)
 $script:RunFinished          = $false  # got to the end without being stopped
 $script:DotNet35Proc         = $null   # background DISM process for .NET 3.5 (started early, finished at the end)
 $script:PinHelper            = $null   # Pin-Taskbar helper path (kept after Invoke-TaskbarPins for the Chrome pin)
 $script:ChromePinned         = $false  # set by Add-ChromeTaskbarPin (right after Chrome installs) - Main refreshes the taskbar if true
-$script:NotSelected          = @{}     # apps a "New user" said n to (winget ID / direct-app Name / vendor Id) - the install phase skips them
-$script:KeepApps             = @{}     # built-in apps a "New user" keeps (appx name -> label) - the app removal leaves them
+$script:NotSelected          = @{}     # apps taken off the window's list (winget ID / direct-app Name / vendor Id) - the install phase skips them
+$script:PnpIds               = $null   # every device's ID (PCI\VEN_..., USB\VID_...), read once per run - Get-PnpIds
+$script:DetectedWhy          = ''      # why the machine is a PC or a laptop, in words - for the log (Get-DetectedMachineType)
 $script:SettingsPagesHidden  = @()     # Settings pages hidden so far in this run (SettingsPageVisibility is one merged string)
 $script:ConsoleModeSaved     = $null   # console input mode before Set-QuickEdit turned QuickEdit off (put back at the end)
 $script:Results              = [System.Collections.Generic.List[object]]::new()
 # The console view ("Rail", superuser's pick from the design page, 2026-09-28) - see Write-Ui
-$script:Version              = '1.7.0' # on the rail head and in the window's title bar - bumped with every release
+$script:Version              = '1.8.0' # on the rail head and in the window's title bar - bumped with every release
 $script:Ui                   = -not $script:Detailed   # the console shows the rail; -Detailed puts the full log there instead
 # Cmdlets' own warnings would print straight onto the rail's live line (superuser's run, 2026-09-28: DISM's "WARNING:
 # Restart is suppressed because NoRestart is specified.") - off in the rail view; -Detailed shows the other cmdlet warnings
@@ -97,7 +99,7 @@ $script:ItemNote             = ''      # what an installer says about the app it
 $script:ItemFail             = ''      # ... or why it failed ('winget exit code 0x8A150011')
 $script:RunClock             = $null   # started when the run starts ("Done in 19m 29s")
 $script:DotNet35Clock        = $null   # started with the .NET 3.5 download
-$script:UserLabel            = 'Gele'  # "Gele" / "New user, 14 of 21 apps" - on the machine line
+$script:AppsLabel            = ''      # "all 27 apps" / "24 of 27 apps" - on the machine line (Set-AppsLabel)
 $script:LastPrompt           = ''      # the question on the console right now, as plain text
 # The window (variant A of the design page, superuser's pick 2026-09-28) - see Start-Gui. The run only FEEDS it.
 $script:ConsoleOnly          = [bool]$Console   # -Console: the rail in the console, no window
@@ -883,12 +885,6 @@ function Set-LaptopPowerPlan {
     Write-Log DEBUG ("power plan '{0}' ({1}) active - {2} battery settings taken from Balanced" -f $name, $guid, $n) $Id
 }
 
-function Test-KeepLegacyPlayer {
-    # Windows Media Player Legacy is the last video player on the PC when a New user said n to VLC AND to keeping
-    # Media Player - then it stays. (Gele always gets VLC.)
-    return ($script:NotSelected.ContainsKey('VideoLAN.VLC') -and -not $script:KeepApps.ContainsKey('Microsoft.ZuneMusic'))
-}
-
 function Invoke-Step {
     param([string]$Description, [scriptblock]$Action, [string]$Id = '')
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would run: $Description" $Id; return }
@@ -1322,19 +1318,17 @@ $script:Tweaks = @(
   # Unwanted Pre-Installed Apps ---------------------------------------------------
   [pscustomobject]@{ Id='WPFTweaksDeBloat'; Content='Unwanted Pre-Installed Apps - Remove'; Category='Essential'; Apply={
       $id='WPFTweaksDeBloat'
-      # (Microsoft.GetHelp is NOT removed: the troubleshooters in Settings > System > Troubleshoot open through it.)
+      # (Microsoft.GetHelp is NOT removed: the troubleshooters in Settings > System > Troubleshoot open through it. Paint
+      # and Media Player stay too - superuser, 2026-09-30.)
       $apps = @(
           'Microsoft.WindowsFeedbackHub','Microsoft.BingNews','Microsoft.BingSearch',
           'Microsoft.BingWeather','Clipchamp.Clipchamp','Microsoft.Todos','Microsoft.PowerAutomateDesktop',
           'Microsoft.MicrosoftSolitaireCollection','Microsoft.WindowsSoundRecorder','Microsoft.MicrosoftStickyNotes',
-          'Microsoft.Windows.DevHome','Microsoft.Paint','Microsoft.OutlookForWindows','Microsoft.WindowsAlarms',
-          'Microsoft.StartExperiencesApp','Microsoft.ZuneMusic',
+          'Microsoft.Windows.DevHome','Microsoft.OutlookForWindows','Microsoft.WindowsAlarms',
+          'Microsoft.StartExperiencesApp',
           'MicrosoftCorporationII.QuickAssist','MSTeams'
       )
-      foreach ($a in $apps) {
-          if ($script:KeepApps.ContainsKey($a)) { Write-Log INFO ("Keeping {0} (the New user wants it)" -f $script:KeepApps[$a]) $id; continue }
-          Remove-Appx -Id $id -Name $a
-      }
+      foreach ($a in $apps) { Remove-Appx -Id $id -Name $a }
       Invoke-Step -Id $id -Description 'uninstall classic Teams' -Action {
           $t = "$Env:LocalAppData\Microsoft\Teams\Update.exe"
           if (Test-Path $t) {
@@ -1852,7 +1846,7 @@ $script:Tweaks = @(
   }}
 
   # Old Windows components nobody uses at home (42-47, 50) - they come back from Settings > System > Optional
-  # features. Windows Media Player Legacy stays when it's the last video player (see Test-KeepLegacyPlayer).
+  # features. (Windows Media Player Legacy can go: the new Media Player is never removed.)
   # LATE, after .NET 3.5: removing IE mode / Work Folders leaves Windows waiting for a restart, and while it waits
   # it holds every new feature back until the restart too - .NET 3.5 included (superuser's VM run, 2026-09-27).
   [pscustomobject]@{ Id='CustomRemoveComponents'; Content='Old Windows components - Remove (Steps Recorder, IE mode...)'; Category='Custom'; Late=$true; Apply={
@@ -1863,16 +1857,10 @@ $script:Tweaks = @(
       Remove-WinCapability -Id $id -Name 'Microsoft.Windows.PowerShell.ISE' -Label 'PowerShell ISE'
       Remove-WinCapability -Id $id -Name 'Print.Management.Console' -Label 'Print Management'
       Disable-WinFeature   -Id $id -Name 'WorkFolders-Client' -Label 'Work Folders'
-      $kept = Test-KeepLegacyPlayer
-      if ($kept) {
-          Write-Log INFO 'Keeping Windows Media Player Legacy - no VLC and no Media Player, it is the only video player left' $id
-      } else {
-          Remove-WinCapability -Id $id -Name 'Media.WindowsMediaPlayer' -Label 'Windows Media Player Legacy'
-          Disable-WinFeature   -Id $id -Name 'WindowsMediaPlayer' -Label 'Windows Media Player Legacy (feature)'
-      }
+      Remove-WinCapability -Id $id -Name 'Media.WindowsMediaPlayer' -Label 'Windows Media Player Legacy'
+      Disable-WinFeature   -Id $id -Name 'WindowsMediaPlayer' -Label 'Windows Media Player Legacy (feature)'
       $n = $script:UiRemoved.Count
       $note = if ($n) { '{0} removed' -f $n } else { 'nothing left to remove' }   # which ones: the log (superuser: no list on the line)
-      if ($kept) { $note = 'Media Player Legacy kept (the last video player); ' + $note }
       if (-not $script:DryRun) { Set-UiNote $id $note }
   }}
 
@@ -1944,8 +1932,8 @@ $script:AppsToInstall = @(
     'SavardSoftware.TurboTop',           # always-on-top helper (on winget, not the savardsoftware.com exe)
     'RARLab.WinRAR'
 )
-# Vendor apps: installed automatically (a New user is asked, as for every app) but ONLY on that vendor's
-# hardware, desktop or laptop alike (Hardware is a regex against Win32_ComputerSystem "<Manufacturer> <Model>"):
+# Vendor apps: installed (picked, like every app in the window's list) but ONLY on that vendor's hardware, desktop or
+# laptop alike (Hardware is a regex against Win32_ComputerSystem "<Manufacturer> <Model>", or Require a test):
 #   Alienware Command Center -> Alienware / Dell G-series (msstore - the Store only offers it there; if the
 #                               Store install fails, Install-Alienware falls back to Dell's direct installer).
 #                               Older G models have no "Dell " in the model ("Dell Inc. G5 5500"), newer ones
@@ -1954,17 +1942,19 @@ $script:AppsToInstall = @(
 $script:VendorApps = @(
     @{ Id='9PMHP03NJ9QP'; Name='Alienware Command Center'; Vendor='Alienware/Dell G'; Hardware='Alienware|^Dell\b.*\bG\d{1,2}\s+\d{4}\b'; Source='msstore' }
 )
-# Apps for ONE machine type only (the "PC or Laptop?" answer) - skipped on the other, like the Machine='PC'
-# tweaks. Keyed by winget ID.
-$script:AppMachine = @{
-    'NZXT.CAM' = 'PC'   # NZXT coolers / fans / cases - a desktop thing
+# winget apps that need their hardware (like the direct apps' Require) - SKIPPED with the reason where it isn't there.
+# Keyed by winget ID.
+$script:AppRequire = @{
+    'NZXT.CAM' = @{ Require = { Test-NzxtHardware }; RequireMsg = 'no NZXT device' }   # NZXT coolers, fans, cases, keyboards
 }
-# Runtimes in $script:AppsToInstall: installed for EVERY user - never offered in the "New user" app questions
-# (games and apps need them; the Visual C++ redists and .NET 3.5 aren't in the app lists at all).
+# The apps for the hardware in this machine (superuser, 2026-09-30: detected, not a question). They are in the window's
+# list - picked, in their own row - only where their hardware is found; the install phase checks it again. Keys as the
+# install phase knows them: winget ID / direct-app Name / vendor-app Id.
+$script:HardwareApps = @('NZXT.CAM', 'NVIDIA App', 'AMD Chipset Software', 'Intel Chipset Device Software', 'AMD Software Adrenalin', '9PMHP03NJ9QP')
+$script:HardwareGroup = 'Drivers & hardware'   # their row in the window
+# Runtimes in $script:AppsToInstall: installed for EVERY machine - never in the window's list (games and apps need them;
+# the Visual C++ redists and .NET 3.5 aren't in the app lists at all).
 $script:RuntimeApps = @('Microsoft.DirectX')
-# Built-in apps the "Unwanted Pre-Installed Apps" tweak removes that a New user may keep instead - asked after the
-# install questions (Enter = keep). Gele isn't asked: they go, as always. Keyed by appx name -> label.
-$script:NewUserKeepApps = [ordered]@{ 'Microsoft.Paint' = 'Paint'; 'Microsoft.ZuneMusic' = 'Media Player' }
 # What the script remembers between runs on this PC: the date the promo apps were removed (CustomRemoveMoreApps) and the
 # GUIDs of the power plans it made (PcPowerPlan / LaptopPowerPlan).
 $script:StateKey = 'HKLM:\SOFTWARE\win11-tweaks'
@@ -2150,15 +2140,15 @@ $script:AppNames = @{
     'SavardSoftware.TurboTop'          = 'TurboTop'
     'RARLab.WinRAR'                    = 'WinRAR'
 }
-# The window's app picker (a New user) shows the apps in these groups, in this order - keys as Get-AppChoices gives them
-# (winget ID / direct-app Name / vendor-app Id). An app in no group lands in "Other".
+# The window's app list shows the apps in these rows, in this order - keys as Get-AppChoices gives them (winget ID /
+# direct-app Name / vendor-app Id). The hardware apps found here get their own row ($script:HardwareGroup); an app in no
+# row lands in "Other".
 $script:AppGroups = [ordered]@{
-    'Games'              = @('Valve.Steam', 'EpicGames.EpicGamesLauncher', 'Blizzard.BattleNet', 'Ubisoft.Connect', 'Google Play Games')
-    'Chat & streaming'   = @('Discord.Discord', 'OBSProject.OBSStudio', 'Parsec')
-    'Media'              = @('VideoLAN.VLC', 'FL Studio')
-    'Tools'              = @('RARLab.WinRAR', 'RevoUninstaller.RevoUninstaller', 'Skillbrains.Lightshot', 'CPUID.HWMonitor', 'NZXT.CAM', 'SavardSoftware.TurboTop')
-    'Browser & cloud'    = @('Google Chrome', 'Bitwarden', 'Nextcloud.NextcloudDesktop')
-    'Drivers & hardware' = @('NVIDIA App', 'AMD Chipset Software', 'Intel Chipset Device Software', 'AMD Software Adrenalin', '9PMHP03NJ9QP')
+    'Games'            = @('Valve.Steam', 'EpicGames.EpicGamesLauncher', 'Blizzard.BattleNet', 'Ubisoft.Connect', 'Google Play Games')
+    'Chat & streaming' = @('Discord.Discord', 'OBSProject.OBSStudio', 'Parsec')
+    'Media'            = @('VideoLAN.VLC', 'FL Studio')
+    'Tools'            = @('RARLab.WinRAR', 'RevoUninstaller.RevoUninstaller', 'Skillbrains.Lightshot', 'CPUID.HWMonitor', 'SavardSoftware.TurboTop')
+    'Internet'         = @('Google Chrome', 'Bitwarden', 'Nextcloud.NextcloudDesktop')
 }
 
 # --------------------------------------------------------------------------------------
@@ -2181,13 +2171,13 @@ function Write-Banner {
     Write-Log DEBUG ("os={0}  build={1}" -f $os.Caption, $os.BuildNumber)
     Write-Log DEBUG ("psver={0}  mode={1}" -f $PSVersionTable.PSVersion, ($(if ($script:DryRun) {'DRYRUN'} else {'APPLY'})))
     Write-Log DEBUG ("logfile={0}" -f $script:LogFile)
-    # the rail: "  |- WIN11-TEST . Windows 11 Pro 25H2 (26200) . PC . Gele"
+    # the rail: "  |- WIN11-TEST . Windows 11 Pro 25H2 (26200) . PC . all 27 apps"
     $g = $script:G
     $osName = Get-OsName -Os $os
     $pcName = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'this PC' }
-    Send-GuiEvent 'banner' @{ Machine = $pcName; Os = (Get-Visible $osName); MachineType = $script:MachineType; User = $script:UserLabel; DryRun = [bool]$script:DryRun; Log = $script:LogFile }
+    Send-GuiEvent 'banner' @{ Machine = $pcName; Os = (Get-Visible $osName); MachineType = $script:MachineType; User = $script:AppsLabel; DryRun = [bool]$script:DryRun; Log = $script:LogFile }
     Write-Ui "  {d:$($g.Bar)}"
-    $bits = @($osName, $script:MachineType, $script:UserLabel | ForEach-Object { "{d:$($g.Dot)} $_" })
+    $bits = @(@($osName, $script:MachineType, $script:AppsLabel) | Where-Object { $_ } | ForEach-Object { "{d:$($g.Dot)} $_" })
     Write-Ui ("  {d:$($g.Tee)$($g.Rule)} {w:$pcName} " + ($bits -join ' '))
     if ($script:DryRun) { Write-Ui "  {d:$($g.Bar)}  {y:DRY RUN - nothing will be changed}" }
 }
@@ -2403,11 +2393,47 @@ function Test-DualCcdX3D {
     return ("$($c.Name)" -match 'X3D' -and [int]$c.NumberOfCores -gt 8)
 }
 
+function Get-PnpIds {
+    # Every device's ID (PCI\VEN_..., USB\VID_..., HID\VID_...) - read ONCE per run and kept: the hardware checks ask for
+    # it several times, and the whole Win32_PnPEntity class takes a moment. Only the ID (see Get-CpuVendor).
+    if ($null -eq $script:PnpIds) {
+        $script:PnpIds = @(Get-CimInstance Win32_PnPEntity -Property DeviceID -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.DeviceID })
+    }
+    return $script:PnpIds
+}
+
 function Test-PciVendor {
     # Is there a PCI device from this vendor ('1022' AMD, '8086' Intel, '10DE' NVIDIA, '1002' AMD graphics)? A VM on an
     # AMD host reports an AMD CPU but has only emulated devices - AMD's chipset installer would refuse there.
     param([string]$Vendor)
-    return [bool](Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object { $_.DeviceID -like "PCI\VEN_$Vendor*" } | Select-Object -First 1)
+    return [bool](@(Get-PnpIds) | Where-Object { $_ -like "PCI\VEN_$Vendor*" } | Select-Object -First 1)
+}
+
+function Test-UsbVendor {
+    # A USB device from this vendor ('1E71' NZXT) - the device itself or its HID part
+    param([string]$Vendor)
+    return [bool](@(Get-PnpIds) | Where-Object { $_ -like "USB\VID_$Vendor*" -or $_ -like "HID\VID_$Vendor*" } | Select-Object -First 1)
+}
+
+function Get-Board {
+    # "<Manufacturer> <Product>" of the motherboard. A home-built PC says "System manufacturer / System Product Name" in
+    # Win32_ComputerSystem - the board is where its maker shows (ASUS ROG STRIX..., NZXT N7...).
+    $b = Get-CimInstance Win32_BaseBoard -Property Manufacturer, Product -ErrorAction SilentlyContinue | Select-Object -First 1
+    return ("{0} {1}" -f $b.Manufacturer, $b.Product).Trim()
+}
+
+function Test-NzxtHardware {
+    # What NZXT CAM is for: a Kraken cooler, a Smart Device / RGB & Fan controller (also inside NZXT cases), an NZXT keyboard
+    # or mouse - all USB vendor 1E71 - or an NZXT board / an NZXT-built PC
+    if (Test-UsbVendor '1E71') { return $true }
+    return (((Get-Hardware) -match '(?i)\bNZXT\b') -or ((Get-Board) -match '(?i)\bNZXT\b'))
+}
+
+function Test-Gate {
+    # A hardware requirement (a Require scriptblock): $true only if it answers yes - an error is a no
+    param([scriptblock]$Require)
+    $met = $false; try { $met = [bool](& $Require) } catch { }
+    return $met
 }
 
 function Test-GpuVendor {
@@ -2425,7 +2451,7 @@ function Get-Hardware {
 }
 
 function Skip-NotSelected {
-    # A "New user" said n to this app (or wasn't offered it): log it, record it as SKIPPED and return $true
+    # This app was taken off the window's list: log it, record it as SKIPPED and return $true
     # (the caller moves on).
     param([string]$Key, [string]$Content, [string]$Label)
     if (-not ($script:NotSelected -and $script:NotSelected.ContainsKey($Key))) { return $false }
@@ -2467,27 +2493,31 @@ function Write-AppLine {
 
 function Get-InstallPlan {
     # The apps this run will go through, in order - the window lists the ones still to come (queued). The apps the
-    # install phase skips outright (other machine type, not selected, not this vendor's hardware) are not in it.
+    # install phase skips outright (taken off the list, other machine type, their hardware not here) are not in it.
     param([string]$Hardware = (Get-Hardware))
     $plan = [System.Collections.Generic.List[string]]::new()
     $take = { param($key) -not ($script:NotSelected -and $script:NotSelected.ContainsKey($key)) }
     if (Get-Command winget -ErrorAction SilentlyContinue) {
         if ($script:VCRedists.Count) { $plan.Add("Visual C++ 2005$($script:G.Dash)2022") }
         foreach ($id in $script:AppsToInstall) {
-            $only = $script:AppMachine[$id]
-            if (($only -and $only -ne $script:MachineType) -or -not (& $take $id)) { continue }
-            $plan.Add($(if ($script:AppNames.ContainsKey($id)) { $script:AppNames[$id] } else { $id }))
+            $req = $script:AppRequire[$id]
+            if (-not (& $take $id) -or ($req -and -not (Test-Gate $req.Require))) { continue }
+            $plan.Add((Get-AppLabel $id))
         }
     }
-    foreach ($d in $script:DirectApps) { if (-not ($d.Machine -and $d.Machine -ne $script:MachineType) -and (& $take $d.Name)) { $plan.Add($d.Name) } }
-    foreach ($a in $script:VendorApps) { if ($Hardware -match $a.Hardware -and (& $take $a.Id)) { $plan.Add($a.Name) } }
+    foreach ($d in $script:DirectApps) {
+        if (($d.Machine -and $d.Machine -ne $script:MachineType) -or -not (& $take $d.Name)) { continue }
+        if ($script:HardwareApps -contains $d.Name -and $d.Require -and -not (Test-Gate $d.Require)) { continue }
+        $plan.Add($d.Name)
+    }
+    foreach ($a in $script:VendorApps) { if (-not (Get-VendorAppMiss $a $Hardware) -and (& $take $a.Id)) { $plan.Add($a.Name) } }
     $plan
 }
 
 function Invoke-InstallPhase {
     Write-Log INFO "=========== INSTALLING APPS ==========="
     Write-UiPhase 'Apps'
-    $notSelected = [System.Collections.Generic.List[string]]::new()   # a New user's "n" apps - one rail line at the end
+    $notSelected = [System.Collections.Generic.List[string]]::new()   # the apps taken off the list - one rail line at the end
     $hw = Get-Hardware
     if ($script:Gui) { Send-GuiEvent 'plan' @{ Apps = @(Get-InstallPlan -Hardware $hw) } }
 
@@ -2514,12 +2544,12 @@ function Invoke-InstallPhase {
         }
         foreach ($id in $script:AppsToInstall) {
             Test-GuiStop   # Stop in the window: before the next app
-            $label = if ($script:AppNames.ContainsKey($id)) { $script:AppNames[$id] } else { $id }
-            $only = $script:AppMachine[$id]
-            if ($only -and $only -ne $script:MachineType) {   # e.g. NZXT CAM is PC only
-                Write-Log INFO ("Skipping {0} ({1} only)" -f $label, $only)
-                $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status='SKIPPED'; Detail="$only only" })
-                Write-Ui (Format-ItemLine -Name $label -Status 'SKIPPED' -Note "$only only")
+            $label = Get-AppLabel $id
+            $req = $script:AppRequire[$id]
+            if ($req -and -not (Test-Gate $req.Require)) {   # e.g. NZXT CAM with no NZXT device
+                Write-Log INFO ("Skipping {0} ({1})" -f $label, $req.RequireMsg)
+                $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status='SKIPPED'; Detail=[string]$req.RequireMsg })
+                Write-Ui (Format-ItemLine -Name $label -Status 'SKIPPED' -Note ([string]$req.RequireMsg))
                 continue
             }
             if (Skip-NotSelected -Key $id -Content $id -Label $label) { $notSelected.Add($label); continue }   # no icon / WinRAR license either
@@ -2538,7 +2568,7 @@ function Invoke-InstallPhase {
         Write-Ui (Format-ItemLine -Name 'winget' -Status 'FAILED' -Note 'not found: install App Installer from the Store, then run again')
     }
 
-    # Non-winget apps (direct vendor download): Bitwarden, Parsec, NVIDIA App (GPU only)
+    # Non-winget apps (direct vendor download): Chrome, Bitwarden, Parsec... and the drivers (their hardware only)
     foreach ($d in $script:DirectApps) {
         Test-GuiStop
         if ($d.Machine -and $d.Machine -ne $script:MachineType) {   # e.g. the chipset / Radeon drivers are PC only
@@ -2547,16 +2577,12 @@ function Invoke-InstallPhase {
             Write-Ui (Format-ItemLine -Name $d.Name -Status 'SKIPPED' -Note "$($d.Machine) only")
             continue
         }
-        if (Skip-NotSelected -Key $d.Name -Content $d.Name -Label $d.Name) {   # no icon / Chrome pin either
-            if ($script:NotSelected[$d.Name] -eq 'not offered') { Write-Ui (Format-ItemLine -Name $d.Name -Status 'SKIPPED' -Note $(if ($d.RequireMsg) { $d.RequireMsg } else { 'not offered' })) }
-            else { $notSelected.Add($d.Name) }
-            continue
-        }
+        if (Skip-NotSelected -Key $d.Name -Content $d.Name -Label $d.Name) { $notSelected.Add($d.Name); continue }   # no icon / Chrome pin either
         $from = $script:Results.Count + 1
         $script:ItemNote = ''; $script:ItemFail = ''
         Start-LiveItem -Name $d.Name -What 'downloading' -NoClock   # Invoke-WebRequest blocks - no clock to tick
         $st = Install-DirectDownload @d
-        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$d.Name; Content=$d.Name; Status=$st; Detail=$(if ($st -eq 'FAILED' -and $script:ItemFail) { $script:ItemFail } else { 'direct' }) })
+        $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$d.Name; Content=$d.Name; Status=$st; Detail=$(if ($st -eq 'FAILED' -and $script:ItemFail) { $script:ItemFail } elseif ($st -eq 'SKIPPED' -and $script:ItemNote) { $script:ItemNote } else { 'direct' }) })
         if ($st -eq 'OK' -and $script:DesktopShortcutApps.ContainsKey($d.Name)) { $sc = $script:DesktopShortcutApps[$d.Name]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
         if ($d.Name -eq 'Google Chrome') { $script:ChromePinned = Add-ChromeTaskbarPin }   # pin Chrome to the taskbar RIGHT AFTER it installs
         Write-AppLine -Name $d.Name -Status $st -From $from
@@ -2564,14 +2590,15 @@ function Invoke-InstallPhase {
 
     # (WinRAR license is created right after WinRAR installs, in the loop above - see Set-WinRarLicense.)
 
-    # Vendor apps LAST - installed (a New user was asked) ONLY on that vendor's hardware, desktop or laptop alike:
+    # Vendor apps LAST - installed ONLY on that vendor's hardware, desktop or laptop alike:
     #   Alienware Command Center -> Alienware / Dell G-series.
     foreach ($a in $script:VendorApps) {
         Test-GuiStop
-        if ($hw -notmatch $a.Hardware) {   # NOT a failure - just not this vendor's machine
-            Write-Log DEBUG "$($a.Name): skipped (not $($a.Vendor) hardware: '$hw')"
-            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail="not $($a.Vendor) hardware" })
-            Write-Ui (Format-ItemLine -Name $a.Name -Status 'SKIPPED' -Note "not $($a.Vendor) hardware")
+        $miss = Get-VendorAppMiss $a $hw
+        if ($miss) {   # NOT a failure - just not this vendor's machine
+            Write-Log DEBUG "$($a.Name): skipped (${miss}: '$hw')"
+            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail=$miss })
+            Write-Ui (Format-ItemLine -Name $a.Name -Status 'SKIPPED' -Note $miss)
             continue
         }
         if (Skip-NotSelected -Key $a.Id -Content $a.Name -Label $a.Name) { $notSelected.Add($a.Name); continue }
@@ -2937,12 +2964,13 @@ function Test-Interactive {
 }
 
 function Show-Intro {
-    # The rail head and the questions - each on ONE line, the answer typed right after it. With the window open, the
-    # window asks instead (its Setup screen - Invoke-GuiSetup).
+    # The rail head and "Continue?" - then the machine type (detected, or -Machine) and the app list: on the console
+    # everything goes in (taking apps off the list is the window's job). With the window open, the window asks instead
+    # (its Setup screen - Invoke-GuiSetup).
     if ($script:Gui) {
         Invoke-GuiSetup
         if ($script:Gui) { return }   # answered - or cancelled - in the window
-        # the window broke before it got an answer (Invoke-GuiSetup let it go): the questions on the console, below
+        # the window broke before it got an answer (Invoke-GuiSetup let it go): the console, below
     }
     $g = $script:G; $bar = "  {d:$($g.Bar)}"
     Write-Ui -Always ''
@@ -2957,101 +2985,113 @@ function Show-Intro {
             return
         }
     }
-    # Machine type - a laptop skips the PC-only items (Ultimate Performance, hibernation off, NZXT CAM). (Alienware Command
-    # Center goes by the actual hardware instead - see Invoke-InstallPhase.)
-    if ($Machine -eq 'PC' -or $Machine -eq 'Laptop') {
-        $script:MachineType = if ($Machine -eq 'Laptop') { 'Laptop' } else { 'PC' }
-    } elseif (Test-Interactive) {
-        $mt = Read-Choice -Title 'PC or laptop?' -Options 'PC', 'Laptop'
-        $script:MachineType = if ($mt -eq '2') { 'Laptop' } else { 'PC' }   # $null (no keyboard) -> PC
-    } else {
-        $script:MachineType = 'PC'   # non-interactive default (override with -Machine PC|Laptop)
-    }
-    # Who is it? Gele gets the full app set, as always. A New user answers (Y/n) for every app BEFORE anything
-    # is downloaded; after the last answer the run goes on unattended. Non-interactive = Gele.
-    $newUser = $false
-    if (Test-Interactive) {
-        $newUser = (Read-Choice -Title 'Who is it?' -Options 'Gele', 'New user') -eq '2'   # $null (no keyboard) -> Gele
-        if ($newUser) { $sel = Read-AppSelection }
-    }
-    Write-Log INFO ("Machine type: {0}" -f $script:MachineType)
-    if ($newUser) {
-        $kept = @($script:NewUserKeepApps.Keys | Where-Object { $script:KeepApps.ContainsKey($_) } | ForEach-Object { $script:NewUserKeepApps[$_] })
-        $keeps = if ($kept) { ', keeps ' + ($kept -join ' + ') } else { '' }
-        Write-Log INFO ("User: New user - {0} of {1} apps selected{2}" -f $sel.Picked, $sel.Asked, $keeps)
-        $script:UserLabel = 'New user, {0} of {1} apps' -f $sel.Picked, $sel.Asked
-    }
-    else { Write-Log INFO "User: Gele - installing all apps"; $script:UserLabel = 'Gele' }
+    $mc = Get-MachineChoice
+    $script:MachineType = $mc.Type
+    Write-Log INFO ("Machine type: {0} ({1})" -f $mc.Type, $mc.Why)
+    $hw = @(Get-HardwareApps)
+    Write-HardwareLog $hw
+    Set-AppsLabel -Total (@(Get-AppChoices).Count + @($hw | Where-Object { $_.Found }).Count)
 }
 
-function Read-Choice {
-    # A one-line menu in colour - "  ?  Title  1 PC  2 Laptop  >" - asked again until a valid number is typed. Returns
-    # that number as a string, or $null when there's no keyboard (input redirected: Read-Host gives nothing back), so the
-    # caller falls back to its default instead of asking forever.
-    param([string]$Title, [string[]]$Options)
-    $opts = @(for ($i = 0; $i -lt $Options.Count; $i++) { "{b:$($i + 1)} $($Options[$i])" }) -join '  '
-    do { $ans = Read-Answer "  {b:?}  {w:$Title}  $opts  {b:$($script:G.Next)} " }
-    until ($null -eq $ans -or ($ans -match '^\s*\d+\s*$' -and [int]$ans -ge 1 -and [int]$ans -le $Options.Count))
-    if ($null -eq $ans) { return $null }
-    return $ans.Trim()
+function Get-DetectedMachineType {
+    # PC or laptop, by what the machine says it is: its case (Laptop, Notebook, Convertible...) or its firmware's power
+    # profile (Mobile). A battery decides only when the case says nothing (Other / Unknown - a VM): a desktop's UPS is a
+    # "battery" to Windows too. Why goes into $script:DetectedWhy (the log).
+    $portable = @{ 8 = 'Portable'; 9 = 'Laptop'; 10 = 'Notebook'; 11 = 'Hand Held'; 12 = 'Docking Station'; 14 = 'Sub Notebook'; 30 = 'Tablet'; 31 = 'Convertible'; 32 = 'Detachable' }
+    $desktop = @{ 3 = 'Desktop'; 4 = 'Low Profile Desktop'; 5 = 'Pizza Box'; 6 = 'Mini Tower'; 7 = 'Tower'; 13 = 'All in One'; 15 = 'Space-saving'; 16 = 'Lunch Box'; 24 = 'Sealed-case PC'; 35 = 'Mini PC'; 36 = 'Stick PC' }
+    $cs = Get-CimInstance Win32_ComputerSystem -Property PCSystemType -ErrorAction SilentlyContinue | Select-Object -First 1
+    $cases = @(Get-CimInstance Win32_SystemEnclosure -Property ChassisTypes -ErrorAction SilentlyContinue | ForEach-Object { @($_.ChassisTypes) } |
+        Where-Object { $null -ne $_ } | ForEach-Object { [int]$_ })
+    $lap = @($cases | Where-Object { $portable.ContainsKey($_) })
+    if ($lap) { $script:DetectedWhy = 'a laptop case ({0})' -f $portable[$lap[0]]; return 'Laptop' }
+    if ([int]$cs.PCSystemType -eq 2) { $script:DetectedWhy = 'a Mobile power profile'; return 'Laptop' }
+    $known = @($cases | Where-Object { $_ -gt 2 })
+    if ($known) { $script:DetectedWhy = 'a desktop case ({0})' -f $(if ($desktop.ContainsKey($known[0])) { $desktop[$known[0]] } else { "type $($known[0])" }); return 'PC' }
+    $bat = $false; try { $bat = @(Get-CimInstance Win32_Battery -ErrorAction Stop).Count -gt 0 } catch { }
+    if ($bat) { $script:DetectedWhy = 'a battery'; return 'Laptop' }
+    $script:DetectedWhy = 'no battery'; return 'PC'
+}
+
+function Get-MachineChoice {
+    # PC or laptop: -Machine when it was given, else what the machine says it is - and why, for the log
+    if ($Machine -eq 'PC' -or $Machine -eq 'Laptop') { return @{ Type = $(if ($Machine -eq 'Laptop') { 'Laptop' } else { 'PC' }); Why = 'set by -Machine' } }
+    $t = Get-DetectedMachineType
+    return @{ Type = $t; Why = "detected - $($script:DetectedWhy)" }
+}
+
+function Get-AppLabel([string]$Id) {
+    # an app's name as people know it (a winget ID has a friendly name; direct / vendor apps are their name already)
+    if ($script:AppNames.ContainsKey($Id)) { return $script:AppNames[$Id] }
+    return $Id
 }
 
 function Get-AppChoices {
-    # The apps a New user is asked about, in install order: the winget apps (minus the runtimes and the apps
-    # for the other machine type), the direct downloads whose gate passes (NVIDIA App only with an NVIDIA card)
-    # and the vendor apps for this hardware (Alienware Command Center on Alienware / Dell G).
-    # Key = what the install phase looks up in $script:NotSelected.
+    # The apps in the window's list, in install order: the winget apps (not the runtimes) and the direct downloads. The
+    # hardware apps are not here - they join the list where their hardware is found (Get-HardwareApps). Key = what the
+    # install phase looks up in $script:NotSelected.
     $list = [System.Collections.Generic.List[object]]::new()
     foreach ($id in $script:AppsToInstall) {
-        if ($script:RuntimeApps -contains $id) { continue }
-        $only = $script:AppMachine[$id]
-        if ($only -and $only -ne $script:MachineType) { continue }
-        $list.Add([pscustomobject]@{ Key = $id; Name = $(if ($script:AppNames.ContainsKey($id)) { $script:AppNames[$id] } else { $id }) })
+        if ($script:RuntimeApps -contains $id -or $script:HardwareApps -contains $id) { continue }
+        $list.Add([pscustomobject]@{ Key = $id; Name = (Get-AppLabel $id) })
     }
     foreach ($d in $script:DirectApps) {
-        if ($d.Machine -and $d.Machine -ne $script:MachineType) { continue }
-        if ($d.Require) { $met = $false; try { $met = [bool](& $d.Require) } catch { }; if (-not $met) { continue } }
+        if ($script:HardwareApps -contains $d.Name) { continue }
         $list.Add([pscustomobject]@{ Key = $d.Name; Name = $d.Name })
-    }
-    $hw = Get-Hardware
-    foreach ($a in $script:VendorApps) {
-        if ($hw -match $a.Hardware) { $list.Add([pscustomobject]@{ Key = $a.Id; Name = $a.Name }) }
     }
     return $list
 }
 
-function Format-Question {
-    # "  |  Revo Uninstaller ................ Y/n > " - one (Y/n) question on the rail
-    param([string]$Name)
-    $n = Get-Cut $Name 30
-    return "  {d:$($script:G.Bar)}  $n {d:" + ('.' * (32 - $n.Length)) + "} {d:Y/n} {b:$($script:G.Next)} "
+function Get-HardwareApps {
+    # The hardware apps, in install order, and whether this machine has what each is for: Key / Name / Found / Why (why
+    # not - for the log and the install phase). A PC-only one on a laptop is "PC only".
+    $hw = Get-Hardware
+    $list = [System.Collections.Generic.List[object]]::new()
+    foreach ($id in $script:AppsToInstall) {
+        if ($script:HardwareApps -notcontains $id) { continue }
+        $r = $script:AppRequire[$id]
+        $why = if ($r -and -not (Test-Gate $r.Require)) { [string]$r.RequireMsg } else { '' }
+        $list.Add([pscustomobject]@{ Key = $id; Name = (Get-AppLabel $id); Found = (-not $why); Why = $why })
+    }
+    foreach ($d in $script:DirectApps) {
+        if ($script:HardwareApps -notcontains $d.Name) { continue }
+        $why = if ($d.Machine -and $d.Machine -ne $script:MachineType) { "$($d.Machine) only" }
+               elseif ($d.Require -and -not (Test-Gate $d.Require)) { $(if ($d.RequireMsg) { [string]$d.RequireMsg } else { 'not for this PC' }) } else { '' }
+        $list.Add([pscustomobject]@{ Key = $d.Name; Name = $d.Name; Found = (-not $why); Why = $why })
+    }
+    foreach ($a in $script:VendorApps) {
+        $why = Get-VendorAppMiss $a $hw
+        $list.Add([pscustomobject]@{ Key = $a.Id; Name = $a.Name; Found = (-not $why); Why = $why })
+    }
+    return $list
 }
 
-function Read-AppSelection {
-    # New user: one (Y/n) per app - Enter (or anything but n/no) = yes. The no's go into $script:NotSelected.
-    # Returns how many apps were asked about (.Asked) and picked (.Picked).
-    $choices = @(Get-AppChoices)
-    $g = $script:G; $bar = "  {d:$($g.Bar)}"
-    Write-Ui -Always $bar
-    Write-Ui -Always ("  {b:?}  {w:Apps for this $(if ($script:MachineType -eq 'Laptop') { 'laptop' } else { 'PC' })}  {d:Enter = yes, n = no}")
-    Write-Ui -Always "$bar  {d:Visual C++, DirectX and .NET 3.5 always go in - games and apps need them.}"
-    $no = 0
-    foreach ($c in $choices) {
-        $ans = Read-Answer (Format-Question $c.Name)
-        if ($ans -match '^\s*(n|no)\s*$') { $script:NotSelected[$c.Key] = 'not selected'; $no++ }
+function Get-VendorAppMiss($App, [string]$Hardware) {
+    # why a vendor app is not for this machine ('' = it is): its Require test, else its Hardware regex on the model
+    if ($App.Require) { if (Test-Gate $App.Require) { return '' } else { return $(if ($App.RequireMsg) { [string]$App.RequireMsg } else { "not $($App.Vendor) hardware" }) } }
+    if ($Hardware -match $App.Hardware) { return '' }
+    return "not $($App.Vendor) hardware"
+}
+
+function Write-HardwareLog($Hardware) {
+    # what was found for the hardware apps, and why the others are not for this machine
+    $found = @($Hardware | Where-Object { $_.Found } | ForEach-Object { $_.Name })
+    $miss = @($Hardware | Where-Object { -not $_.Found } | ForEach-Object { '{0} ({1})' -f $_.Name, $_.Why })
+    Write-Log INFO ("Hardware apps: {0}" -f $(if ($found) { $found -join ', ' } else { 'none for this machine' }))
+    if ($miss) { Write-Log DEBUG ("not for this machine: {0}" -f ($miss -join ', ')) }
+}
+
+function Set-AppsLabel {
+    # "Apps: all 27" / "Apps: 24 of 27 - left out: Steam, Parsec, OBS Studio" in the log, and the machine line's label
+    param([int]$Total, [string[]]$Left = @())
+    $Left = @($Left | Where-Object { $_ })
+    $n = $Total - $Left.Count
+    if ($Left.Count) {
+        Write-Log INFO ("Apps: {0} of {1} - left out: {2}" -f $n, $Total, ($Left -join ', '))
+        $script:AppsLabel = '{0} of {1} apps' -f $n, $Total
+    } else {
+        Write-Log INFO ("Apps: all {0}" -f $Total)
+        $script:AppsLabel = 'all {0} apps' -f $Total
     }
-    # Built-in apps the script would remove (Gele never gets asked - they go): Enter keeps them, n removes them.
-    Write-Ui -Always $bar
-    Write-Ui -Always "  {b:?}  {w:Keep these Windows apps?}  {d:Enter = yes, n = no}"
-    foreach ($k in $script:NewUserKeepApps.Keys) {
-        $ans = Read-Answer (Format-Question $script:NewUserKeepApps[$k])
-        if ($ans -notmatch '^\s*(n|no)\s*$') { $script:KeepApps[$k] = $script:NewUserKeepApps[$k] }
-    }
-    # A direct app that wasn't offered (its gate failed - e.g. no NVIDIA driver yet) must not install later
-    # either: the install phase checks the gate again, and Windows Update can add the NVIDIA driver mid-run.
-    $offered = @($choices | ForEach-Object { $_.Key })
-    foreach ($d in $script:DirectApps) { if ($offered -notcontains $d.Name) { $script:NotSelected[$d.Name] = 'not offered' } }
-    return [pscustomobject]@{ Asked = $choices.Count; Picked = $choices.Count - $no }
 }
 
 # --------------------------------------------------------------------------------------
@@ -3151,91 +3191,65 @@ function Test-GuiStop {
     if ($script:Gui -and $script:Gui.Shared.Stop) { Write-GuiClicks; throw [System.OperationCanceledException]::new('Stopped from the window') }
 }
 
-function Get-DetectedMachineType {
-    # A battery -> a laptop. The window preselects it; one click changes it.
-    try { if (@(Get-CimInstance Win32_Battery -ErrorAction Stop).Count -gt 0) { return 'Laptop' } } catch { }
-    return 'PC'
-}
-
 function Get-AppGroup {
     param([string]$Key)
     foreach ($g in $script:AppGroups.Keys) { if ($script:AppGroups[$g] -contains $Key) { return $g } }
     return 'Other'
 }
 
-function Get-AppsNotOffered {
-    # What this machine type / hardware is not offered, and why - the window lists them (dim) under its app picker
-    $list = [System.Collections.Generic.List[object]]::new()
-    foreach ($id in $script:AppsToInstall) {
-        $only = $script:AppMachine[$id]
-        if ($only -and $only -ne $script:MachineType) { $list.Add(@{ Name = $(if ($script:AppNames.ContainsKey($id)) { $script:AppNames[$id] } else { $id }); Why = "$only only" }) }
-    }
-    foreach ($d in $script:DirectApps) {
-        if ($d.Machine -and $d.Machine -ne $script:MachineType) { $list.Add(@{ Name = $d.Name; Why = "$($d.Machine) only" }); continue }
-        if ($d.Require) {
-            $met = $false; try { $met = [bool](& $d.Require) } catch { }
-            if (-not $met) { $list.Add(@{ Name = $d.Name; Why = $(if ($d.RequireMsg) { $d.RequireMsg } else { 'not for this PC' }) }) }
-        }
-    }
-    $hw = Get-Hardware
-    foreach ($a in $script:VendorApps) { if ($hw -notmatch $a.Hardware) { $list.Add(@{ Name = $a.Name; Why = "not $($a.Vendor) hardware" }) } }
-    $list
-}
-
 function Get-SetupPayload {
-    # What the window's Setup screen needs: this PC, the detected machine type, the apps a New user is asked about - for
-    # a PC AND for a laptop (one click switches) - with their groups, what always goes in, what is not offered here and
-    # why, and the built-in apps a New user may keep
+    # What the window's Setup screen needs: this PC and its type (and why), the app list - row by row, in the rows' order,
+    # the hardware apps found here in their own row -, what always goes in, how many tweaks run on this machine type
+    $mc = Get-MachineChoice
     $saved = $script:MachineType
-    $apps = @{}; $not = @{}
     try {
-        foreach ($mt in 'PC', 'Laptop') {
-            $script:MachineType = $mt
-            $apps[$mt] = @(Get-AppChoices | ForEach-Object { @{ Key = $_.Key; Name = $_.Name; Group = (Get-AppGroup $_.Key) } })
-            $not[$mt] = @(Get-AppsNotOffered)
-        }
+        $script:MachineType = $mc.Type
+        $choices = @(Get-AppChoices); $hw = @(Get-HardwareApps)
     } finally { $script:MachineType = $saved }
-    $runtimes = @($script:RuntimeApps | ForEach-Object { if ($script:AppNames.ContainsKey($_)) { $script:AppNames[$_] } else { $_ } })
-    $tweaks = @{}; foreach ($mt in 'PC', 'Laptop') { $tweaks[$mt] = @($script:Tweaks | Where-Object { -not $_.Machine -or $_.Machine -eq $mt }).Count }
+    $apps = [System.Collections.Generic.List[object]]::new()
+    foreach ($g in @($script:AppGroups.Keys) + @('Other')) {
+        $in = @($choices | Where-Object { (Get-AppGroup $_.Key) -eq $g })
+        if ($g -ne 'Other') { $order = @($script:AppGroups[$g]); $in = @($in | Sort-Object { $order.IndexOf([string]$_.Key) }) }
+        foreach ($c in $in) { $apps.Add(@{ Key = $c.Key; Name = $c.Name; Group = $g }) }
+    }
+    foreach ($h in @($hw | Where-Object { $_.Found })) { $apps.Add(@{ Key = $h.Key; Name = $h.Name; Group = $script:HardwareGroup }) }
+    $runtimes = @($script:RuntimeApps | ForEach-Object { Get-AppLabel $_ })
     return @{
         Version = $script:Version; PcName = $(if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'this PC' }); Os = (Get-Visible (Get-OsName))
-        Detected = (Get-DetectedMachineType); Machine = ''   # Machine: preset by -Machine (Invoke-GuiSetup)
-        Apps = $apps; NotOffered = $not; Groups = @($script:AppGroups.Keys) + @('Other'); TweakCount = $tweaks; Log = $script:LogFile
+        Machine = $mc.Type; MachineWhy = $mc.Why
+        Apps = @($apps); Hardware = @($hw | Where-Object { $_.Found } | ForEach-Object { $_.Name })
+        NotOffered = @($hw | Where-Object { -not $_.Found } | ForEach-Object { @{ Name = $_.Name; Why = $_.Why } })   # for the log
+        Groups = @($script:AppGroups.Keys) + @($script:HardwareGroup, 'Other'); HardwareGroup = $script:HardwareGroup
+        TweakCount = @($script:Tweaks | Where-Object { -not $_.Machine -or $_.Machine -eq $mc.Type }).Count; Log = $script:LogFile
         Always = @("Visual C++ 2005$($script:G.Dash)2022") + $runtimes + @('.NET 3.5')
-        Keep = @($script:NewUserKeepApps.Keys | ForEach-Object { @{ Key = $_; Name = $script:NewUserKeepApps[$_] } })
     }
 }
 
 function Set-SetupAnswer {
-    # The window's answer, applied like the console questions: the machine type; a New user's "no" apps (and the direct
-    # apps this PC is not offered - they must not install later either) and kept built-in apps. Gele gets everything.
+    # The window's answer: the machine type it showed, and the apps taken off its list - the install phase skips them
+    # ("not selected"). Everything else in the list goes in.
     param([hashtable]$Answer)
     $script:MachineType = if ($Answer.Machine -eq 'Laptop') { 'Laptop' } else { 'PC' }
-    Write-Log INFO ("Machine type: {0}" -f $script:MachineType)
-    if ($Answer.User -ne 'New user') { Write-Log INFO "User: Gele - installing all apps"; $script:UserLabel = 'Gele'; return }
-    $choices = @(Get-AppChoices); $off = @($Answer.Off); $no = 0
-    foreach ($c in $choices) { if ($off -contains $c.Key) { $script:NotSelected[$c.Key] = 'not selected'; $no++ } }
-    foreach ($k in @($Answer.Keep)) { if ($script:NewUserKeepApps.Contains($k)) { $script:KeepApps[$k] = $script:NewUserKeepApps[$k] } }
-    $offered = @($choices | ForEach-Object { $_.Key })
-    foreach ($d in $script:DirectApps) { if ($offered -notcontains $d.Name) { $script:NotSelected[$d.Name] = 'not offered' } }
-    $kept = @($script:NewUserKeepApps.Keys | Where-Object { $script:KeepApps.ContainsKey($_) } | ForEach-Object { $script:NewUserKeepApps[$_] })
-    $keeps = if ($kept) { ', keeps ' + ($kept -join ' + ') } else { '' }
-    Write-Log INFO ("User: New user - {0} of {1} apps selected{2}" -f ($choices.Count - $no), $choices.Count, $keeps)
-    $script:UserLabel = 'New user, {0} of {1} apps' -f ($choices.Count - $no), $choices.Count
+    Write-Log INFO ("Machine type: {0}{1}" -f $script:MachineType, $(if ($Answer.MachineWhy) { " ($($Answer.MachineWhy))" } else { '' }))
+    $hw = @(Get-HardwareApps)
+    Write-HardwareLog $hw
+    $list = @(Get-AppChoices) + @($hw | Where-Object { $_.Found })
+    $off = @($Answer.Off); $left = @()
+    foreach ($c in $list) { if ($off -contains $c.Key) { $script:NotSelected[$c.Key] = 'not selected'; $left += $c.Name } }
+    Set-AppsLabel -Total $list.Count -Left $left
 }
 
 function Invoke-GuiSetup {
-    # The questions in the window - PC or laptop, who it is, a New user's apps - on one screen, then Start or Cancel.
+    # The window's Setup screen - the machine type it detected and the app list, everything picked; Start or Cancel.
     # Cancel (or closing the window) is "Continue? n": nothing is changed.
     $p = if ($null -ne $script:SetupPayload) { $script:SetupPayload } else { Get-SetupPayload }   # (gathered while the window started - Start-Gui)
-    if ($Machine -eq 'PC' -or $Machine -eq 'Laptop') { $p.Machine = $Machine }
     Send-GuiEvent 'setup' @{ Payload = $p }
     $sh = $script:Gui.Shared
     while (-not $sh.Answer -and -not $sh.Closed) { Start-Sleep -Milliseconds 100 }
     $a = $sh.Answer
     if (-not $a -and ($sh.Error -or $sh.ErrorCount)) {
         # it closed itself (it could not draw) - that is no Cancel: the console asks instead (Show-Intro)
-        Write-Log WARN 'the window broke before an answer - the questions are on the console'
+        Write-Log WARN 'the window broke before an answer - the console asks instead'
         Close-Gui; Set-ConsoleWindow -Show
         return
     }
@@ -3244,6 +3258,7 @@ function Invoke-GuiSetup {
         $script:Cancelled = $true
         return
     }
+    if (-not $a.MachineWhy) { $a.MachineWhy = $p.MachineWhy }   # (the window only shows it - the log says why)
     Set-SetupAnswer $a
 }
 
@@ -3443,6 +3458,13 @@ function New-GuiButton {
     "<Border Tag='$Tag' Height='32' Padding='14,0' Margin='8,0,0,0' CornerRadius='7' BorderBrush='$bd' BorderThickness='1'>$(New-GuiHover $bg $hv)$fx" +
         "<StackPanel Orientation='Horizontal' IsHitTestVisible='False'>$g$(New-GuiText $Text $fg 12 $w)$t</StackPanel></Border>"
 }
+function New-GuiSmallButton([string]$Text, [string]$Tag, [switch]$Accent) {
+    # a small button in a phase's title line (Deselect all / Select all) - the blue one invites
+    $bd = if ($Accent) { $GuiC.blue55 } else { $GuiC.line2 }; $fg = if ($Accent) { $GuiC.blue } else { $GuiC.tx2 }
+    $bg = if ($Accent) { $GuiC.blue10 } else { 'Transparent' }; $hv = if ($Accent) { $GuiC.blue18 } else { $GuiC.hover2 }
+    "<Border Tag='$Tag' Height='22' Padding='9,0' Margin='12,0,0,0' CornerRadius='6' BorderBrush='$bd' BorderThickness='1' VerticalAlignment='Center'>$(New-GuiHover $bg $hv)" +
+        "<StackPanel Orientation='Horizontal' IsHitTestVisible='False'>$(New-GuiText $Text $fg 11.5 'Medium')</StackPanel></Border>"
+}
 function New-GuiNode {
     # a phase on the rail: its dot (done / warn / fail / live / bg / ask / end / todo), its title, what is on its right,
     # what is under it
@@ -3586,7 +3608,7 @@ function Join-GuiText([object[]]$Parts) { (@($Parts) | Where-Object { $_ }) -joi
 # ---- the model: what the window shows - changed only by the run's events (Update-GuiModel) and the clicks (Invoke-GuiAction)
 function New-GuiModel {
     @{ Screen = 'wait'; WaitText = 'Getting ready'; Setup = $null; Version = ''; Log = ''
-       Choice = @{ Machine = 'PC'; User = 'Gele'; Off = @{}; Keep = @{} }
+       Choice = @{ Machine = 'PC'; Off = @{} }   # the apps taken off the list (key -> $true)
        Banner = @{ Machine = ''; Os = ''; MachineType = ''; User = ''; DryRun = $false }
        Tweaks = @{ State = 'todo'; Rows = [System.Collections.Generic.List[object]]::new(); Progress = $null; Count = 0; Time = '' }
        Apps = @{ State = 'todo'; Rows = [System.Collections.Generic.List[object]]::new(); Plan = @() }
@@ -3604,8 +3626,8 @@ function Update-GuiModel($M, $Ev) {
     switch ([string]$Ev.Type) {
         'setup' {
             $p = $Ev.Payload; $M.Setup = $p; $M.Screen = 'setup'; $M.Version = [string]$p.Version; $M.Log = [string]$p.Log
-            $M.Choice.Machine = if ($p.Machine) { [string]$p.Machine } elseif ($p.Detected) { [string]$p.Detected } else { 'PC' }
-            $M.Choice.Keep = @{}; foreach ($k in @($p.Keep)) { if ($k) { $M.Choice.Keep[[string]$k.Key] = $true } }   # Enter = keep, like the console
+            $M.Choice.Machine = if ($p.Machine) { [string]$p.Machine } else { 'PC' }   # detected (or -Machine) - shown, not a choice
+            $M.Choice.Off = @{}   # everything picked
         }
         'banner' {
             foreach ($k in 'Machine', 'Os', 'MachineType', 'User', 'DryRun') { $M.Banner[$k] = $Ev[$k] }
@@ -3660,18 +3682,14 @@ function Get-GuiWaitParts($M) {
     (Get-GuiFooter '' '')
 }
 function Get-GuiSetupParts($M) {
-    $p = $M.Setup; $ch = $M.Choice; $mt = [string]$ch.Machine
-    $opt = { param($on, $label, $hint, $glyph, $tag)
-        $bd = if ($on) { $GuiC.blue } else { $GuiC.line2 }; $th = if ($on) { '2' } else { '1' }
-        $bg = if ($on) { $GuiC.blue10 } else { 'Transparent' }; $hv = if ($on) { $GuiC.blue10 } else { $GuiC.hover2 }
-        $ic = if ($on) { $GuiC.blue } else { $GuiC.tx2 }; $lb = if ($on) { $GuiC.tx } else { $GuiC.tx2 }
-        $h = if ($hint) { New-GuiText (ConvertTo-GuiXml $hint) $GuiC.tx3 11.5 'Normal' '9,0,0,0' } else { '' }
-        $t = if ($tag) { "Tag='$tag' " } else { '' }
-        "<Border $t" + "Height='36' Padding='14,0' Margin='0,0,10,0' CornerRadius='8' BorderBrush='$bd' BorderThickness='$th'>$(New-GuiHover $bg $hv)" +
-            "<StackPanel Orientation='Horizontal' IsHitTestVisible='False'>$(New-GuiGlyph $glyph 14 $ic '0,0,9,0')$(New-GuiText $label $lb 12.5 'SemiBold')$h</StackPanel></Border>"
-    }
-    $chip = { param($name, $on, $tag)
-        if ($on) {
+    # Set up this PC (superuser, 2026-09-30): one app list, everything picked - take off what you don't want. A row's name
+    # takes the whole row off or back on; Deselect all / Select all; the hardware apps found here in their own row.
+    $p = $M.Setup; $ch = $M.Choice
+    $apps = @($p.Apps | Where-Object { $_ })
+    $isOn = { param($a) -not $ch.Off.ContainsKey([string]$a.Key) }
+    $on = @($apps | Where-Object { & $isOn $_ }).Count
+    $chip = { param($name, $sel, $tag)
+        if ($sel) {
             "<Border Tag='$tag' Height='26' Padding='8,0,10,0' Margin='0,0,6,6' CornerRadius='6' BorderBrush='$($GuiC.blue55)' BorderThickness='1'>$(New-GuiHover $GuiC.blue10 $GuiC.blue18)" +
                 "<StackPanel Orientation='Horizontal' IsHitTestVisible='False'>$(New-GuiGlyph 'E73E' 10 $GuiC.blue '0,0,6,0')$(New-GuiText (ConvertTo-GuiXml $name) $GuiC.tx 12)</StackPanel></Border>"
         } else {
@@ -3680,45 +3698,39 @@ function Get-GuiSetupParts($M) {
                 "$(New-GuiText (ConvertTo-GuiXml $name) $GuiC.tx3 12)</StackPanel></Border>"
         }
     }
-    $grp = { param($label, $content)
-        "<Grid Margin='0,3,0,0'><Grid.ColumnDefinitions><ColumnDefinition Width='150'/><ColumnDefinition/></Grid.ColumnDefinitions>" +
-            (New-GuiText (ConvertTo-GuiXml $label) $GuiC.tx3 11.5 'Normal' '0,5,0,0' "VerticalAlignment='Top'") + "<WrapPanel Grid.Column='1'>$content</WrapPanel></Grid>"
+    $box = { param($state)   # the row's own box: all of it on / some / none
+        switch ($state) {
+            'all'  { "<Border Width='11' Height='11' CornerRadius='3' BorderBrush='$($GuiC.blue55)' Background='$($GuiC.blue18)' BorderThickness='1.5' Margin='0,0,7,0' VerticalAlignment='Center'>$(New-GuiGlyph 'E73E' 7 $GuiC.blue)</Border>" }
+            'some' { "<Border Width='11' Height='11' CornerRadius='3' BorderBrush='$($GuiC.blue55)' BorderThickness='1.5' Margin='0,0,7,0' VerticalAlignment='Center'><Rectangle Width='5' Height='1.5' Fill='$($GuiC.blue)' HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>" }
+            'none' { "<Border Width='11' Height='11' CornerRadius='3' BorderBrush='$($GuiC.line2)' BorderThickness='1.5' Margin='0,0,7,0' VerticalAlignment='Center'/>" }
+            default { "<Border Width='11' Height='11' Margin='0,0,7,0'/>" }
+        }
+    }
+    $row = { param($label, $content, $tag, $state)
+        $name = "<StackPanel Orientation='Horizontal' IsHitTestVisible='False'>$(& $box $state)$(New-GuiText (ConvertTo-GuiXml $label) $GuiC.tx3 11.5)</StackPanel>"
+        $left = if ($tag) { "<Border Tag='$tag' Height='26' Padding='0,0,8,0' CornerRadius='5' HorizontalAlignment='Left' VerticalAlignment='Top'>$(New-GuiHover 'Transparent' $GuiC.hover2)$name</Border>" }
+                else { "<Border Height='26' HorizontalAlignment='Left' VerticalAlignment='Top'>$name</Border>" }
+        "<Grid Margin='0,3,0,0'><Grid.ColumnDefinitions><ColumnDefinition Width='170'/><ColumnDefinition/></Grid.ColumnDefinitions>$left<WrapPanel Grid.Column='1'>$content</WrapPanel></Grid>"
     }
     $q = { param($t) (New-GuiText '?' $GuiC.blue 13 'Bold' '0,0,8,0') + (New-GuiTitle $t) }
-    $hint = { param($type)
-        if ($p.Machine -eq $type) { 'set by -Machine' }
-        elseif (-not $p.Machine -and $p.Detected -eq $type) { if ($type -eq 'Laptop') { 'detected - it has a battery' } else { 'detected - no battery' } }
-        else { '' }
+    $rows = ''
+    foreach ($g in @($p.Groups)) {
+        $in = @($apps | Where-Object { $_.Group -eq $g }); if (-not $in) { continue }
+        $n = @($in | Where-Object { & $isOn $_ }).Count
+        $state = if ($n -eq $in.Count) { 'all' } elseif ($n) { 'some' } else { 'none' }
+        $chips = (@($in) | ForEach-Object { & $chip ([string]$_.Name) (& $isOn $_) ('app:' + (ConvertTo-GuiXml ([string]$_.Key))) }) -join ''
+        $rows += & $row $g $chips ('pick:row:' + (ConvertTo-GuiXml $g)) $state
     }
-    $mtag = { param($type) if ($p.Machine) { '' } else { "pick:machine:$type" } }   # -Machine decided it: no choice here
-    $apps = @($p.Apps[$mt] | Where-Object { $_ })
-    $body = (New-GuiNode 'ask' (& $q 'PC or laptop?') '' ("<StackPanel Orientation='Horizontal' Margin='0,6,0,4'>" +
-                (& $opt ($mt -eq 'PC') 'PC' (& $hint 'PC') 'E7F4' (& $mtag 'PC')) + (& $opt ($mt -eq 'Laptop') 'Laptop' (& $hint 'Laptop') 'E7F8' (& $mtag 'Laptop')) + '</StackPanel>')) +
-            (New-GuiNode 'ask' (& $q 'Who is it?') '' ("<StackPanel Orientation='Horizontal' Margin='0,6,0,4'>" +
-                (& $opt ($ch.User -ne 'New user') 'Gele' 'everything, no questions' 'E77B' 'pick:user:Gele') + (& $opt ($ch.User -eq 'New user') 'New user' 'pick the apps' 'E716' 'pick:user:New user') + '</StackPanel>'))
     $lock = "<StackPanel Orientation='Horizontal' Height='26'>$(New-GuiGlyph 'E72E' 11 $GuiC.tx3 '0,0,7,0')" +
             (New-GuiText ((@($p.Always) | ForEach-Object { ConvertTo-GuiXml ([string]$_) }) -join " $GuiDot ") $GuiC.tx3 12) + '</StackPanel>'
-    $notNames = @($p.NotOffered[$mt] | Where-Object { $_ } | ForEach-Object { ConvertTo-GuiXml ([string]$_.Name) })
-    $not = if ($notNames) { & $grp 'Not here' ("<TextBlock Foreground='$($GuiC.tx3)' FontSize='12' Padding='0,5,0,0' TextWrapping='Wrap'>" + ($notNames -join " $GuiDot ") + '</TextBlock>') } else { '' }
-    if ($ch.User -eq 'New user') {
-        $on = @($apps | Where-Object { -not $ch.Off.ContainsKey([string]$_.Key) }).Count
-        $groups = ''
-        foreach ($g in @($p.Groups)) {
-            $in = @($apps | Where-Object { $_.Group -eq $g }); if (-not $in) { continue }
-            $groups += & $grp $g (($in | ForEach-Object { & $chip ([string]$_.Name) (-not $ch.Off.ContainsKey([string]$_.Key)) ('app:' + (ConvertTo-GuiXml ([string]$_.Key))) }) -join '')
-        }
-        $body += New-GuiNode 'ask' (& $q 'Apps') ((New-GuiText "$on" $GuiC.tx 12 'SemiBold') + (New-GuiRight " of $($apps.Count) selected")) ($groups + (& $grp 'Always' $lock) + $not)
-        $keep = (@($p.Keep | Where-Object { $_ }) | ForEach-Object { & $chip ([string]$_.Name) ($ch.Keep.ContainsKey([string]$_.Key)) ('keep:' + (ConvertTo-GuiXml ([string]$_.Key))) }) -join ''
-        $body += New-GuiNode 'ask' (& $q 'Keep Windows apps') (New-GuiRight 'the rest of the built-in apps go') "<WrapPanel Margin='0,4,0,0'>$keep</WrapPanel>" -Last
-        $kept = @(@($p.Keep | Where-Object { $_ }) | Where-Object { $ch.Keep.ContainsKey([string]$_.Key) } | ForEach-Object { [string]$_.Name })
-        $foot = @("$on apps"); if ($kept) { $foot += ($kept -join ' + ') + ' kept' }
-    } else {
-        $body += New-GuiNode 'ask' (& $q 'Apps') (New-GuiRight "all $($apps.Count)") ((New-GuiText 'Everything, as always - no questions.' $GuiC.tx2 12 'Normal' '0,4,0,4') + (& $grp 'Always' $lock) + $not) -Last
-        $foot = @("all $($apps.Count) apps")
-    }
-    if ($p.TweakCount -and $p.TweakCount[$mt]) { $foot += "$($p.TweakCount[$mt]) tweaks" }
+    $rows += & $row 'Always' $lock '' ''
+    $toggle = if ($on) { New-GuiSmallButton 'Deselect all' 'pick:apps:none' } else { New-GuiSmallButton 'Select all' 'pick:apps:all' -Accent }
+    $right = (New-GuiText "$on" $GuiC.tx 12 'SemiBold') + (New-GuiRight " of $($apps.Count) selected") + $toggle
+    $body = New-GuiNode 'ask' (& $q 'Apps') $right $rows -Last
+    $foot = @($(if ($apps.Count -and $on -eq $apps.Count) { "all $on apps" } else { "$on apps" }))
+    if ($p.TweakCount) { $foot += "$($p.TweakCount) tweaks" }
     $kbd = "<Border BorderBrush='$($GuiC.line2)' BorderThickness='1,1,1,2' CornerRadius='5' Padding='7,1' VerticalAlignment='Center'>$(New-GuiText 'Enter' $GuiC.tx2 11)</Border>"
-    $hl = (New-GuiText 'Set up this PC' $GuiC.tx 17 'Bold') + (New-GuiText (ConvertTo-GuiXml (Join-GuiText @($p.PcName, $p.Os))) $GuiC.tx3 12 'Normal' '0,3,0,0')
+    $hl = (New-GuiText 'Set up this PC' $GuiC.tx 17 'Bold') + (New-GuiText (ConvertTo-GuiXml (Join-GuiText @($p.PcName, $p.Os, $ch.Machine))) $GuiC.tx3 12 'Normal' '0,3,0,0')
     (Get-GuiHeader $hl ($kbd + (New-GuiText 'to start' $GuiC.tx3 12 'Normal' '10,0,0,0'))) +
     (Get-GuiBody $body) +
     (Get-GuiFooter (New-GuiText (ConvertTo-GuiXml (Join-GuiText $foot)) $GuiC.tx2 12) ((New-GuiButton 'Cancel' 'act:cancel') + (New-GuiButton 'Start' 'act:start' '' 'primary' 'E76C')))
@@ -3959,11 +3971,11 @@ function Update-GuiClocks {
     $n = $c.FindName('NetClockText'); if ($n -and $m.Net.Since) { $n.Text = Get-GuiClock ($now - $m.Net.Since) }
 }
 function Connect-GuiHandlers($Root) {
-    # every element with an action tag (act: / pick: / app: / keep: / cap:) gets the hand cursor and a click
+    # every element with an action tag (act: / pick: / app: / cap:) gets the hand cursor and a click
     $stack = [System.Collections.Generic.Stack[object]]::new(); $stack.Push($Root)
     while ($stack.Count) {
         $el = $stack.Pop()
-        if ($el -is [Windows.FrameworkElement] -and $el.Tag -is [string] -and $el.Tag -match '^(act|pick|app|keep|cap):') {
+        if ($el -is [Windows.FrameworkElement] -and $el.Tag -is [string] -and $el.Tag -match '^(act|pick|app|cap):') {
             $el.Cursor = [Windows.Input.Cursors]::Hand
             $el.Add_MouseLeftButtonUp({ param($s, $e) $e.Handled = $true; Invoke-GuiAction ([string]$s.Tag) })
         }
@@ -3999,7 +4011,8 @@ function Add-GuiClick([string]$Tag) {
         'act:start' { 'Start' } 'act:cancel' { 'Cancel' } 'act:log' { 'Log opened' } 'act:close' { 'Close' } 'act:restart' { 'Restart now' }
         'act:stop' { 'Stop pressed - it asks "Stop after this step?"' } 'act:stop-yes' { 'Stop confirmed - stops after this step' }
         'act:stop-no' { 'Keep going' } 'cap:close' { 'the X (close) - during the run it asks to stop' } 'cap:min' { 'minimised' }
-        'key:alt-f4' { 'closed from outside the window (Alt+F4, the taskbar, End task) - during the run it asks to stop' } default { $null }
+        'key:alt-f4' { 'closed from outside the window (Alt+F4, the taskbar, End task) - during the run it asks to stop' }
+        'pick:apps:none' { 'Deselect all' } 'pick:apps:all' { 'Select all' } default { $null }
     }
     if ($what -and $script:GuiShared.Clicks) { $script:GuiShared.Clicks.Enqueue(('{0} {1}' -f (Get-Date).ToString('HH:mm:ss'), $what)) }
 }
@@ -4012,13 +4025,17 @@ function Invoke-GuiAction([string]$Tag) {
             if ($m.Screen -eq 'run') { if (-not $m.Stopping) { $m.ConfirmStop = $true } }   # the run goes on: close = stop, asked first
             else { if ($m.Screen -eq 'setup' -and -not $sh.Answer) { $sh.Answer = @{ Cancel = $true } }; Close-GuiWindowNow; return }
         }
-        '^pick:machine:(.+)$' { if (-not $m.Setup.Machine) { $m.Choice.Machine = $Matches[1] } }
-        '^pick:user:(.+)$'    { $m.Choice.User = $Matches[1] }
         '^app:(.+)$'          { $k = $Matches[1]; if ($m.Choice.Off.ContainsKey($k)) { $m.Choice.Off.Remove($k) } else { $m.Choice.Off[$k] = $true } }
-        '^keep:(.+)$'         { $k = $Matches[1]; if ($m.Choice.Keep.ContainsKey($k)) { $m.Choice.Keep.Remove($k) } else { $m.Choice.Keep[$k] = $true } }
+        '^pick:row:(.+)$'     {   # a row's name: the whole row off - or, when any of it is off, the whole row back on
+            $in = @(@($m.Setup.Apps) | Where-Object { $_ -and $_.Group -eq $Matches[1] })
+            $allOn = -not @($in | Where-Object { $m.Choice.Off.ContainsKey([string]$_.Key) }).Count
+            foreach ($a in $in) { if ($allOn) { $m.Choice.Off[[string]$a.Key] = $true } else { $m.Choice.Off.Remove([string]$a.Key) } }
+        }
+        '^pick:apps:none$'    { foreach ($a in @($m.Setup.Apps)) { if ($a) { $m.Choice.Off[[string]$a.Key] = $true } } }
+        '^pick:apps:all$'     { $m.Choice.Off = @{} }
         '^act:start$'         {
             if ($m.Screen -ne 'setup' -or $sh.Answer) { return }
-            $sh.Answer = @{ Machine = $m.Choice.Machine; User = $m.Choice.User; Off = @($m.Choice.Off.Keys); Keep = @($m.Choice.Keep.Keys) }
+            $sh.Answer = @{ Machine = $m.Choice.Machine; Off = @($m.Choice.Off.Keys) }
             $m.Screen = 'wait'; $m.WaitText = 'Starting'
         }
         '^act:cancel$'        { if (-not $sh.Answer) { $sh.Answer = @{ Cancel = $true } }; Close-GuiWindowNow; return }
@@ -4045,13 +4062,13 @@ function Save-GuiSnapshot([string]$Name) {
     } catch { Add-GuiError "snapshot: $($_.Exception.Message)" }
 }
 function Invoke-GuiTestHooks {
-    # only with the test variables set: W11T_GUI_AUTOSTART (1 = Gele, newuser = New user) presses Start, W11T_GUI_STOP=apps
+    # only with the test variables set: W11T_GUI_AUTOSTART (1 = as it is, some = a few apps taken off) presses Start, W11T_GUI_STOP=apps
     # stops the run in its Apps phase, W11T_GUI_SNAP saves the screens as PNGs, W11T_GUI_AUTOCLOSE closes the window at the end
     $m = $script:GuiM; $h = $script:GuiHooks; $now = Get-GuiNow
     if ($env:W11T_GUI_AUTOSTART -and $m.Screen -eq 'setup' -and -not $h.Started) {
         if (-not $h.SetupAt) { $h.SetupAt = $now }
         elseif ($now - $h.SetupAt -gt 1.5) {
-            if ($env:W11T_GUI_AUTOSTART -eq 'newuser') { $m.Choice.User = 'New user'; Invoke-GuiRender }
+            if ($env:W11T_GUI_AUTOSTART -eq 'some') { foreach ($a in @($m.Setup.Apps | Select-Object -First 3)) { if ($a) { $m.Choice.Off[[string]$a.Key] = $true } }; Invoke-GuiRender }
             Save-GuiSnapshot 'setup'; $h.Started = $true; Invoke-GuiAction 'act:start'
         }
     }
@@ -4178,7 +4195,7 @@ finally {
         Write-Log INFO ("=========== WIN11-TWEAKS {0} ===========" -f $(if ($script:RunFinished) { 'DONE' } else { 'STOPPED' }))
         Clear-StuckSearch   # a stuck Windows Search takes the clicks meant for the Done screen (and the desktop)
     }
-    # The Pin-Taskbar helper is normally deleted by the Chrome pin - but not when Chrome was left out (New user)
+    # The Pin-Taskbar helper is normally deleted by the Chrome pin - but not when Chrome was taken off the list
     # or the run was stopped before it. Don't leave it in TEMP.
     if ($script:PinHelper) { Remove-Item $script:PinHelper -Force -ErrorAction SilentlyContinue; $script:PinHelper = $null }
     Set-QuickEdit -Restore

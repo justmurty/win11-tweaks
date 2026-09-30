@@ -819,7 +819,12 @@ function Reset-LaptopPowerPlan {
     param([string]$Id = '')
     $balanced = '381b4222-f694-41f0-9685-ff5bb260df2e'
     $guid = Find-PowerPlan -StateName 'LaptopPowerPlan' -Name 'Ultimate + Balanced on battery'
-    if (-not $guid) { Write-Log DEBUG 'no power plan from an earlier version - the plan stays as it is' $Id; return }
+    if (-not $guid) {
+        if ($null -ne (Get-RegValue -Path $script:StateKey -Name 'LaptopPowerPlan')) {   # remembered, but the plan is gone already
+            Set-Reg -Id $Id -Path $script:StateKey -Name 'LaptopPowerPlan' -Type String -Value '<RemoveEntry>'
+        }
+        Write-Log DEBUG 'no power plan from an earlier version - the plan stays as it is' $Id; return
+    }
     if ((powercfg -getactivescheme | Out-String) -match [regex]::Escape($guid)) {
         $null = powercfg -setactive $balanced
         Write-Log INFO "power plan: Balanced again - the laptop plan of an earlier version goes" $Id
@@ -929,12 +934,32 @@ function Invoke-Winget {
     # Start-Process -Wait, which waits for the whole process TREE (it puts the child in a job object): an app
     # the installer launches when it's done (Battle.net + its browser helpers) would then hold the run until
     # someone closed it. winget itself waits for its installer, so this behaves like `winget install` by hand.
-    param([string]$ArgumentList, [string]$OutFile)
+    # -TimeoutSec (the updates: an app that is running can make its installer wait on a question nobody sees): after that
+    # long winget and everything it started are stopped, and it throws. 0 = as long as it takes (the installs).
+    param([string]$ArgumentList, [string]$OutFile, [int]$TimeoutSec = 0)
     $p = Start-Process -FilePath 'winget' -NoNewWindow -PassThru -ArgumentList $ArgumentList -RedirectStandardOutput $OutFile
     $null = $p.Handle   # open the handle NOW - Windows PowerShell returns the process by PID, and without a handle ExitCode can be empty after exit
     # a second at a time, so the live line's clock ticks while winget works
-    do { Wait-Process -InputObject $p -Timeout 1 -ErrorAction Ignore; Update-LiveTick } until ($p.HasExited)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    do {
+        Wait-Process -InputObject $p -Timeout 1 -ErrorAction Ignore; Update-LiveTick
+        if ($TimeoutSec -gt 0 -and -not $p.HasExited -and $sw.Elapsed.TotalSeconds -ge $TimeoutSec) {
+            Stop-ProcessTree -Id $p.Id
+            throw ('winget did not finish in {0} - stopped; maybe a question on the screen' -f (Format-Span $TimeoutSec))
+        }
+    } until ($p.HasExited)
     return $p.ExitCode
+}
+
+function Stop-ProcessTree {
+    # A process and everything it started (found through the parent process ids), forced
+    param([int]$Id)
+    $all = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId -ErrorAction SilentlyContinue)
+    $ids = [System.Collections.Generic.List[int]]::new(); $ids.Add($Id)
+    for ($i = 0; $i -lt $ids.Count; $i++) {
+        foreach ($c in @($all | Where-Object { [int]$_.ParentProcessId -eq $ids[$i] })) { if (-not $ids.Contains([int]$c.ProcessId)) { $ids.Add([int]$c.ProcessId) } }
+    }
+    foreach ($x in $ids) { Stop-Process -Id $x -Force -ErrorAction SilentlyContinue }
 }
 
 function Install-App {
@@ -992,11 +1017,12 @@ function Update-App {
     if ($script:AppScopes -and $script:AppScopes[$Id]) { $a += " --scope $($script:AppScopes[$Id])" }
     $left = @{ '0x8A15002B' = 'no newer version'; '0x8A15004F' = 'the installed one is newer'; '0x8A15010E' = 'a newer one is installed'
                '0x8A150050' = 'winget cannot tell its version'; '0x8A150014' = 'not a winget install'; '0x8A150068' = 'pinned in winget'
-               '0x8A15008E' = 'installed another way than winget''s package'; '0x8A150114' = 'its installer does not update' }
+               '0x8A15008E' = 'installed another way than winget''s package'; '0x8A150114' = 'its installer does not update'
+               '0x8A15010D' = 'another version is installed'; '0x80004004' = 'winget stopped waiting - the installer may still be finishing' }
     Write-Log INFO "$Label is installed - updating it to the latest"
     Set-LiveWhat 'updating'
     $wo = Join-Path $env:TEMP 'winget_out.log'; $why = ''
-    try { $hex = '0x{0:X8}' -f (Invoke-Winget -ArgumentList $a -OutFile $wo) } catch { $hex = ''; $why = $_.Exception.Message }
+    try { $hex = '0x{0:X8}' -f (Invoke-Winget -ArgumentList $a -OutFile $wo -TimeoutSec $script:UpdateTimeoutSec) } catch { $hex = ''; $why = $_.Exception.Message }
     if ($hex -eq '0x00000000') { Write-Log OK "Updated to the latest - $Label"; $script:ItemNote = 'updated to the latest' }
     elseif ($hex -eq '0x8A150109') { Write-Log OK "Updated - $Label (it finishes at the next restart)"; $script:ItemNote = 'updated - finishes after a restart' }
     elseif ($left.ContainsKey($hex)) { Write-Log OK "Already installed - $Label ($($left[$hex]))"; $script:ItemNote = 'already installed' }
@@ -2230,6 +2256,9 @@ $script:VCRedists = @(
 # DirectX's June 2010 runtime and Visual C++ 2005-2013 (2015-2022 is updated). winget ID -like patterns.
 $script:NoUpdateApps = @('Microsoft.DirectX', 'Microsoft.VCRedist.2005.*', 'Microsoft.VCRedist.2008.*', 'Microsoft.VCRedist.2010.*',
                          'Microsoft.VCRedist.2012.*', 'Microsoft.VCRedist.2013.*')
+# How long one update may take: an app that is running (Afterburner, Discord...) can make its installer wait on a question
+# nobody sees - then it is stopped and the app stays as it was ("update failed"). The biggest one (MSI Afterburner) needs ~3 min.
+$script:UpdateTimeoutSec = 900
 
 # WinRAR license embedded as base64 (the only source) - the WinRAR step decodes this and writes
 # rarreg.key into the WinRAR dir(s), so both download-and-run AND the `irm|iex` one-liner license WinRAR.
@@ -2582,7 +2611,8 @@ function Install-ArmouryCrate {
         return 'BACKGROUND'
     } catch {
         Write-Log WARN "Failed - $name ($($_.Exception.Message))"; $script:ItemFail = $_.Exception.Message; return 'FAILED'
-    } finally { Remove-Item $zip -Force -ErrorAction SilentlyContinue }
+    } finally { Remove-Item $zip -Force -ErrorAction SilentlyContinue }   # (the unpacked folder stays: ASUS's installer can still run from
+                                                                            # it - the next run's temporary-files cleanup takes it)
 }
 
 function Install-Alienware {

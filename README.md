@@ -73,10 +73,11 @@ Every detail goes to a log file for later.
   Fixed in v1.6.0: Activity History no longer breaks the clipboard history (Win+V), Get Help stays
   (the Settings troubleshooters need it), "ConsumerFeatures" now also works on Pro. Details:
   [`docs/2026-07-11-win11-tweaks-design.md`](docs/2026-07-11-win11-tweaks-design.md).
-- Shows the **MSUHost banner** and asks **`Continue? (Y/n)`**. **PC or laptop** is detected: the case
-  type the PC reports (a laptop / notebook / convertible case = laptop, a desktop case = PC even with a
-  UPS "battery"), else Windows' power profile, else a battery; `-Machine` overrides it. On a laptop the
-  power plan stays Windows' own, hibernation and the panel's refresh rate stay as they are.
+- Shows the **MSUHost banner** and asks **`Continue? (Y/n)`**. **PC or laptop** is detected from what
+  the PC reports: a laptop / notebook / convertible case or a Mobile power profile = laptop; a desktop
+  case = PC, even with a UPS "battery"; otherwise a battery = laptop. `-Machine` overrides it. A laptop
+  gets no power plan of ours (Windows' own stays); hibernation and the panel's refresh rate stay as
+  they are.
 - The window lists **every app, picked**: click one to leave it out, a row's name (Games, Tools...) for
   the whole row, **Deselect all** / **Select all**. **Drivers & hardware** lists only what this PC's
   hardware needs. The apps taken off show as SKIPPED "not selected".

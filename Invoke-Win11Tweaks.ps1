@@ -2053,6 +2053,11 @@ $script:HardwareGroup = 'Drivers & hardware'   # their row in the window
 # Runtimes in $script:AppsToInstall: installed for EVERY machine - never in the window's list (games and apps need them;
 # the Visual C++ redists and .NET 3.5 aren't in the app lists at all).
 $script:RuntimeApps = @('Microsoft.DirectX')
+# Apps of the winget list that have an installer of their own here (in their place in the list). DirectX: winget's
+# Microsoft.DirectX is only the Store apps' DirectX framework - the runtime games need is Microsoft's End-User Runtime.
+$script:AppCustom = @{
+    'Microsoft.DirectX' = { Install-DirectXRuntime }
+}
 # What the script remembers between runs on this PC: the date the promo apps were removed (CustomRemoveMoreApps) and the
 # GUID of the power plan it made (PcPowerPlan; LaptopPowerPlan = 1.6 / 1.7's laptop plan, until it is removed).
 $script:StateKey = 'HKLM:\SOFTWARE\win11-tweaks'
@@ -2242,6 +2247,12 @@ $script:DesktopShortcutApps = @{
     'Blizzard.BattleNet'      = @{ Name = 'Battle.net'; Exe = "${env:ProgramFiles(x86)}\Battle.net\Battle.net Launcher.exe" }
     'Bitwarden'               = @{ Name = 'Bitwarden'; Exe = "$env:ProgramFiles\Bitwarden\Bitwarden.exe" }
     'Parsec'                  = @{ Name = 'Parsec';    Exe = "$env:ProgramFiles\Parsec\parsecd.exe" }
+    # superuser, 2026-09-30: these made none either
+    'JAMSoftware.TreeSize.Free' = @{ Name = 'TreeSize Free'; Exe = "$env:ProgramFiles\JAM Software\TreeSize Free\TreeSizeFree.exe" }
+    'qBittorrent.qBittorrent' = @{ Name = 'qBittorrent'; Exe = "$env:ProgramFiles\qBittorrent\qbittorrent.exe" }
+    'Razer Synapse'           = @{ Name = 'Razer Synapse' }   # its Start Menu shortcut (Razer App Engine starts it)
+    '9PB2MZ1ZMB1S'            = @{ Name = 'iTunes' }          # Store apps: no .lnk anywhere - New-DesktopShortcut goes through
+    '9NP83LWLPZ9K'            = @{ Name = 'Apple Devices' }   # shell:AppsFolder
 }
 # .NET Framework via Windows features (not winget): only 3.5 and 4.
 #   NetFx3        = .NET 3.5 (inherently bundles 2.0/3.0); off by default, may need WU/source.
@@ -2440,10 +2451,39 @@ function Get-StartMenuShortcuts {
     Get-ChildItem $roots -Recurse -Filter '*.lnk' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
 }
 
+function New-ShellLink {
+    # A .lnk file (WScript.Shell)
+    param([string]$Path, [string]$Target, [string]$Arguments = '', [string]$Icon = '')
+    $wsh = New-Object -ComObject WScript.Shell; $sc = $wsh.CreateShortcut($Path)
+    $sc.TargetPath = $Target; if ($Arguments) { $sc.Arguments = $Arguments } else { $sc.WorkingDirectory = (Split-Path $Target) }
+    if ($Icon) { $sc.IconLocation = $Icon }
+    $sc.Save()
+}
+
+function Get-StoreAppLink {
+    # A Store app's way in for a shortcut: its app id (Get-StartApps: "<package family>!<app>") and its own .exe for the
+    # icon (the package's manifest). $null if it is no Store app or not there (yet).
+    param([string]$Name)
+    $app = @(Get-StartApps -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $Name -and "$($_.AppID)" -match '^[^\\{]+![^!]+$' })[0]
+    if (-not $app) { return $null }
+    $family, $appId = "$($app.AppID)" -split '!', 2
+    $icon = ''
+    try {
+        $pkg = @(Get-AppxPackage -ErrorAction Stop | Where-Object { $_.PackageFamilyName -eq $family })[0]
+        if ($pkg) {
+            $man = [xml](Get-Content -LiteralPath (Join-Path $pkg.InstallLocation 'AppxManifest.xml') -Raw -ErrorAction Stop)
+            $exe = @($man.Package.Applications.Application | Where-Object { $_.Id -eq $appId })[0].Executable
+            if ($exe) { $icon = '{0},0' -f (Join-Path $pkg.InstallLocation $exe) }
+        }
+    } catch { }
+    return @{ AppID = [string]$app.AppID; Icon = $icon }
+}
+
 function New-DesktopShortcut {
     # Create a Desktop icon for ONE app, called right after that app installs. Prefer copying the app's
-    # Start Menu shortcut (correct icon+target); else build one from its .exe. Skip if a Desktop icon
-    # already exists (matched by name). Used only for the few apps that don't reliably make their own.
+    # Start Menu shortcut (correct icon+target) - the one of exactly that name first, never an "(Administrator)" or a Help
+    # one; else build one from its .exe; a Store app (no .lnk anywhere): shell:AppsFolder\<its app id>, its own icon. Skip if
+    # a Desktop icon already exists (matched by name). Used only for the apps that don't reliably make their own.
     param([string]$Name, [string]$Exe)
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would create a Desktop shortcut for $Name"; return }
     $pub = "$env:Public\Desktop"; $usr = [Environment]::GetFolderPath('Desktop')
@@ -2452,17 +2492,19 @@ function New-DesktopShortcut {
     if ((Test-Path $dest) -or (Test-Path (Join-Path $usr "$Name.lnk"))) {
         Write-Log DEBUG "Desktop shortcut for $Name already present"; $rec.Status='OK'; $rec.Detail='exists'; $script:Results.Add($rec); return
     }
-    $srcLnk = Get-StartMenuShortcuts | Where-Object {
-        $b = [IO.Path]::GetFileNameWithoutExtension($_); ($b -eq $Name) -or ($b -like "$Name*" -and $b -notmatch '(?i)uninstall|help')
-    } | Select-Object -First 1
+    $lnks = @(Get-StartMenuShortcuts)
+    $srcLnk = @(@($lnks | Where-Object { [IO.Path]::GetFileNameWithoutExtension($_) -eq $Name }) +
+                @($lnks | Where-Object { $b = [IO.Path]::GetFileNameWithoutExtension($_); $b -like "$Name*" -and $b -notmatch '(?i)uninstall|help|administrator' }))[0]
     try {
         if ($srcLnk) {
             Copy-Item -LiteralPath $srcLnk -Destination $dest -Force -ErrorAction Stop
             Write-Log DEBUG "desktop shortcut: $Name"; $rec.Status='OK'
         } elseif ($Exe -and (Test-Path $Exe)) {
-            $wsh = New-Object -ComObject WScript.Shell; $sc = $wsh.CreateShortcut($dest)
-            $sc.TargetPath = $Exe; $sc.WorkingDirectory = (Split-Path $Exe); $sc.Description = $Name; $sc.Save()
+            New-ShellLink -Path $dest -Target $Exe
             Write-Log DEBUG "desktop shortcut: $Name"; $rec.Status='OK'
+        } elseif ($store = Get-StoreAppLink -Name $Name) {
+            New-ShellLink -Path $dest -Target (Join-Path $env:SystemRoot 'explorer.exe') -Arguments "shell:AppsFolder\$($store.AppID)" -Icon $store.Icon
+            Write-Log DEBUG "desktop shortcut: $Name (Store app $($store.AppID))"; $rec.Status='OK'
         } else {
             Write-Log DEBUG "desktop shortcut '$Name': no Start Menu shortcut and no .exe yet - skipping (the app may create its own on first launch)"; $rec.Status='SKIPPED'; $rec.Detail='not found'
         }
@@ -2496,26 +2538,58 @@ function Set-WinRarLicense {
     $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status=$st; Detail=$why })
 }
 
+function Install-DirectXRuntime {
+    # DirectX End-User Runtime (June 2010): the D3DX 9 / 10 / 11, XInput 1.3 and XAudio 2.7 files older games and MSI
+    # Afterburner need - Windows 11 has DirectX 12, not these. (winget's Microsoft.DirectX is only the Store apps' framework,
+    # so Afterburner's setup fetched them itself, in a window of its own - superuser, 2026-09-30.) Microsoft's full package,
+    # signed by Microsoft: unpacked, then DXSETUP /silent. OK / FAILED / DRYRUN.
+    $name = 'DirectX'
+    $url = 'https://download.microsoft.com/download/8/4/A/84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe'
+    $files = @((Join-Path $env:SystemRoot 'System32\d3dx9_43.dll'), (Join-Path $env:SystemRoot 'SysWOW64\d3dx9_43.dll'))   # 64- and 32-bit
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install the DirectX End-User Runtime (June 2010)"; return 'DRYRUN' }
+    if (@($files | Where-Object { Test-Path -LiteralPath $_ }).Count -eq $files.Count) { Write-Log OK "Already installed - $name"; $script:ItemNote = 'already installed'; return 'OK' }
+    Write-Log INFO "Installing $name (End-User Runtime, June 2010)"
+    $tmp = Join-Path $env:TEMP ('directx_Jun2010_redist_{0}.exe' -f (Get-Date -Format 'yyyyMMddHHmmss')); $dir = $tmp -replace '\.exe$', ''
+    try {
+        $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -ErrorAction Stop
+        $ProgressPreference = $pp
+        $sig = Get-AuthenticodeSignature -FilePath $tmp -ErrorAction SilentlyContinue
+        if (-not $sig -or "$($sig.Status)" -ne 'Valid' -or "$($sig.SignerCertificate.Subject)" -notmatch 'Microsoft Corporation') {
+            throw ("the download is not signed by Microsoft ({0}) - not run" -f $(if ($sig) { $sig.Status } else { 'no signature' }))
+        }
+        Set-LiveWhat 'unpacking' -NoClock
+        $p = Start-Process -FilePath $tmp -ArgumentList "/Q /T:`"$dir`"" -Wait -PassThru -WindowStyle Hidden
+        $setup = Join-Path $dir 'DXSETUP.exe'
+        if (-not (Test-Path -LiteralPath $setup)) { throw "unpacking failed (exit code $($p.ExitCode))" }
+        Set-LiveWhat 'installing' -NoClock
+        $p = Start-Process -FilePath $setup -ArgumentList '/silent' -Wait -PassThru
+        Write-Log DEBUG "DXSETUP exit code: $($p.ExitCode)"
+        if (@($files | Where-Object { Test-Path -LiteralPath $_ }).Count -eq $files.Count) { Write-Log OK 'Done!'; return 'OK' }
+        throw "DXSETUP exit code $($p.ExitCode), the runtime is not there"
+    } catch {
+        Write-Log WARN "Failed - $name ($($_.Exception.Message))"; $script:ItemFail = $_.Exception.Message; return 'FAILED'
+    } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 function Install-RazerSynapse {
-    # Razer Synapse 4 (superuser, 2026-09-30). Its one installer (the Razer hub) has no silent mode - Razer's own parts do:
-    # App Engine, Synapse and Chroma (/S), Razer Central (/silent), Game Manager (Inno Setup). The current parts come from
-    # Razer's manifest - the one the hub reads -, each must be signed by Razer. OK / FAILED / DRYRUN.
+    # Razer Synapse 4 (superuser, 2026-09-30). Its one installer (the Razer hub) has no silent mode - Razer's own parts do.
+    # Only Synapse and Razer App Engine, which Synapse 4 runs on (his ask: Synapse, nothing else - no Chroma, Razer Central
+    # or Game Manager; Synapse offers its modules itself). The current parts come from Razer's manifest - the one the hub
+    # reads -, each must be signed by Razer. OK / FAILED / DRYRUN.
     $name = 'Razer Synapse'
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $name (Razer's parts, from Razer's manifest)"; return 'DRYRUN' }
     if (Test-AppInstalled -NamePattern 'Razer Synapse*') { Write-Log OK "Already installed - $name"; $script:ItemNote = 'already installed'; return 'OK' }
     try {
         $ep = @((Invoke-RestMethod 'https://discovery3.razerapi.com/api/v1/endpoints' -UseBasicParsing -ErrorAction Stop).data.items | Where-Object { $_.name -eq 'prod' })[0]
         $man = Invoke-RestMethod ('https://manifest3.razerapi.com/api/v1/releases/{0}/tags/prod/products?os=windows&osver=11&arch=64' -f $ep.hash) -UseBasicParsing -ErrorAction Stop
-        $mods = @($man.data.items | Where-Object { $_.name -in 'Anne', 'Chroma', 'GameBooster2' } | ForEach-Object { $_.modules })
+        $mods = @($man.data.items | Where-Object { $_.name -eq 'Anne' } | ForEach-Object { $_.modules })   # Anne = Synapse 4
     } catch {
         Write-Log WARN "Failed - $name (Razer's download list: $($_.Exception.Message))"; $script:ItemFail = "Razer's download list did not answer"; return 'FAILED'
     }
     $parts = @(
-        @{ Module = 'Razer App Engine'; Label = 'Razer App Engine';   Args = '/S' }
-        @{ Module = 'Razer Synapse';    Label = 'Razer Synapse';      Args = '/S' }
-        @{ Module = 'Razer Chroma';     Label = 'Razer Chroma';       Args = '/S' }
-        @{ Module = 'Natasha';          Label = 'Razer Central';      Args = '/silent' }
-        @{ Module = 'GMS3';             Label = 'Razer Game Manager'; Args = '/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART' }
+        @{ Module = 'Razer App Engine'; Label = 'Razer App Engine'; Args = '/S' }
+        @{ Module = 'Razer Synapse';    Label = 'Razer Synapse';    Args = '/S' }
     )
     $k = 0
     foreach ($part in $parts) {
@@ -2737,13 +2811,12 @@ function Get-Hardware {
 }
 
 function Skip-NotSelected {
-    # This app was taken off the window's list: log it, record it as SKIPPED and return $true
-    # (the caller moves on).
+    # This app was taken off the window's list: the log says so and $true (the caller moves on). Not listed anywhere else -
+    # the run shows only what it installs (superuser, 2026-09-30).
     param([string]$Key, [string]$Content, [string]$Label)
     if (-not ($script:NotSelected -and $script:NotSelected.ContainsKey($Key))) { return $false }
     $why = $script:NotSelected[$Key]; if ($why -isnot [string]) { $why = 'not selected' }
     Write-Log INFO ("Skipping {0} ({1})" -f $Label, $why)
-    $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$Key; Content=$Content; Status='SKIPPED'; Detail=$why })
     return $true
 }
 
@@ -2803,7 +2876,6 @@ function Get-InstallPlan {
 function Invoke-InstallPhase {
     Write-Log INFO "=========== INSTALLING APPS ==========="
     Write-UiPhase 'Apps'
-    $notSelected = [System.Collections.Generic.List[string]]::new()   # the apps taken off the list - one rail line at the end
     $hw = Get-Hardware
     if ($script:Gui) { Send-GuiEvent 'plan' @{ Apps = @(Get-InstallPlan -Hardware $hw) } }
 
@@ -2835,17 +2907,16 @@ function Invoke-InstallPhase {
             Test-GuiStop   # Stop in the window: before the next app
             $label = Get-AppLabel $id
             $req = $script:AppRequire[$id]
-            if ($req -and -not (Test-Gate $req.Require)) {   # e.g. NZXT CAM with no NZXT device
+            if ($req -and -not (Test-Gate $req.Require)) {   # e.g. NZXT CAM with no NZXT device: the log only (superuser, 2026-09-30)
                 Write-Log INFO ("Skipping {0} ({1})" -f $label, $req.RequireMsg)
-                $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status='SKIPPED'; Detail=[string]$req.RequireMsg })
-                Write-Ui (Format-ItemLine -Name $label -Status 'SKIPPED' -Note ([string]$req.RequireMsg))
                 continue
             }
-            if (Skip-NotSelected -Key $id -Content $id -Label $label) { $notSelected.Add($label); continue }   # no icon / WinRAR license either
+            if (Skip-NotSelected -Key $id -Content $id -Label $label) { continue }   # no icon / WinRAR license either
             $from = $script:Results.Count + 1
             $script:ItemNote = ''; $script:ItemFail = ''
             Start-LiveItem -Name $label -What 'installing'
-            $st = Install-App -Id $id -Location $script:AppLocations[$id] -DetectName $script:AppDetectNames[$id] -Source $script:AppSources[$id]
+            $st = if ($script:AppCustom -and $script:AppCustom[$id]) { & $script:AppCustom[$id] }
+                  else { Install-App -Id $id -Location $script:AppLocations[$id] -DetectName $script:AppDetectNames[$id] -Source $script:AppSources[$id] }
             $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status=$st; Detail=$script:ItemFail })
             if ($st -ne 'FAILED' -and $script:DesktopShortcutApps.ContainsKey($id)) { $sc = $script:DesktopShortcutApps[$id]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
             if ($id -eq 'RARLab.WinRAR') { Set-WinRarLicense }   # license right after WinRAR installs (clean pairing)
@@ -2860,17 +2931,22 @@ function Invoke-InstallPhase {
     # Non-winget apps (direct vendor download): Chrome, Bitwarden, Parsec... and the drivers (their hardware only)
     foreach ($d in $script:DirectApps) {
         Test-GuiStop
-        if ($d.Machine -and $d.Machine -ne $script:MachineType) {   # e.g. the chipset / Radeon drivers are PC only
+        # the apps for hardware this PC does not have are not shown - the log says why (superuser, 2026-09-30: what is not
+        # found is not listed): the drivers on a laptop (PC only), NVIDIA App with no NVIDIA card...
+        if ($d.Machine -and $d.Machine -ne $script:MachineType) {
             Write-Log INFO ("Skipping {0} ({1} only)" -f $d.Name, $d.Machine)
-            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$d.Name; Content=$d.Name; Status='SKIPPED'; Detail="$($d.Machine) only" })
-            Write-Ui (Format-ItemLine -Name $d.Name -Status 'SKIPPED' -Note "$($d.Machine) only")
             continue
         }
-        if (Skip-NotSelected -Key $d.Name -Content $d.Name -Label $d.Name) { $notSelected.Add($d.Name); continue }   # no icon / Chrome pin either
+        if ($script:HardwareApps -contains $d.Name -and $d.Require -and -not (Test-Gate $d.Require)) {
+            Write-Log INFO ("Skipping {0} ({1})" -f $d.Name, $(if ($d.RequireMsg) { $d.RequireMsg } else { 'not for this PC' }))
+            continue
+        }
+        if (Skip-NotSelected -Key $d.Name -Content $d.Name -Label $d.Name) { continue }   # no icon / Chrome pin either
         $from = $script:Results.Count + 1
         $script:ItemNote = ''; $script:ItemFail = ''
         Start-LiveItem -Name $d.Name -What 'downloading' -NoClock   # Invoke-WebRequest blocks - no clock to tick
         $st = if ($d.Custom) { & $d.Custom } else { Install-DirectDownload @d }   # Razer Synapse, Vencord: their own installers
+        if ($st -eq 'SKIPPED') { $null = Stop-LiveItem; continue }   # e.g. Vencord with no Discord: the installer logged why - not listed
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$d.Name; Content=$d.Name; Status=$st; Detail=$(if ($st -eq 'FAILED' -and $script:ItemFail) { $script:ItemFail } elseif ($st -eq 'SKIPPED' -and $script:ItemNote) { $script:ItemNote } else { 'direct' }) })
         if ($st -eq 'OK' -and $script:DesktopShortcutApps.ContainsKey($d.Name)) { $sc = $script:DesktopShortcutApps[$d.Name]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
         if ($d.Name -eq 'Google Chrome') { $script:ChromePinned = Add-ChromeTaskbarPin }   # pin Chrome to the taskbar RIGHT AFTER it installs
@@ -2884,13 +2960,11 @@ function Invoke-InstallPhase {
     foreach ($a in $script:VendorApps) {
         Test-GuiStop
         $miss = Get-VendorAppMiss $a $hw
-        if ($miss) {   # NOT a failure - just not this vendor's machine
-            Write-Log DEBUG "$($a.Name): skipped (${miss}: '$hw')"
-            $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status='SKIPPED'; Detail=$miss })
-            Write-Ui (Format-ItemLine -Name $a.Name -Status 'SKIPPED' -Note $miss)
+        if ($miss) {   # not this vendor's machine: not shown, the log says why
+            Write-Log INFO "$($a.Name): skipped (${miss}: '$hw')"
             continue
         }
-        if (Skip-NotSelected -Key $a.Id -Content $a.Name -Label $a.Name) { $notSelected.Add($a.Name); continue }
+        if (Skip-NotSelected -Key $a.Id -Content $a.Name -Label $a.Name) { continue }
         $from = $script:Results.Count + 1
         $script:ItemNote = ''; $script:ItemFail = ''
         Start-LiveItem -Name $a.Name -What 'installing'
@@ -2900,7 +2974,6 @@ function Invoke-InstallPhase {
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=$st; Detail=$(if ($st -eq 'FAILED' -and $script:ItemFail) { $script:ItemFail } else { $hw }) })
         Write-AppLine -Name $a.Name -Status $st -From $from
     }
-    if ($notSelected.Count) { Write-Ui (Format-Row -Glyph (Get-Glyph 'SKIPPED') -Name 'Not selected' -Text ($notSelected -join ', ') -NameWidth 32 -Status 'SKIPPED') }
 
     # (.NET 3.5 was started in the BACKGROUND before this phase (Start-DotNet35) so it downloads in
     #  parallel; it's finished after this phase (Enable-DotNetFeatures). Desktop icons are per-app above.)
@@ -4062,14 +4135,14 @@ function Get-GuiRunParts($M) {
         if ($tail -gt 0) { $apInner += (@($rows[($rows.Count - $tail)..($rows.Count - 1)]) | ForEach-Object { New-GuiResultRow $_ }) -join '' }
         if ($live) { $apInner += New-GuiLiveRow $live.Name $live.What $live.Clock }
         if ($head -gt 0) { $apInner += (@($queued[0..($head - 1)]) | ForEach-Object { New-GuiRow (New-GuiText $GuiDot $GuiC.line2 14 'Bold') ([string]$_) '' '' $GuiC.tx3 }) -join '' }
-        $more = @(); if ($queued.Count -gt $head) { $more += "+ $($queued.Count - $head) more queued" }; if ($skipN) { $more += "$skipN not for this PC" }
+        $more = @(); if ($queued.Count -gt $head) { $more += "+ $($queued.Count - $head) more queued" }; if ($skipN) { $more += "$skipN skipped" }
         if ($more) { $apInner += New-GuiText (ConvertTo-GuiXml (Join-GuiText $more)) $GuiC.tx3 11.5 'Normal' '18,4,0,0' }
         $apRight = (New-GuiText "$doneN" $GuiC.tx 12 'SemiBold') + (New-GuiRight " / $($plan.Count)")
     } elseif ($ap.State -eq 'todo') {
         $apRight = New-GuiRight 'next'; $apInner = ''
     } else {
         $inst = @($rows | Where-Object { $_.Status -in 'OK', 'DRYRUN' -and $_.Name -ne 'Not selected' }).Count
-        $apRight = New-GuiRight (Join-GuiText @("$inst $(if ($b.DryRun) { 'would install' } else { 'installed' })", $(if ($skipN) { "$skipN not for this PC" })))
+        $apRight = New-GuiRight (Join-GuiText @("$inst $(if ($b.DryRun) { 'would install' } else { 'installed' })", $(if ($skipN) { "$skipN skipped" })))
         $apInner = Get-GuiBadRows $ap
     }
     $body += New-GuiNode (Get-GuiKind $ap) (New-GuiTitle 'Apps') $apRight $apInner
@@ -4143,7 +4216,7 @@ function Get-GuiDoneParts($M) {
     $ap = $M.Apps; $rows = @($ap.Rows)
     $inst = @($rows | Where-Object { $_.Status -in 'OK', 'DRYRUN' -and $_.Name -ne 'Not selected' }).Count
     $skipN = @($rows | Where-Object { $_.Status -eq 'SKIPPED' -and $_.Name -ne 'Not selected' }).Count
-    $apText = if ($ap.State -eq 'todo') { 'did not run' } else { Join-GuiText @("$inst $(if ($b.DryRun) { 'would install' } else { 'installed' })", $(if ($skipN) { "$skipN not for this PC" })) }
+    $apText = if ($ap.State -eq 'todo') { 'did not run' } else { Join-GuiText @("$inst $(if ($b.DryRun) { 'would install' } else { 'installed' })", $(if ($skipN) { "$skipN skipped" })) }
     $apInner = ''
     if ($rows.Count) {
         $half = [math]::Ceiling($rows.Count / 2)

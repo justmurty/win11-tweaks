@@ -949,7 +949,7 @@ function Install-App {
     if ($Location) { $wingetArgs += " --location `"$Location`"" }   # e.g. Battle.net requires an install location
     if ($script:AppScopes -and $script:AppScopes[$Id]) { $wingetArgs += " --scope $($script:AppScopes[$Id])" }   # e.g. TreeSize: for the machine
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $label"; return 'DRYRUN' }
-    if (Test-AppInstalled -Id $Id -NamePattern $DetectName) { Write-Log OK "Already installed - $label"; $script:ItemNote = 'already installed'; return 'OK' }
+    if (Test-AppInstalled -Id $Id -NamePattern $DetectName) { return (Update-App -Id $Id -Label $label -Source $src -Location $Location) }
     Write-Log INFO "Installing $label"
     $wo = Join-Path $env:TEMP 'winget_out.log'
     try {
@@ -981,6 +981,81 @@ function Install-App {
     }
 }
 
+function Update-App {
+    # An app that is already installed goes to the latest (superuser, 2026-09-30: upgrade them all): winget upgrade,
+    # silent and never a question (a prompt would hold the run). The app is there whatever winget says, so this is always
+    # OK - a failed update is a warning and the app's note. winget's "nothing to do" answers leave it as it is.
+    param([string]$Id, [string]$Label, [string]$Source = 'winget', [string]$Location)
+    if (@($script:NoUpdateApps | Where-Object { $Id -like $_ }).Count) { Write-Log OK "Already installed - $Label"; $script:ItemNote = 'already installed'; return 'OK' }
+    $a = "upgrade --id $Id --exact --accept-package-agreements --accept-source-agreements --source $Source --silent --disable-interactivity"
+    if ($Location) { $a += " --location `"$Location`"" }   # Battle.net: as when it was installed
+    if ($script:AppScopes -and $script:AppScopes[$Id]) { $a += " --scope $($script:AppScopes[$Id])" }
+    $left = @{ '0x8A15002B' = 'no newer version'; '0x8A15004F' = 'the installed one is newer'; '0x8A15010E' = 'a newer one is installed'
+               '0x8A150050' = 'winget cannot tell its version'; '0x8A150014' = 'not a winget install'; '0x8A150068' = 'pinned in winget'
+               '0x8A15008E' = 'installed another way than winget''s package'; '0x8A150114' = 'its installer does not update' }
+    Write-Log INFO "$Label is installed - updating it to the latest"
+    Set-LiveWhat 'updating'
+    $wo = Join-Path $env:TEMP 'winget_out.log'; $why = ''
+    try { $hex = '0x{0:X8}' -f (Invoke-Winget -ArgumentList $a -OutFile $wo) } catch { $hex = ''; $why = $_.Exception.Message }
+    if ($hex -eq '0x00000000') { Write-Log OK "Updated to the latest - $Label"; $script:ItemNote = 'updated to the latest' }
+    elseif ($hex -eq '0x8A150109') { Write-Log OK "Updated - $Label (it finishes at the next restart)"; $script:ItemNote = 'updated - finishes after a restart' }
+    elseif ($left.ContainsKey($hex)) { Write-Log OK "Already installed - $Label ($($left[$hex]))"; $script:ItemNote = 'already installed' }
+    else {
+        Write-Log WARN ("{0}: installed, but the update failed ({1})" -f $Label, $(if ($hex) { "winget exit code $hex" } else { $why }))
+        $script:ItemNote = 'update failed, see the log'
+        if (Test-Path $wo) { Get-Content $wo -ErrorAction SilentlyContinue | Where-Object { $_.Trim() } | Select-Object -Last 8 | ForEach-Object { Write-Log DEBUG "  winget> $($_.Trim())" } }
+    }
+    Remove-Item $wo -Force -ErrorAction SilentlyContinue
+    return 'OK'
+}
+
+function Get-InstalledVersion {
+    # The newest DisplayVersion Add/Remove Programs shows for a program ('' if none). The newest, as FL Studio keeps each
+    # year's version next to the one before ("FL Studio 2024" 24.2.2.4648, "FL Studio 2025" 25.1.1.4879).
+    param([string[]]$NamePattern)
+    $best = ''
+    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                   'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*') {
+        foreach ($e in @(Get-ItemProperty $k -ErrorAction SilentlyContinue)) {
+            $dn = [string]$e.DisplayName; $v = [string]$e.DisplayVersion
+            if ($dn -and $v -and @($NamePattern | Where-Object { $dn -like $_ }).Count -and (Compare-Version $v $best) -gt 0) { $best = $v }
+        }
+    }
+    return $best
+}
+
+function Compare-Version {
+    # 1 / 0 / -1: version text A against B, part by part as numbers ("7.01.08.129" = "7.1.8.129"), over the parts both have
+    # (a file name's "25.2.4.4960" = "25.2.4" somewhere else). No version at all is the lowest.
+    param([string]$A, [string]$B)
+    $x = [regex]::Match($A, '\d+(\.\d+)*').Value; $y = [regex]::Match($B, '\d+(\.\d+)*').Value
+    if (-not $x -or -not $y) { return ([int][bool]$x - [int][bool]$y) }
+    $x = @($x -split '\.' | ForEach-Object { [double]$_ }); $y = @($y -split '\.' | ForEach-Object { [double]$_ })
+    for ($i = 0; $i -lt [Math]::Min($x.Count, $y.Count); $i++) {
+        if ($x[$i] -gt $y[$i]) { return 1 }
+        if ($x[$i] -lt $y[$i]) { return -1 }
+    }
+    return 0
+}
+
+function Resolve-FinalUrl {
+    # Where a vendor's "latest" link leads - its redirects followed, nothing downloaded (a HEAD request): the file's name
+    # carries the version.
+    param([string]$Url)
+    $rq = [System.Net.WebRequest]::Create($Url)
+    $rq.Method = 'HEAD'; $rq.UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'; $rq.Timeout = 30000
+    $rs = $rq.GetResponse()
+    try { return [string]$rs.ResponseUri } finally { $rs.Close() }
+}
+
+function Get-DirectFailStatus {
+    # A direct app's failure. A failed UPDATE leaves the app as it was - still installed, so OK, and its note says the
+    # update failed (the WARN is in the log); anything else is FAILED, with why.
+    param([string]$Why, [bool]$Updating)
+    if ($Updating) { $script:ItemNote = 'update failed, see the log'; return 'OK' }
+    $script:ItemFail = $Why; return 'FAILED'
+}
+
 function Install-DirectDownload {
     # Download a vendor installer straight from a URL (or a scraped URL) and run it silently.
     # For apps NOT on winget (e.g. NVIDIA App). DryRun-aware. Returns OK/SKIPPED/FAILED/DRYRUN.
@@ -995,21 +1070,38 @@ function Install-DirectDownload {
         [hashtable]$Headers,          # extra request headers for the download (AMD serves its files only with an amd.com Referer)
         [string]$Signer,              # the download must carry a valid signature from this publisher, or it is not run
         [string]$Machine,             # 'PC' / 'Laptop' only - checked by the install phase (listed so @splatting works)
-        [switch]$WaitMainOnly         # wait for the installer process only, not for an app it leaves running (see below)
+        [switch]$WaitMainOnly,        # wait for the installer process only, not for an app it leaves running (see below)
+        [switch]$UpdateFromUrl        # no updater of its own: installed, but older than the download -> installed over it
     )
     if ($Require) {
         $met = $false; try { $met = [bool](& $Require) } catch { }
         if (-not $met) { Write-Log INFO "${Name}: skipped ($RequireMsg)"; $script:ItemNote = $RequireMsg; return 'SKIPPED' }
     }
+    $from = ''   # the installed version this run updates (UpdateFromUrl); the others are left to update themselves
     if ($DetectName -and -not $script:DryRun -and (Test-AppInstalled -NamePattern $DetectName)) {
-        Write-Log OK "Already installed - $Name"; $script:ItemNote = 'already installed'; return 'OK'
+        if ($UpdateFromUrl) { $from = Get-InstalledVersion -NamePattern $DetectName }
+        if (-not $from) { Write-Log OK "Already installed - $Name"; $script:ItemNote = 'already installed'; return 'OK' }
     }
-    if ($UrlScript) {
-        try { $Url = & $UrlScript } catch { Write-Log WARN "Failed - $Name (could not resolve download URL: $($_.Exception.Message))"; $script:ItemFail = 'could not find the download'; return 'FAILED' }
+    try {   # an update needs the file's own name (its version) - where the vendor's "latest" link leads
+        if ($UrlScript) { $Url = & $UrlScript } elseif ($from) { $Url = Resolve-FinalUrl -Url $Url }
+    } catch {
+        if ($from) { Write-Log OK "Already installed - $Name $from (could not check for a newer one: $($_.Exception.Message))"; $script:ItemNote = 'already installed'; return 'OK' }
+        Write-Log WARN "Failed - $Name (could not resolve download URL: $($_.Exception.Message))"; $script:ItemFail = 'could not find the download'; return 'FAILED'
     }
-    if (-not $Url) { Write-Log WARN "Failed - $Name (no download URL found)"; $script:ItemFail = 'no download link found'; return 'FAILED' }
+    if (-not $Url) {
+        if ($from) { Write-Log OK "Already installed - $Name $from (could not check for a newer one: no download link found)"; $script:ItemNote = 'already installed'; return 'OK' }
+        Write-Log WARN "Failed - $Name (no download URL found)"; $script:ItemFail = 'no download link found'; return 'FAILED'
+    }
+    if ($from) {
+        $to = [regex]::Match(([uri]::UnescapeDataString(($Url -split '[?#]')[0]) -replace '^.*/', ''), '\d+(\.\d+){2,3}').Value
+        if (-not $to -or (Compare-Version $to $from) -le 0) {
+            Write-Log OK ("Already installed - {0} {1} ({2})" -f $Name, $from, $(if ($to) { "the latest is $to" } else { 'no version in the download''s name' }))
+            $script:ItemNote = 'already installed'; return 'OK'
+        }
+    }
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $Name (direct download from $Url)"; return 'DRYRUN' }
-    Write-Log INFO "Installing $Name"
+    $failed = if ($from) { "${Name}: installed, but the update failed" } else { "Failed - $Name" }   # the WARN lines below
+    Write-Log INFO $(if ($from) { "Updating $Name $from -> $to" } else { "Installing $Name" })
     $ext = if ($Url -match '\.msi(\?|#|$)') { 'msi' } else { 'exe' }   # MSI installers (e.g. Chrome) need msiexec
     $tmp = Join-Path $env:TEMP ("{0}_{1}.{2}" -f ($Name -replace '\W','_'), (Get-Date -Format 'yyyyMMddHHmmss'), $ext)
     Write-Log DEBUG "downloading $Name from $Url"
@@ -1021,7 +1113,7 @@ function Install-DirectDownload {
         $ProgressPreference = $pp
     } catch {
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue   # no half file left in TEMP (Adrenalin alone is 1.6 GB)
-        Write-Log WARN "Failed - $Name (download failed: $($_.Exception.Message))"; $script:ItemFail = 'download failed'; return 'FAILED'
+        Write-Log WARN "$failed (download failed: $($_.Exception.Message))"; return (Get-DirectFailStatus 'download failed' ([bool]$from))
     }
     # sanity: make sure we got a real installer (MZ='MZ' = exe, or OLE 'D0 CF 11 E0' = msi), not an HTML page
     try {
@@ -1030,20 +1122,18 @@ function Install-DirectDownload {
     $isExe = ($sig[0] -eq 0x4D -and $sig[1] -eq 0x5A)
     $isMsi = ($sig[0] -eq 0xD0 -and $sig[1] -eq 0xCF -and $sig[2] -eq 0x11 -and $sig[3] -eq 0xE0)
     if (-not ($isExe -or $isMsi)) {
-        Write-Log WARN "Failed - $Name (downloaded file is not an exe/msi installer; get it manually from $Url)"
-        $script:ItemFail = 'the download is not an installer'
-        Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return 'FAILED'
+        Write-Log WARN "$failed (downloaded file is not an exe/msi installer; get it manually from $Url)"
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return (Get-DirectFailStatus 'the download is not an installer' ([bool]$from))
     }
     if ($Signer) {   # a scraped link must lead to the vendor's own signed file - anything else is never run
         $sig = Get-AuthenticodeSignature -FilePath $tmp -ErrorAction SilentlyContinue
         $subject = if ($sig -and $sig.SignerCertificate) { [string]$sig.SignerCertificate.Subject } else { '' }
         if (-not $sig -or "$($sig.Status)" -ne 'Valid' -or $subject -notmatch [regex]::Escape($Signer)) {
-            Write-Log WARN ("Failed - {0} (the download is not signed by {1}: {2} {3}) - not run" -f $Name, $Signer, $(if ($sig) { $sig.Status } else { 'no signature' }), $subject)
-            $script:ItemFail = "not signed by $Signer - not run"
-            Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return 'FAILED'
+            Write-Log WARN ("{0} (the download is not signed by {1}: {2} {3}) - not run" -f $failed, $Signer, $(if ($sig) { $sig.Status } else { 'no signature' }), $subject)
+            Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return (Get-DirectFailStatus "not signed by $Signer - not run" ([bool]$from))
         }
     }
-    Set-LiveWhat 'installing' -NoClock:(-not $WaitMainOnly)   # only the WaitMainOnly wait below can tick the clock
+    Set-LiveWhat $(if ($from) { 'updating' } else { 'installing' }) -NoClock:(-not $WaitMainOnly)   # only the WaitMainOnly wait below can tick the clock
     try {
         $sp = if ($isMsi) { @{ FilePath = 'msiexec.exe'; ArgumentList = "/i `"$tmp`" $SilentArgs" } }
               elseif ($SilentArgs) { @{ FilePath = $tmp; ArgumentList = $SilentArgs } }
@@ -1058,17 +1148,20 @@ function Install-DirectDownload {
         $code = $p.ExitCode
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         Write-Log DEBUG "$Name installer exit code: $code"
+        if ($from) { $script:ItemNote = 'updated to the latest' }   # (a failure below says otherwise)
         if ($code -in 0, 3010, 1641) { Write-Log OK "Done!"; return 'OK' }
         # Non-standard exit code - but some installers (e.g. FL Studio's NSIS) return an odd code even on a
-        # clean install. Trust ARP over the exit code: if the app is now actually present, it worked.
-        if ($DetectName -and (Test-AppInstalled -NamePattern $DetectName)) {
+        # clean install. Trust ARP over the exit code: if the app is now actually present (an update: in the new
+        # version), it worked.
+        if ($DetectName -and $(if ($from) { (Compare-Version (Get-InstalledVersion -NamePattern $DetectName) $to) -ge 0 } else { Test-AppInstalled -NamePattern $DetectName })) {
             Write-Log DEBUG "$Name exit code $code is non-standard, but it IS installed (ARP match) - treating as success"
             Write-Log OK "Done!"; return 'OK'
         }
-        Write-Log WARN "Failed - $Name (installer exit code $code)"; $script:ItemFail = "installer exit code $code"; return 'FAILED'
+        Write-Log WARN "$failed (installer exit code $code)"; return (Get-DirectFailStatus "installer exit code $code" ([bool]$from))
     } catch {
-        Write-Log WARN "Failed - $Name : $($_.Exception.Message)"; $script:ItemFail = $_.Exception.Message
-        Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return 'FAILED'
+        $m = $_.Exception.Message
+        Write-Log WARN "$failed : $m"
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return (Get-DirectFailStatus $m ([bool]$from))
     }
 }
 
@@ -1985,11 +2078,14 @@ $script:DirectApps = @(
     }
     @{  # FL Studio - REMOVED from winget (manifest folder 404 -> winget "No package found"). Image-Line's
         # official "latest Windows installer" redirect always resolves to the current flstudio_win64_*.exe
-        # (verified: -> install.image-line.com/flstudio/flstudio_win64_26.1.1.5547.exe). NSIS installer -> /S.
+        # (verified: -> install.image-line.com/flstudio/flstudio_win64_26.1.6.5639.exe). NSIS installer -> /S.
+        # No updater of its own: an older one gets the latest (the file's name vs Add/Remove Programs' DisplayVersion,
+        # both 26.1.6.5639-style; a new year's version installs next to the old one, as Image-Line's does).
         Name       = 'FL Studio'
         Url        = 'https://support.image-line.com/redirect/flstudio_win_installer'
         SilentArgs = '/S'
         DetectName = 'FL Studio*'
+        UpdateFromUrl = $true
     }
     # ---- drivers from the maker's own site, not Windows Update (superuser, 2026-09-27). PC only: a laptop keeps its
     # maker's tuned drivers (AMD and Intel both say so); never in a virtual machine (emulated chipset). Every file must be
@@ -2007,6 +2103,7 @@ $script:DirectApps = @(
         Headers    = @{ Referer = 'https://www.amd.com/' }
         SilentArgs = '/S'
         DetectName = 'AMD Chipset Software*'
+        UpdateFromUrl = $true              # nothing else updates it: AMD_Chipset_Software_8.08.12.551.exe vs DisplayVersion 8.08.12.551
         Signer     = 'Advanced Micro Devices'
         Machine    = 'PC'
         Require    = { (Get-CpuVendor) -eq 'AuthenticAMD' -and (Test-PciVendor '1022') -and -not (Test-VirtualMachine) }
@@ -2121,6 +2218,10 @@ $script:VCRedists = @(
     'Microsoft.VCRedist.2013.x86', 'Microsoft.VCRedist.2013.x64',
     'Microsoft.VCRedist.2015+.x86', 'Microsoft.VCRedist.2015+.x64'
 )
+# What is already installed goes to the latest (winget upgrade) - except these, out of support (no new builds come):
+# DirectX's June 2010 runtime and Visual C++ 2005-2013 (2015-2022 is updated). winget ID -like patterns.
+$script:NoUpdateApps = @('Microsoft.DirectX', 'Microsoft.VCRedist.2005.*', 'Microsoft.VCRedist.2008.*', 'Microsoft.VCRedist.2010.*',
+                         'Microsoft.VCRedist.2012.*', 'Microsoft.VCRedist.2013.*')
 
 # WinRAR license embedded as base64 (the only source) - the WinRAR step decodes this and writes
 # rarreg.key into the WinRAR dir(s), so both download-and-run AND the `irm|iex` one-liner license WinRAR.
@@ -2612,7 +2713,7 @@ function Write-AppLine {
     # An app's line once it - and its desktop icon / license / taskbar pin, the records from index $From on - is done
     param([string]$Name, [string]$Status, [int]$From)
     $secs = Stop-LiveItem
-    $extras = [System.Collections.Generic.List[string]]::new(); $warn = $false
+    $extras = [System.Collections.Generic.List[string]]::new(); $warn = $script:ItemNote -like 'update failed*'   # still installed - yellow
     for ($i = $From; $i -lt $script:Results.Count; $i++) {
         $x = $script:Results[$i]
         $what = switch -Wildcard ($x.Id) { 'Desktop.*' { 'desktop icon' } 'WinRAR.License' { 'license' } 'Chrome.Pin' { 'pinned to the taskbar' } default { $null } }
@@ -2675,9 +2776,12 @@ function Invoke-InstallPhase {
             $failed = @($vc | Where-Object { $_.Status -eq 'FAILED' }).Count
             if ($script:DryRun) { Write-Ui (Format-ItemLine -Name $vcName -Status 'DRYRUN' -Note "$($vc.Count) runtimes") }
             elseif ($failed) { Write-Ui (Format-ItemLine -Name $vcName -Status 'FAILED' -Note "$failed of $($vc.Count) failed, see the log" -Seconds $secs) }
-            else {
-                $new = @($vc | Where-Object { $_.Note -ne 'already installed' }).Count
-                Write-Ui (Format-ItemLine -Name $vcName -Status 'OK' -Note $(if ($new) { "$($vc.Count) runtimes" } else { 'already installed' }) -Seconds $secs)
+            else {   # installed now (no note) / updated / an update failed / all there already
+                $new = @($vc | Where-Object { -not $_.Note }).Count
+                $bad = @($vc | Where-Object { $_.Note -like 'update failed*' }).Count
+                $upd = @($vc | Where-Object { $_.Note -like 'updated*' }).Count
+                $note = if ($new) { "$($vc.Count) runtimes" } elseif ($bad) { 'update failed, see the log' } elseif ($upd) { 'updated to the latest' } else { 'already installed' }
+                Write-Ui (Format-ItemLine -Name $vcName -Status 'OK' -Note $note -Seconds $secs -Warn:([bool]$bad))
             }
         }
         foreach ($id in $script:AppsToInstall) {

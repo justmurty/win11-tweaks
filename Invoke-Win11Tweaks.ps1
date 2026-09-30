@@ -1979,12 +1979,20 @@ $script:AppsToInstall = @(
     'RARLab.WinRAR',
     'JAMSoftware.TreeSize.Free',         # superuser, 2026-09-30: TreeSize, qBittorrent, MSI Afterburner (with RivaTuner -
     'qBittorrent.qBittorrent',           # its installer always brings it)
-    'Guru3D.Afterburner'
+    'Guru3D.Afterburner',
+    '9PB2MZ1ZMB1S',                      # iTunes and Apple Devices (superuser, 2026-09-30) - the Microsoft Store's, the way
+    '9NP83LWLPZ9K'                       # Apple offers them for Windows 10 / 11 (see AppSources)
 )
 # winget installs these for the whole machine only when asked (the default scope is the user's - TreeSize would land in
 # the admin's profile). Keyed by winget ID.
 $script:AppScopes = @{
     'JAMSoftware.TreeSize.Free' = 'machine'
+}
+# Apps winget gets from the Microsoft Store, not from its own repository (the Store keeps them up to date too). Keyed by
+# ID (the Store's product ID).
+$script:AppSources = @{
+    '9PB2MZ1ZMB1S' = 'msstore'   # iTunes
+    '9NP83LWLPZ9K' = 'msstore'   # Apple Devices (iPhone / iPad backup, sync and updates)
 }
 # Vendor apps: installed (picked, like every app in the window's list) but ONLY on that vendor's hardware, desktop or
 # laptop alike (Hardware is a regex against Win32_ComputerSystem "<Manufacturer> <Model>", or Require a test):
@@ -2253,6 +2261,8 @@ $script:AppNames = @{
     'JAMSoftware.TreeSize.Free'        = 'TreeSize'
     'qBittorrent.qBittorrent'          = 'qBittorrent'
     'Guru3D.Afterburner'               = 'MSI Afterburner'
+    '9PB2MZ1ZMB1S'                     = 'iTunes'
+    '9NP83LWLPZ9K'                     = 'Apple Devices'
 }
 # The window's app list shows the apps in these rows, in this order - keys as Get-AppChoices gives them (winget ID /
 # direct-app Name / vendor-app Id). The hardware apps found here get their own row ($script:HardwareGroup); an app in no
@@ -2260,8 +2270,8 @@ $script:AppNames = @{
 $script:AppGroups = [ordered]@{
     'Games'            = @('Valve.Steam', 'EpicGames.EpicGamesLauncher', 'Blizzard.BattleNet', 'Ubisoft.Connect', 'Rockstar Games Launcher', 'Google Play Games', 'U.GG')
     'Chat & streaming' = @('Discord.Discord', 'Vencord', 'OBSProject.OBSStudio', 'Parsec')
-    'Media'            = @('VideoLAN.VLC', 'FL Studio')
-    'Tools'            = @('RARLab.WinRAR', 'RevoUninstaller.RevoUninstaller', 'JAMSoftware.TreeSize.Free', 'Skillbrains.Lightshot', 'CPUID.HWMonitor', 'Guru3D.Afterburner', 'SavardSoftware.TurboTop', 'Razer Synapse')
+    'Media'            = @('VideoLAN.VLC', 'FL Studio', '9PB2MZ1ZMB1S')
+    'Tools'            = @('RARLab.WinRAR', 'RevoUninstaller.RevoUninstaller', 'JAMSoftware.TreeSize.Free', 'Skillbrains.Lightshot', 'CPUID.HWMonitor', 'Guru3D.Afterburner', 'SavardSoftware.TurboTop', 'Razer Synapse', '9NP83LWLPZ9K')
     'Internet'         = @('Google Chrome', 'Bitwarden', 'Nextcloud.NextcloudDesktop', 'qBittorrent.qBittorrent')
 }
 
@@ -2798,7 +2808,7 @@ function Invoke-InstallPhase {
             $from = $script:Results.Count + 1
             $script:ItemNote = ''; $script:ItemFail = ''
             Start-LiveItem -Name $label -What 'installing'
-            $st = Install-App -Id $id -Location $script:AppLocations[$id] -DetectName $script:AppDetectNames[$id]
+            $st = Install-App -Id $id -Location $script:AppLocations[$id] -DetectName $script:AppDetectNames[$id] -Source $script:AppSources[$id]
             $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status=$st; Detail=$script:ItemFail })
             if ($st -ne 'FAILED' -and $script:DesktopShortcutApps.ContainsKey($id)) { $sc = $script:DesktopShortcutApps[$id]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
             if ($id -eq 'RARLab.WinRAR') { Set-WinRarLicense }   # license right after WinRAR installs (clean pairing)

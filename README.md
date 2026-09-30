@@ -61,7 +61,8 @@ Every detail goes to a log file for later.
   or all); **PC or laptop is detected**, not asked; the apps for **this PC's hardware** are found, not
   asked (NVIDIA App, AMD / Intel chipset drivers, Intel Driver & Support Assistant, Adrenalin, NZXT CAM,
   Armoury Crate, Alienware Command Center); **what is already installed goes to the latest**; new apps
-  (U.GG, Rockstar Games Launcher, TreeSize, qBittorrent, MSI Afterburner, Razer Synapse, Vencord);
+  (U.GG, Rockstar Games Launcher, TreeSize, qBittorrent, MSI Afterburner, Razer Synapse, Vencord, iTunes,
+  Apple Devices);
   a laptop keeps Windows' own power plan; the Windows (dark) theme; Copilot removed.
 
   New in v1.7.0: **a window** that asks the setup
@@ -80,8 +81,9 @@ Every detail goes to a log file for later.
   the whole row, **Deselect all** / **Select all**. **Drivers & hardware** lists only what this PC's
   hardware needs. The apps taken off show as SKIPPED "not selected".
   Visual C++, DirectX and .NET 3.5 always go in. On the console (no window) everything goes in.
-- Then the **install phase**: **12 Visual C++ redists** + **18 winget apps**
-  (incl. VLC, Lightshot, TurboTop, WinRAR, TreeSize, qBittorrent, MSI Afterburner; **NZXT CAM** only
+- Then the **install phase**: **12 Visual C++ redists** + **20 winget apps**
+  (incl. VLC, Lightshot, TurboTop, WinRAR, TreeSize, qBittorrent, MSI Afterburner; **iTunes** and **Apple
+  Devices** from the Microsoft Store, the way Apple offers them for Windows 11; **NZXT CAM** only
   where an NZXT device is found) + **direct downloads** from the vendor (**Google Chrome**, **Bitwarden**,
   **Parsec**, **Google Play Games**, **FL Studio**, **U.GG**, **Rockstar Games Launcher**, **Razer
   Synapse** — Razer's own parts, silent —, **Vencord** into the signed-in user's Discord; **NVIDIA App**

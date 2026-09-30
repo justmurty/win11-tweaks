@@ -104,7 +104,8 @@ Every detail goes to a log file for later.
 - Already-installed apps (found via `winget list` + Add/Remove Programs) **go to the latest**:
   `winget upgrade`; FL Studio and AMD's chipset software (no updater of their own) when the vendor's
   latest file is newer than the installed version; the other direct downloads update themselves.
-  A failed update leaves the app as it was — a warning, not a failure. DirectX and Visual C++
+  An update that fails is a warning in the log, not a failure (one that hangs, e.g. on a question
+  about the app running, is stopped after 15 minutes — check that app). DirectX and Visual C++
   2005–2013 are out of support and left alone.
 - Makes **no** restore point and does **not** reboot on its own (unless `-Reboot`). Nothing that
   isn't selected is touched.
@@ -185,7 +186,7 @@ the result:
 ```
   ┌  MSUHost  win11-tweaks 1.8.0
   ?  Continue? (Y/n) › y
-  ├─ WIN11-TEST · Windows 11 Pro 25H2 (26200) · PC · all 25 apps
+  ├─ WIN11-TEST · Windows 11 Pro 25H2 (26200) · PC · all 27 apps
   ├─ Tweaks
   │  √ Privacy           telemetry, activity history, location, error reports        4.3s
   │  ! Edge              Microsoft Edge - Debloat: 1 step(s) failed - see the log     140ms

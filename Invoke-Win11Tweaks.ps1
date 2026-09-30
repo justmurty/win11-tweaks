@@ -952,14 +952,21 @@ function Invoke-Winget {
 }
 
 function Stop-ProcessTree {
-    # A process and everything it started (found through the parent process ids), forced
+    # A process and everything it started, forced. A child = its parent id is one of these AND it started after that parent:
+    # Windows reuses the ids of processes that are gone, so an older process can carry a parent id that belongs to someone
+    # else now (the elevation relaunch's first PowerShell -> this script). This script itself never.
     param([int]$Id)
-    $all = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId -ErrorAction SilentlyContinue)
+    $all = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, CreationDate -ErrorAction SilentlyContinue)
+    $born = @{}; foreach ($p in $all) { $born[[int]$p.ProcessId] = $p.CreationDate }
     $ids = [System.Collections.Generic.List[int]]::new(); $ids.Add($Id)
     for ($i = 0; $i -lt $ids.Count; $i++) {
-        foreach ($c in @($all | Where-Object { [int]$_.ParentProcessId -eq $ids[$i] })) { if (-not $ids.Contains([int]$c.ProcessId)) { $ids.Add([int]$c.ProcessId) } }
+        $parent = $ids[$i]; $since = $born[$parent]
+        if (-not $since) { continue }   # its start time unknown: its children cannot be told apart - left
+        foreach ($c in @($all | Where-Object { [int]$_.ParentProcessId -eq $parent -and $_.CreationDate -and $_.CreationDate -ge $since })) {
+            if (-not $ids.Contains([int]$c.ProcessId)) { $ids.Add([int]$c.ProcessId) }
+        }
     }
-    foreach ($x in $ids) { Stop-Process -Id $x -Force -ErrorAction SilentlyContinue }
+    foreach ($x in $ids) { if ($x -ne $PID) { Stop-Process -Id $x -Force -ErrorAction SilentlyContinue } }
 }
 
 function Install-App {

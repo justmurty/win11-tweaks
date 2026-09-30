@@ -163,7 +163,10 @@ The one-liner (and the `.bat`) open a dark window — nothing to install, it is 
 - **Set up this PC** — the PC, its Windows and PC / laptop (detected), then the apps: every one
   picked, in rows (Games, Chat & streaming, Media, Tools, Internet, and Drivers & hardware with only
   what this PC needs); click an app to leave it out, a row's name for the whole row, **Deselect all**
-  / **Select all**; what always goes in. **Start** (or Enter) / **Cancel** — Cancel changes nothing.
+  / **Select all**; what always goes in. When Windows is **not activated**, a **Windows** row on top
+  with **Activate in Settings** (picked): at Start the run's first line opens Settings > System >
+  Activation, where the key goes in — the script itself activates nothing. **Start** (or Enter) /
+  **Cancel** — Cancel changes nothing.
 - **The run** — the clock, then the phases on one line down the left: Tweaks (n / N, then the
   groups), Apps (the last ones done with their times, the one installing now with its own clock,
   the next ones), .NET 3.5 (downloading in the background next to the apps), Finishing. **Log**

@@ -100,6 +100,7 @@ $script:ItemFail             = ''      # ... or why it failed ('winget exit code
 $script:RunClock             = $null   # started when the run starts ("Done in 19m 29s")
 $script:DotNet35Clock        = $null   # started with the .NET 3.5 download
 $script:AppsLabel            = ''      # "all 27 apps" / "24 of 27 apps" - on the machine line (Set-AppsLabel)
+$script:OpenActivation       = $false  # Windows is not activated and the window's box was left on: Settings > Activation opens
 $script:LastPrompt           = ''      # the question on the console right now, as plain text
 # The window (variant A of the design page, superuser's pick 2026-09-28) - see Start-Gui. The run only FEEDS it.
 $script:ConsoleOnly          = [bool]$Console   # -Console: the rail in the console, no window
@@ -1969,6 +1970,7 @@ $script:Tweaks = @(
 # Text = what the group does: a string, one per machine type, or a scriptblock (the counts). A tweak in no group
 # would land in "Other" - the tests make sure none does. The Late tweaks have their own lines (Finishing).
 $script:TweakGroups = @(
+    [pscustomobject]@{ Name = 'Windows activation'; Text = 'Settings > Activation opened'; Ids = @('WindowsActivation') }   # only when it ran
     [pscustomobject]@{ Name = 'Privacy'; Text = 'telemetry, activity history, location, error reports'
         Ids = @('WPFTweaksActivity', 'WPFTweaksConsumerFeatures', 'WPFTweaksDeliveryOptimization', 'WPFTweaksLocation', 'WPFTweaksTelemetry', 'WPFTweaksWPBT', 'CustomWerOff') }
     [pscustomobject]@{ Name = 'Apps removed'; Text = { if ($script:UiCount.Appx) { '{0} pre-installed apps removed' -f $script:UiCount.Appx } else { 'pre-installed apps, OneDrive, Widgets, Phone Link' } }
@@ -2360,6 +2362,16 @@ function Invoke-Tweaks {
     param([switch]$Late)
     $list = @($script:Tweaks | Where-Object { [bool]$_.Late -eq [bool]$Late })
     Write-UiPhase $(if ($Late) { 'Finishing' } else { 'Tweaks' })
+    if (-not $Late -and $script:OpenActivation) {   # first of all (superuser, 2026-09-30): Windows not activated, the box left on
+        Test-GuiStop
+        Send-GuiEvent 'progress' @{ Name = 'Windows activation'; N = 0; Total = $list.Count }
+        Show-Live (Format-Row -Glyph "{b:$($script:G.Run)}" -Name 'Windows activation' -NameWidth 60 -Right "0/$($list.Count)")
+        Write-Log INFO 'Applying Windows activation - open Settings > System > Activation' 'WindowsActivation'
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        Open-ActivationSettings
+        $script:Results.Add([pscustomobject]@{ Phase='Tweak'; Id='WindowsActivation'; Content='Windows activation - open Settings > System > Activation'
+                                               Status=$(if ($script:DryRun) { 'DRYRUN' } else { 'OK' }); Detail=''; Seconds=$sw.Elapsed.TotalSeconds })
+    }
     $n = 0
     foreach ($t in $list) {
         Test-GuiStop   # Stop in the window: before the next tweak
@@ -2430,15 +2442,15 @@ function Write-TweakGroups {
             $st = if (@($bad | Where-Object { $_.Status -eq 'FAILED' })) { 'FAILED' } else { 'WARN' }
             $what = if ($bad[0].Detail) { '{0}: {1}' -f $bad[0].Content, $bad[0].Detail } else { [string]$bad[0].Content }
             if ($bad.Count -gt 1) { $what += " (+$($bad.Count - 1) more)" }
-            Write-Ui (Format-Row -Glyph (Get-Glyph $st) -Name $grp.Name -Text $what -TextColor $(if ($st -eq 'FAILED') { 'r' } else { 'y' }) -Right $time -Status $st)
+            Write-Ui (Format-Row -Glyph (Get-Glyph $st) -Name $grp.Name -Text $what -TextColor $(if ($st -eq 'FAILED') { 'r' } else { 'y' }) -Right $time -Status $st -NameWidth 20)
         } elseif ($script:DryRun) {
-            Write-Ui (Format-Row -Glyph (Get-Glyph 'DRYRUN') -Name $grp.Name -Text $text -Right 'dry run' -Status 'DRYRUN')
+            Write-Ui (Format-Row -Glyph (Get-Glyph 'DRYRUN') -Name $grp.Name -Text $text -Right 'dry run' -Status 'DRYRUN' -NameWidth 20)
         } else {
-            Write-Ui (Format-Row -Glyph (Get-Glyph 'OK') -Name $grp.Name -Text $text -Right $time -Status 'OK')
+            Write-Ui (Format-Row -Glyph (Get-Glyph 'OK') -Name $grp.Name -Text $text -Right $time -Status 'OK' -NameWidth 20)
         }
     }
     foreach ($only in @($done | Where-Object { $_.Status -eq 'SKIPPED' } | Group-Object Detail)) {
-        Write-Ui (Format-Row -Glyph (Get-Glyph 'SKIPPED') -Name $only.Name -Text ((@($only.Group | ForEach-Object { Get-ShortName $_.Content })) -join ', ') -Status 'SKIPPED')
+        Write-Ui (Format-Row -Glyph (Get-Glyph 'SKIPPED') -Name $only.Name -Text ((@($only.Group | ForEach-Object { Get-ShortName $_.Content })) -join ', ') -Status 'SKIPPED' -NameWidth 20)
     }
     # the window: the phase is over - how many tweaks were applied and how long they took
     $ran = @($done | Where-Object { $_.Status -ne 'SKIPPED' -and "$($_.Id)" -notlike 'Trialware.*' })
@@ -3351,6 +3363,7 @@ function Show-Intro {
     $mc = Get-MachineChoice
     $script:MachineType = $mc.Type
     Write-Log INFO ("Machine type: {0} ({1})" -f $mc.Type, $mc.Why)
+    if (-not (Get-WindowsActivation).Activated) { Write-Log INFO 'Windows is not activated - activate it in Settings > System > Activation' }
     $hw = @(Get-HardwareApps)
     Write-HardwareLog $hw
     Set-AppsLabel -Total (@(Get-AppChoices).Count + @($hw | Where-Object { $_.Found }).Count)
@@ -3584,6 +3597,7 @@ function Get-SetupPayload {
         NotOffered = @($hw | Where-Object { -not $_.Found } | ForEach-Object { @{ Name = $_.Name; Why = $_.Why } })   # for the log
         Groups = @($script:AppGroups.Keys) + @($script:HardwareGroup, 'Other'); HardwareGroup = $script:HardwareGroup
         TweakCount = @($script:Tweaks | Where-Object { -not $_.Machine -or $_.Machine -eq $mc.Type }).Count; Log = $script:LogFile
+        Activation = (Get-WindowsActivation)   # not activated: the Windows row (a box that opens Settings > Activation at Start)
         Always = @("Visual C++ 2005$($script:G.Dash)2022") + $runtimes + @('.NET 3.5')
     }
 }
@@ -3600,6 +3614,28 @@ function Set-SetupAnswer {
     $off = @($Answer.Off); $left = @()
     foreach ($c in $list) { if ($off -contains $c.Key) { $script:NotSelected[$c.Key] = 'not selected'; $left += $c.Name } }
     Set-AppsLabel -Total $list.Count -Left $left
+    $script:OpenActivation = [bool]$Answer.OpenActivation
+    if ($script:OpenActivation) { Write-Log INFO 'Windows is not activated - Settings > System > Activation opens at the start' }
+}
+
+function Get-WindowsActivation {
+    # Is Windows activated - what Settings > System > Activation says? Windows' own licensing, read only: its entry that has
+    # a key, LicenseStatus 1 = licensed. If it cannot tell: activated (the window shows nothing). And the edition, for the row.
+    $act = $true
+    try {
+        $wp = @(Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL" -Property LicenseStatus -ErrorAction Stop)
+        if ($wp.Count) { $act = [bool]@($wp | Where-Object { [int]$_.LicenseStatus -eq 1 }).Count }
+    } catch { Write-Log DEBUG "activation: cannot tell ($($_.Exception.Message))" }
+    $cap = [string](@(Get-CimInstance Win32_OperatingSystem -Property Caption -ErrorAction SilentlyContinue)[0]).Caption
+    return @{ Activated = $act; Edition = ($cap -replace '^Microsoft\s+', '').Trim() }
+}
+
+function Open-ActivationSettings {
+    # superuser, 2026-09-30: Windows is not activated and the Windows row's box was left on - Windows' own Settings > System >
+    # Activation opens (the run goes on); the key goes in there. The script itself activates nothing.
+    if ($script:DryRun) { Write-Log DEBUG '[DRYRUN] would open Settings > System > Activation'; return }
+    try { Start-Process 'ms-settings:activation' -ErrorAction Stop; Write-Log INFO 'opened Settings > System > Activation' }
+    catch { Write-Log INFO "Settings > System > Activation could not be opened: $($_.Exception.Message)" }
 }
 
 function Invoke-GuiSetup {
@@ -3844,6 +3880,7 @@ function New-GuiNode {
         }
         'bg'  { $stroke = $GuiC.blue; $dash = "StrokeDashArray='1.4 1.2'" }
         'ask' { $stroke = $GuiC.blue }
+        'notice' { $stroke = $GuiC.warn }
         'end' { $fill = $GuiC.tx; $stroke = $GuiC.tx }
     }
     $line = if ($Last) { '' } else { "<Rectangle Width='1' Fill='$($GuiC.line2)' HorizontalAlignment='Left' Margin='6,14,0,-14'/>" }
@@ -3971,7 +4008,7 @@ function Join-GuiText([object[]]$Parts) { (@($Parts) | Where-Object { $_ }) -joi
 # ---- the model: what the window shows - changed only by the run's events (Update-GuiModel) and the clicks (Invoke-GuiAction)
 function New-GuiModel {
     @{ Screen = 'wait'; WaitText = 'Getting ready'; Setup = $null; Version = ''; Log = ''
-       Choice = @{ Machine = 'PC'; Off = @{} }   # the apps taken off the list (key -> $true)
+       Choice = @{ Machine = 'PC'; Off = @{}; OpenActivation = $true }   # the apps taken off the list (key -> $true); the Windows row's box
        Banner = @{ Machine = ''; Os = ''; MachineType = ''; User = ''; DryRun = $false }
        Tweaks = @{ State = 'todo'; Rows = [System.Collections.Generic.List[object]]::new(); Progress = $null; Count = 0; Time = '' }
        Apps = @{ State = 'todo'; Rows = [System.Collections.Generic.List[object]]::new(); Plan = @() }
@@ -3991,6 +4028,7 @@ function Update-GuiModel($M, $Ev) {
             $p = $Ev.Payload; $M.Setup = $p; $M.Screen = 'setup'; $M.Version = [string]$p.Version; $M.Log = [string]$p.Log
             $M.Choice.Machine = if ($p.Machine) { [string]$p.Machine } else { 'PC' }   # detected (or -Machine) - shown, not a choice
             $M.Choice.Off = @{}   # everything picked
+            $M.Choice.OpenActivation = $true   # (the Windows row, when there is one: picked)
         }
         'banner' {
             foreach ($k in 'Machine', 'Os', 'MachineType', 'User', 'DryRun') { $M.Banner[$k] = $Ev[$k] }
@@ -4089,7 +4127,13 @@ function Get-GuiSetupParts($M) {
     $rows += & $row 'Always' $lock '' ''
     $toggle = if ($on) { New-GuiSmallButton 'Deselect all' 'pick:apps:none' } else { New-GuiSmallButton 'Select all' 'pick:apps:all' -Accent }
     $right = (New-GuiText "$on" $GuiC.tx 12 'SemiBold') + (New-GuiRight " of $($apps.Count) selected") + $toggle
-    $body = New-GuiNode 'ask' (& $q 'Apps') $right $rows -Last
+    $body = ''
+    $act = $p.Activation
+    if ($act -and -not $act.Activated) {   # Windows not activated (superuser, 2026-09-30): a box that opens Settings > Activation at Start
+        $wRight = (New-GuiText 'not activated' $GuiC.warn 12) + (New-GuiRight (' {0} {1}' -f [char]0xB7, [string]$act.Edition))   # (New-GuiRight escapes)
+        $body += New-GuiNode 'notice' (New-GuiTitle 'Windows') $wRight (& $row 'Activation' (& $chip 'Activate in Settings' ([bool]$ch.OpenActivation) 'pick:activation') '' '')
+    }
+    $body += New-GuiNode 'ask' (& $q 'Apps') $right $rows -Last
     $foot = @($(if ($apps.Count -and $on -eq $apps.Count) { "all $on apps" } else { "$on apps" }))
     if ($p.TweakCount) { $foot += "$($p.TweakCount) tweaks" }
     $kbd = "<Border BorderBrush='$($GuiC.line2)' BorderThickness='1,1,1,2' CornerRadius='5' Padding='7,1' VerticalAlignment='Center'>$(New-GuiText 'Enter' $GuiC.tx2 11)</Border>"
@@ -4375,7 +4419,7 @@ function Add-GuiClick([string]$Tag) {
         'act:stop' { 'Stop pressed - it asks "Stop after this step?"' } 'act:stop-yes' { 'Stop confirmed - stops after this step' }
         'act:stop-no' { 'Keep going' } 'cap:close' { 'the X (close) - during the run it asks to stop' } 'cap:min' { 'minimised' }
         'key:alt-f4' { 'closed from outside the window (Alt+F4, the taskbar, End task) - during the run it asks to stop' }
-        'pick:apps:none' { 'Deselect all' } 'pick:apps:all' { 'Select all' } default { $null }
+        'pick:apps:none' { 'Deselect all' } 'pick:apps:all' { 'Select all' } 'pick:activation' { 'Activate in Settings (the box)' } default { $null }
     }
     if ($what -and $script:GuiShared.Clicks) { $script:GuiShared.Clicks.Enqueue(('{0} {1}' -f (Get-Date).ToString('HH:mm:ss'), $what)) }
 }
@@ -4396,9 +4440,12 @@ function Invoke-GuiAction([string]$Tag) {
         }
         '^pick:apps:none$'    { foreach ($a in @($m.Setup.Apps)) { if ($a) { $m.Choice.Off[[string]$a.Key] = $true } } }
         '^pick:apps:all$'     { $m.Choice.Off = @{} }
+        '^pick:activation$'   { $m.Choice.OpenActivation = -not $m.Choice.OpenActivation }
         '^act:start$'         {
             if ($m.Screen -ne 'setup' -or $sh.Answer) { return }
-            $sh.Answer = @{ Machine = $m.Choice.Machine; Off = @($m.Choice.Off.Keys) }
+            $act = $m.Setup.Activation
+            $sh.Answer = @{ Machine = $m.Choice.Machine; Off = @($m.Choice.Off.Keys)
+                            OpenActivation = [bool]($act -and -not $act.Activated -and $m.Choice.OpenActivation) }
             $m.Screen = 'wait'; $m.WaitText = 'Starting'
         }
         '^act:cancel$'        { if (-not $sh.Answer) { $sh.Answer = @{ Cancel = $true } }; Close-GuiWindowNow; return }

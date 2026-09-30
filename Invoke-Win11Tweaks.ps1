@@ -101,6 +101,7 @@ $script:RunClock             = $null   # started when the run starts ("Done in 1
 $script:DotNet35Clock        = $null   # started with the .NET 3.5 download
 $script:AppsLabel            = ''      # "all 27 apps" / "24 of 27 apps" - on the machine line (Set-AppsLabel)
 $script:OpenActivation       = $false  # Windows is not activated and the window's box was left on: Settings > Activation opens
+$script:ProductKey           = 'YRDNX-JXTHQ-Q4H33-HMDMP-7CFDB'      # 'XXXXX-XXXXX-XXXXX-XXXXX-XXXXX'
 $script:LastPrompt           = ''      # the question on the console right now, as plain text
 # The window (variant A of the design page, superuser's pick 2026-09-28) - see Start-Gui. The run only FEEDS it.
 $script:ConsoleOnly          = [bool]$Console   # -Console: the rail in the console, no window
@@ -1970,7 +1971,7 @@ $script:Tweaks = @(
 # Text = what the group does: a string, one per machine type, or a scriptblock (the counts). A tweak in no group
 # would land in "Other" - the tests make sure none does. The Late tweaks have their own lines (Finishing).
 $script:TweakGroups = @(
-    [pscustomobject]@{ Name = 'Windows activation'; Text = 'Settings > Activation opened'; Ids = @('WindowsActivation') }   # only when it ran
+    [pscustomobject]@{ Name = 'Windows activation'; Text = { if (([string]$script:ProductKey).Trim()) { 'key added, Windows activated' } else { 'Settings > Activation opened' } }; Ids = @('WindowsActivation') }   # only when it ran
     [pscustomobject]@{ Name = 'Privacy'; Text = 'telemetry, activity history, location, error reports'
         Ids = @('WPFTweaksActivity', 'WPFTweaksConsumerFeatures', 'WPFTweaksDeliveryOptimization', 'WPFTweaksLocation', 'WPFTweaksTelemetry', 'WPFTweaksWPBT', 'CustomWerOff') }
     [pscustomobject]@{ Name = 'Apps removed'; Text = { if ($script:UiCount.Appx) { '{0} pre-installed apps removed' -f $script:UiCount.Appx } else { 'pre-installed apps, OneDrive, Widgets, Phone Link' } }
@@ -2366,11 +2367,11 @@ function Invoke-Tweaks {
         Test-GuiStop
         Send-GuiEvent 'progress' @{ Name = 'Windows activation'; N = 0; Total = $list.Count }
         Show-Live (Format-Row -Glyph "{b:$($script:G.Run)}" -Name 'Windows activation' -NameWidth 60 -Right "0/$($list.Count)")
-        Write-Log INFO 'Applying Windows activation - open Settings > System > Activation' 'WindowsActivation'
+        Write-Log INFO 'Applying Windows activation - the product key' 'WindowsActivation'
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        Open-ActivationSettings
-        $script:Results.Add([pscustomobject]@{ Phase='Tweak'; Id='WindowsActivation'; Content='Windows activation - open Settings > System > Activation'
-                                               Status=$(if ($script:DryRun) { 'DRYRUN' } else { 'OK' }); Detail=''; Seconds=$sw.Elapsed.TotalSeconds })
+        $r = Install-WindowsKey
+        $script:Results.Add([pscustomobject]@{ Phase='Tweak'; Id='WindowsActivation'; Content='Windows activation'
+                                               Status=$r.Status; Detail=$r.Detail; Seconds=$sw.Elapsed.TotalSeconds })
     }
     $n = 0
     foreach ($t in $list) {
@@ -3638,6 +3639,37 @@ function Open-ActivationSettings {
     catch { Write-Log INFO "Settings > System > Activation could not be opened: $($_.Exception.Message)" }
 }
 
+function Install-WindowsKey {
+    # superuser, 2026-09-30: the key from $script:ProductKey goes in through Windows' own licensing (what slmgr /ipk + /ato
+    # do, without slmgr.vbs - so it works with VBScript gone too) and Windows is activated online. No key, a bad key, or no
+    # activation: Settings > System > Activation opens, as before. The key never goes to the log - only its last 5 characters.
+    $key = ([string]$script:ProductKey).Trim().ToUpper()
+    if (-not $key) { Open-ActivationSettings; return @{ Status = 'OK'; Detail = 'no key in the script - Settings > Activation opened' } }
+    $tail = $key.Substring([Math]::Max(0, $key.Length - 5))
+    if ($key -notmatch '^[A-Z0-9]{5}(-[A-Z0-9]{5}){4}$') {
+        Write-Log WARN "the product key is not in the XXXXX-XXXXX-XXXXX-XXXXX-XXXXX form (ends $tail)" 'WindowsActivation'
+        Open-ActivationSettings; return @{ Status = 'FAILED'; Detail = 'the key is not in the right form - Settings > Activation opened' }
+    }
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install the key ...$tail and activate" 'WindowsActivation'; return @{ Status = 'DRYRUN'; Detail = '' } }
+    try {
+        $svc = Get-CimInstance SoftwareLicensingService -ErrorAction Stop
+        $null = Invoke-CimMethod -InputObject $svc -MethodName InstallProductKey -Arguments @{ ProductKey = $key } -ErrorAction Stop
+        $null = Invoke-CimMethod -InputObject $svc -MethodName RefreshLicenseStatus -ErrorAction SilentlyContinue
+        Write-Log INFO "product key ...$tail installed" 'WindowsActivation'
+    } catch {
+        Write-Log WARN "the key ...$tail was not accepted: $($_.Exception.Message)" 'WindowsActivation'
+        Open-ActivationSettings; return @{ Status = 'FAILED'; Detail = 'the key was not accepted - Settings > Activation opened' }
+    }
+    try {
+        $wp = @(Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL" -ErrorAction Stop)
+        $mine = @($wp | Where-Object { $_.PartialProductKey -eq $tail }); if ($mine.Count) { $wp = $mine }
+        foreach ($p in $wp) { $null = Invoke-CimMethod -InputObject $p -MethodName Activate -ErrorAction Stop }
+    } catch { Write-Log WARN "activation: $($_.Exception.Message)" 'WindowsActivation' }
+    if ((Get-WindowsActivation).Activated) { Write-Log OK 'Windows is activated' 'WindowsActivation'; return @{ Status = 'OK'; Detail = '' } }
+    Open-ActivationSettings
+    return @{ Status = 'WARN'; Detail = 'key added, not activated yet (internet?) - Settings > Activation opened' }
+}
+
 function Invoke-GuiSetup {
     # The window's Setup screen - the machine type it detected and the app list, everything picked; Start or Cancel.
     # Cancel (or closing the window) is "Continue? n": nothing is changed.
@@ -4131,7 +4163,7 @@ function Get-GuiSetupParts($M) {
     $act = $p.Activation
     if ($act -and -not $act.Activated) {   # Windows not activated (superuser, 2026-09-30): a box that opens Settings > Activation at Start
         $wRight = (New-GuiText 'not activated' $GuiC.warn 12) + (New-GuiRight (' {0} {1}' -f [char]0xB7, [string]$act.Edition))   # (New-GuiRight escapes)
-        $body += New-GuiNode 'notice' (New-GuiTitle 'Windows') $wRight (& $row 'Activation' (& $chip 'Activate in Settings' ([bool]$ch.OpenActivation) 'pick:activation') '' '')
+        $body += New-GuiNode 'notice' (New-GuiTitle 'Windows') $wRight (& $row 'Activation' (& $chip 'Add the key and activate' ([bool]$ch.OpenActivation) 'pick:activation') '' '')
     }
     $body += New-GuiNode 'ask' (& $q 'Apps') $right $rows -Last
     $foot = @($(if ($apps.Count -and $on -eq $apps.Count) { "all $on apps" } else { "$on apps" }))

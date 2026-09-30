@@ -947,6 +947,7 @@ function Install-App {
     $src = if ($Source) { $Source } else { 'winget' }   # 'msstore' for Store-only apps (e.g. Alienware Command Center)
     $wingetArgs = "install $Id --accept-package-agreements --accept-source-agreements --source $src --silent"
     if ($Location) { $wingetArgs += " --location `"$Location`"" }   # e.g. Battle.net requires an install location
+    if ($script:AppScopes -and $script:AppScopes[$Id]) { $wingetArgs += " --scope $($script:AppScopes[$Id])" }   # e.g. TreeSize: for the machine
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $label"; return 'DRYRUN' }
     if (Test-AppInstalled -Id $Id -NamePattern $DetectName) { Write-Log OK "Already installed - $label"; $script:ItemNote = 'already installed'; return 'OK' }
     Write-Log INFO "Installing $label"
@@ -1882,8 +1883,16 @@ $script:AppsToInstall = @(
     'Skillbrains.Lightshot',
     'VideoLAN.VLC',
     'SavardSoftware.TurboTop',           # always-on-top helper (on winget, not the savardsoftware.com exe)
-    'RARLab.WinRAR'
+    'RARLab.WinRAR',
+    'JAMSoftware.TreeSize.Free',         # superuser, 2026-09-30: TreeSize, qBittorrent, MSI Afterburner (with RivaTuner -
+    'qBittorrent.qBittorrent',           # its installer always brings it)
+    'Guru3D.Afterburner'
 )
+# winget installs these for the whole machine only when asked (the default scope is the user's - TreeSize would land in
+# the admin's profile). Keyed by winget ID.
+$script:AppScopes = @{
+    'JAMSoftware.TreeSize.Free' = 'machine'
+}
 # Vendor apps: installed (picked, like every app in the window's list) but ONLY on that vendor's hardware, desktop or
 # laptop alike (Hardware is a regex against Win32_ComputerSystem "<Manufacturer> <Model>", or Require a test):
 #   Alienware Command Center -> Alienware / Dell G-series (msstore - the Store only offers it there; if the
@@ -1893,6 +1902,8 @@ $script:AppsToInstall = @(
 # (AnyDesk and HP Support Assistant removed per user request.)
 $script:VendorApps = @(
     @{ Id='9PMHP03NJ9QP'; Name='Alienware Command Center'; Vendor='Alienware/Dell G'; Hardware='Alienware|^Dell\b.*\bG\d{1,2}\s+\d{4}\b'; Source='msstore' }
+    # Armoury Crate (superuser, 2026-09-30) -> ASUS ROG / TUF / PRIME / ProArt boards and ROG / TUF laptops (Install-ArmouryCrate)
+    @{ Id='ArmouryCrate'; Name='Armoury Crate'; Vendor='ASUS ROG / TUF'; Require={ Test-ArmouryCrateHardware }; RequireMsg='not ASUS ROG / TUF / PRIME / ProArt' }
 )
 # winget apps that need their hardware (like the direct apps' Require) - SKIPPED with the reason where it isn't there.
 # Keyed by winget ID.
@@ -1902,7 +1913,8 @@ $script:AppRequire = @{
 # The apps for the hardware in this machine (superuser, 2026-09-30: detected, not a question). They are in the window's
 # list - picked, in their own row - only where their hardware is found; the install phase checks it again. Keys as the
 # install phase knows them: winget ID / direct-app Name / vendor-app Id.
-$script:HardwareApps = @('NZXT.CAM', 'NVIDIA App', 'AMD Chipset Software', 'Intel Chipset Device Software', 'AMD Software Adrenalin', '9PMHP03NJ9QP')
+$script:HardwareApps = @('NZXT.CAM', 'NVIDIA App', 'AMD Chipset Software', 'Intel Chipset Device Software', 'AMD Software Adrenalin',
+                         'Intel Driver & Support Assistant', 'ArmouryCrate', '9PMHP03NJ9QP')
 $script:HardwareGroup = 'Drivers & hardware'   # their row in the window
 # Runtimes in $script:AppsToInstall: installed for EVERY machine - never in the window's list (games and apps need them;
 # the Visual C++ redists and .NET 3.5 aren't in the app lists at all).
@@ -1921,7 +1933,10 @@ $script:AppLocations = @{
 # Skip-if-already-installed detection by Add/Remove Programs DisplayName (-like pattern),
 # for apps often present OUTSIDE winget so 'winget list' alone won't see them. Add IDs here as needed.
 $script:AppDetectNames = @{
-    'Blizzard.BattleNet' = '*Battle.net*'   # its setup finishes outside winget (winget reports "Installation abandoned")
+    'Blizzard.BattleNet'        = '*Battle.net*'   # its setup finishes outside winget (winget reports "Installation abandoned")
+    'JAMSoftware.TreeSize.Free' = 'TreeSize Free*'
+    'qBittorrent.qBittorrent'   = 'qBittorrent*'
+    'Guru3D.Afterburner'        = 'MSI Afterburner*'
 }
 # Non-winget apps: fetch the vendor installer directly and run it silently (see Install-DirectDownload).
 $script:DirectApps = @(
@@ -2037,6 +2052,49 @@ $script:DirectApps = @(
         Require    = { (Test-GpuVendor '1002' 'Radeon') -and -not (Test-GpuVendor '10DE' 'NVIDIA') }
         RequireMsg = 'no AMD Radeon card (or an NVIDIA card is the main one)'
     }
+    @{  # Intel Driver & Support Assistant (superuser, 2026-09-30) - it keeps the Intel drivers current (chipset, Wi-Fi,
+        # Bluetooth, graphics); it only offers them, so the chipset driver above still goes in now. Any Intel device counts
+        # (an Intel Wi-Fi / Ethernet card on an AMD board too); PC only like the chipset drivers; never in a VM. Intel's
+        # own always-latest link (the winget package points at it too, and fails whenever Intel swaps the file).
+        Name       = 'Intel Driver & Support Assistant'
+        Url        = 'https://dsadata.intel.com/installer'
+        SilentArgs = '/quiet /norestart'   # a WiX (burn) bundle
+        WaitMainOnly = $true               # it may leave its tray app running
+        DetectName = 'Intel* Driver * Support Assistant*'
+        Signer     = 'Intel Corporation'
+        Machine    = 'PC'
+        Require    = { (Test-PciVendor '8086') -and -not (Test-VirtualMachine) }
+        RequireMsg = 'no Intel hardware'
+    }
+    @{  # U.GG (superuser, 2026-09-30) - League of Legends builds and runes. Its own installer (electron-builder NSIS, not
+        # Overwolf any more), always the latest; installs for the signed-in user (%LOCALAPPDATA%\Programs\U.GG). The
+        # u.gg page itself answers scripts with a Cloudflare challenge - this is where it points.
+        Name       = 'U.GG'
+        Url        = 'https://static.bigbrain.gg/monoapp/U.GG%20Setup.exe'
+        SilentArgs = '/S'
+        DetectName = 'U.GG*'
+        Signer     = 'Enthusiast Gaming'   # a new short-lived certificate for every build - the name, never the thumbprint
+    }
+    @{  # Rockstar Games Launcher (superuser, 2026-09-30) - winget's package fails as admin on a hash mismatch (Rockstar
+        # replaces the file in place); Rockstar's own always-latest link, its silent switches.
+        Name       = 'Rockstar Games Launcher'
+        Url        = 'https://gamedownloads.rockstargames.com/public/installer/Rockstar-Games-Launcher.exe'
+        SilentArgs = '/s /f'
+        WaitMainOnly = $true               # in case it starts the launcher when it is done
+        DetectName = 'Rockstar Games Launcher*'
+        Signer     = 'Rockstar Games'
+    }
+    @{  # Razer Synapse (superuser, 2026-09-30). Its one installer (the Razer hub) has no silent mode - Razer's own parts do
+        # (Install-RazerSynapse).
+        Name       = 'Razer Synapse'
+        Custom     = { Install-RazerSynapse }
+        DetectName = 'Razer Synapse*'
+    }
+    @{  # Vencord (superuser, 2026-09-30) - the Discord client mod, through its command-line installer. Needs Discord - last
+        # of the direct apps, so Discord (a winget app) is in and has updated itself (Install-Vencord).
+        Name       = 'Vencord'
+        Custom     = { Install-Vencord }
+    }
 )
 # Apps that should get a Desktop icon (most make their own; these do not reliably). Keyed by winget ID
 # (or a direct-download Name). Right after each app installs, New-DesktopShortcut copies its Start Menu
@@ -2091,16 +2149,19 @@ $script:AppNames = @{
     'VideoLAN.VLC'                     = 'VLC media player'
     'SavardSoftware.TurboTop'          = 'TurboTop'
     'RARLab.WinRAR'                    = 'WinRAR'
+    'JAMSoftware.TreeSize.Free'        = 'TreeSize'
+    'qBittorrent.qBittorrent'          = 'qBittorrent'
+    'Guru3D.Afterburner'               = 'MSI Afterburner'
 }
 # The window's app list shows the apps in these rows, in this order - keys as Get-AppChoices gives them (winget ID /
 # direct-app Name / vendor-app Id). The hardware apps found here get their own row ($script:HardwareGroup); an app in no
 # row lands in "Other".
 $script:AppGroups = [ordered]@{
-    'Games'            = @('Valve.Steam', 'EpicGames.EpicGamesLauncher', 'Blizzard.BattleNet', 'Ubisoft.Connect', 'Google Play Games')
-    'Chat & streaming' = @('Discord.Discord', 'OBSProject.OBSStudio', 'Parsec')
+    'Games'            = @('Valve.Steam', 'EpicGames.EpicGamesLauncher', 'Blizzard.BattleNet', 'Ubisoft.Connect', 'Rockstar Games Launcher', 'Google Play Games', 'U.GG')
+    'Chat & streaming' = @('Discord.Discord', 'Vencord', 'OBSProject.OBSStudio', 'Parsec')
     'Media'            = @('VideoLAN.VLC', 'FL Studio')
-    'Tools'            = @('RARLab.WinRAR', 'RevoUninstaller.RevoUninstaller', 'Skillbrains.Lightshot', 'CPUID.HWMonitor', 'SavardSoftware.TurboTop')
-    'Internet'         = @('Google Chrome', 'Bitwarden', 'Nextcloud.NextcloudDesktop')
+    'Tools'            = @('RARLab.WinRAR', 'RevoUninstaller.RevoUninstaller', 'JAMSoftware.TreeSize.Free', 'Skillbrains.Lightshot', 'CPUID.HWMonitor', 'Guru3D.Afterburner', 'SavardSoftware.TurboTop', 'Razer Synapse')
+    'Internet'         = @('Google Chrome', 'Bitwarden', 'Nextcloud.NextcloudDesktop', 'qBittorrent.qBittorrent')
 }
 
 # --------------------------------------------------------------------------------------
@@ -2286,6 +2347,131 @@ function Set-WinRarLicense {
     $why = if ($placed) { '' } else { 'could not write rarreg.key' }
     if ($placed) { Write-Log OK "Done!" } else { Write-Log WARN "Failed - WinRAR license ($why)" }
     $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='WinRAR.License'; Content='WinRAR license (rarreg.key)'; Status=$st; Detail=$why })
+}
+
+function Install-RazerSynapse {
+    # Razer Synapse 4 (superuser, 2026-09-30). Its one installer (the Razer hub) has no silent mode - Razer's own parts do:
+    # App Engine, Synapse and Chroma (/S), Razer Central (/silent), Game Manager (Inno Setup). The current parts come from
+    # Razer's manifest - the one the hub reads -, each must be signed by Razer. OK / FAILED / DRYRUN.
+    $name = 'Razer Synapse'
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $name (Razer's parts, from Razer's manifest)"; return 'DRYRUN' }
+    if (Test-AppInstalled -NamePattern 'Razer Synapse*') { Write-Log OK "Already installed - $name"; $script:ItemNote = 'already installed'; return 'OK' }
+    try {
+        $ep = @((Invoke-RestMethod 'https://discovery3.razerapi.com/api/v1/endpoints' -UseBasicParsing -ErrorAction Stop).data.items | Where-Object { $_.name -eq 'prod' })[0]
+        $man = Invoke-RestMethod ('https://manifest3.razerapi.com/api/v1/releases/{0}/tags/prod/products?os=windows&osver=11&arch=64' -f $ep.hash) -UseBasicParsing -ErrorAction Stop
+        $mods = @($man.data.items | Where-Object { $_.name -in 'Anne', 'Chroma', 'GameBooster2' } | ForEach-Object { $_.modules })
+    } catch {
+        Write-Log WARN "Failed - $name (Razer's download list: $($_.Exception.Message))"; $script:ItemFail = "Razer's download list did not answer"; return 'FAILED'
+    }
+    $parts = @(
+        @{ Module = 'Razer App Engine'; Label = 'Razer App Engine';   Args = '/S' }
+        @{ Module = 'Razer Synapse';    Label = 'Razer Synapse';      Args = '/S' }
+        @{ Module = 'Razer Chroma';     Label = 'Razer Chroma';       Args = '/S' }
+        @{ Module = 'Natasha';          Label = 'Razer Central';      Args = '/silent' }
+        @{ Module = 'GMS3';             Label = 'Razer Game Manager'; Args = '/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART' }
+    )
+    $k = 0
+    foreach ($part in $parts) {
+        $k++
+        $url = [string](@($mods | Where-Object { $_.name -eq $part.Module } | ForEach-Object { $_.download_url }) | Select-Object -First 1)
+        if (-not $url) { Write-Log WARN "Failed - $name ($($part.Label) is not in Razer's list)"; $script:ItemFail = "$($part.Label) is not in Razer's list"; return 'FAILED' }
+        Set-LiveWhat ('{0} {1}/{2}' -f $part.Label, $k, $parts.Count)
+        $st = Install-DirectDownload -Name $part.Label -Url $url -SilentArgs $part.Args -Signer 'Razer USA' -WaitMainOnly
+        if ($st -ne 'OK') { $script:ItemFail = "$($part.Label): $($script:ItemFail)"; return 'FAILED' }
+    }
+    $script:ItemNote = ''
+    return 'OK'
+}
+
+function Get-DiscordApp {
+    # The signed-in user's Discord: its newest app-<version> folder (the one Discord runs), or $null
+    $dir = Join-Path $env:LOCALAPPDATA 'Discord'
+    @(Get-ChildItem -LiteralPath $dir -Directory -Filter 'app-*' -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'resources') } |
+        Sort-Object { $v = [version]'0.0'; $null = [version]::TryParse(($_.Name -replace '^app-', ''), [ref]$v); $v } -Descending) | Select-Object -First 1
+}
+
+function Install-Vencord {
+    # Vencord (superuser, 2026-09-30) - the Discord mod, through its command-line installer from the Vencord organisation's
+    # GitHub releases (not code-signed - Vencord says so on its page; the link is theirs, over HTTPS). It patches the
+    # signed-in user's Discord and closes Discord for that - so it needs Discord, and runs after it (the last direct app,
+    # when Discord has updated itself). OK / SKIPPED / FAILED / DRYRUN.
+    $name = 'Vencord'
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $name into Discord"; return 'DRYRUN' }
+    $app = Get-DiscordApp
+    if (-not $app) { Write-Log INFO "Skipping $name (no Discord for this user)"; $script:ItemNote = 'needs Discord'; return 'SKIPPED' }
+    if (Test-Path -LiteralPath (Join-Path $app.FullName 'resources\_app.asar')) { Write-Log OK "Already installed - $name"; $script:ItemNote = 'already installed'; return 'OK' }
+    Write-Log INFO "Installing $name (into Discord $($app.Name))"
+    $tmp = Join-Path $env:TEMP ('VencordInstallerCli_{0}.exe' -f (Get-Date -Format 'yyyyMMddHHmmss'))
+    try {
+        $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri 'https://github.com/Vencord/Installer/releases/latest/download/VencordInstallerCli.exe' -OutFile $tmp -UseBasicParsing -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -ErrorAction Stop
+        $ProgressPreference = $pp
+        $fs = [System.IO.File]::OpenRead($tmp); $mz = New-Object byte[] 2; [void]$fs.Read($mz, 0, 2); $fs.Close()
+        if (-not ($mz[0] -eq 0x4D -and $mz[1] -eq 0x5A)) { throw 'the download is not a program' }
+    } catch {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        Write-Log WARN "Failed - $name (download: $($_.Exception.Message))"; $script:ItemFail = 'download failed'; return 'FAILED'
+    }
+    Set-LiveWhat 'installing'
+    try {
+        $out = Join-Path $env:TEMP 'vencord_out.log'
+        $p = Start-Process -FilePath $tmp -ArgumentList '-install -branch auto' -WindowStyle Hidden -PassThru -RedirectStandardOutput $out
+        $null = $p.Handle   # open it now, or ExitCode can be empty afterwards
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while (-not $p.HasExited -and $sw.Elapsed.TotalSeconds -lt 300) { Wait-Process -InputObject $p -Timeout 1 -ErrorAction Ignore; Update-LiveTick }
+        if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; throw 'it did not finish in 5 min' }
+        $code = $p.ExitCode
+        if (Test-Path $out) { Get-Content $out -ErrorAction SilentlyContinue | Where-Object { $_.Trim() } | Select-Object -Last 6 | ForEach-Object { Write-Log DEBUG "  vencord> $($_.Trim())" }; Remove-Item $out -Force -ErrorAction SilentlyContinue }
+        $app = Get-DiscordApp
+        if ($code -eq 0 -and $app -and (Test-Path -LiteralPath (Join-Path $app.FullName 'resources\_app.asar'))) { Write-Log OK 'Done!'; return 'OK' }
+        Write-Log WARN ("Failed - {0} (the installer's exit code {1}, Discord {2})" -f $name, $code, $(if ($app) { 'not patched' } else { 'gone' }))
+        $script:ItemFail = "the installer's exit code $code"; return 'FAILED'
+    } catch {
+        Write-Log WARN "Failed - $name ($($_.Exception.Message))"; $script:ItemFail = $_.Exception.Message; return 'FAILED'
+    } finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+}
+
+function Test-ArmouryCrateHardware {
+    # What Armoury Crate is for: an ASUS ROG / TUF / PRIME / ProArt board (a home-built PC shows its maker only on the
+    # board), a ROG / TUF laptop or desktop. Not the ROG Ally - it has Armoury Crate SE.
+    $cs = Get-Hardware; $board = Get-Board
+    if ($cs -match '(?i)\bRC7\d') { return $false }
+    if ($cs -match '(?i)^ASUS' -and $cs -match '(?i)\b(ROG|TUF|TX Gaming|TX Air)\b') { return $true }
+    return ($board -match '(?i)^ASUSTeK' -and $board -match '(?i)\b(ROG|TUF|PRIME|ProArt)\b')
+}
+
+function Install-ArmouryCrate {
+    # Armoury Crate (superuser, 2026-09-30): ASUS's installer (ArmouryCrateInstaller.exe in ASUS's always-latest zip) with
+    # -silent (/S does nothing). It returns within seconds, exit code 0 whatever happens; an ASUS service then downloads
+    # Armoury Crate (~1.2 GB) and installs it in the background, finishing after a restart - so it is BACKGROUND, not OK.
+    $name = 'Armoury Crate'
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $name (ASUS's installer, -silent)"; return 'DRYRUN' }
+    if ((Get-Service -Name 'ArmouryCrateService' -ErrorAction SilentlyContinue) -or (Get-AppxPackage -AllUsers -Name 'B9ECED6F.ArmouryCrate' -ErrorAction SilentlyContinue) -or
+        (Test-AppInstalled -NamePattern 'ARMOURY CRATE*Service*')) { Write-Log OK "Already installed - $name"; $script:ItemNote = 'already installed'; return 'OK' }
+    if (Get-Process -Name 'ArmouryCrateInstaller' -ErrorAction SilentlyContinue) {   # ASUS's own, started by the PC's firmware
+        Write-Log INFO "$name is being installed already (by ASUS's installer) - it finishes after a restart"; $script:ItemNote = 'being installed by ASUS already'; return 'BACKGROUND'
+    }
+    Write-Log INFO "Installing $name"
+    $zip = Join-Path $env:TEMP ('ArmouryCrateInstallTool_{0}.zip' -f (Get-Date -Format 'yyyyMMddHHmmss')); $dir = $zip -replace '\.zip$', ''
+    try {
+        $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri 'https://dlcdnets.asus.com/pub/ASUS/mb/14Utilities/ArmouryCrateInstallTool.zip' -OutFile $zip -UseBasicParsing -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -ErrorAction Stop
+        Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force -ErrorAction Stop
+        $ProgressPreference = $pp
+        $exe = @(Get-ChildItem -LiteralPath $dir -Recurse -Filter 'ArmouryCrateInstaller.exe' -ErrorAction Stop)[0]
+        if (-not $exe) { throw 'no ArmouryCrateInstaller.exe in the zip' }
+        $sig = Get-AuthenticodeSignature -FilePath $exe.FullName -ErrorAction SilentlyContinue
+        if (-not $sig -or "$($sig.Status)" -ne 'Valid' -or "$($sig.SignerCertificate.Subject)" -notmatch '(?i)ASUSTeK') { throw "the installer is not signed by ASUS ($(if ($sig) { $sig.Status }))" }
+        $p = Start-Process -FilePath $exe.FullName -ArgumentList '-silent' -WindowStyle Hidden -PassThru
+        $null = $p.Handle
+        $null = $p.WaitForExit(120000)   # the installer only - its service keeps going on its own
+        Write-Log INFO ("{0}: ASUS's installer started it (exit code {1}) - it downloads and installs in the background and finishes after a restart" -f $name, $(if ($p.HasExited) { $p.ExitCode } else { 'still running' }))
+        $script:ItemNote = 'downloading in the background - finishes after a restart'
+        return 'BACKGROUND'
+    } catch {
+        Write-Log WARN "Failed - $name ($($_.Exception.Message))"; $script:ItemFail = $_.Exception.Message; return 'FAILED'
+    } finally { Remove-Item $zip -Force -ErrorAction SilentlyContinue }
 }
 
 function Install-Alienware {
@@ -2533,7 +2719,7 @@ function Invoke-InstallPhase {
         $from = $script:Results.Count + 1
         $script:ItemNote = ''; $script:ItemFail = ''
         Start-LiveItem -Name $d.Name -What 'downloading' -NoClock   # Invoke-WebRequest blocks - no clock to tick
-        $st = Install-DirectDownload @d
+        $st = if ($d.Custom) { & $d.Custom } else { Install-DirectDownload @d }   # Razer Synapse, Vencord: their own installers
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$d.Name; Content=$d.Name; Status=$st; Detail=$(if ($st -eq 'FAILED' -and $script:ItemFail) { $script:ItemFail } elseif ($st -eq 'SKIPPED' -and $script:ItemNote) { $script:ItemNote } else { 'direct' }) })
         if ($st -eq 'OK' -and $script:DesktopShortcutApps.ContainsKey($d.Name)) { $sc = $script:DesktopShortcutApps[$d.Name]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
         if ($d.Name -eq 'Google Chrome') { $script:ChromePinned = Add-ChromeTaskbarPin }   # pin Chrome to the taskbar RIGHT AFTER it installs
@@ -2543,7 +2729,7 @@ function Invoke-InstallPhase {
     # (WinRAR license is created right after WinRAR installs, in the loop above - see Set-WinRarLicense.)
 
     # Vendor apps LAST - installed ONLY on that vendor's hardware, desktop or laptop alike:
-    #   Alienware Command Center -> Alienware / Dell G-series.
+    #   Alienware Command Center -> Alienware / Dell G-series; Armoury Crate -> ASUS ROG / TUF / PRIME / ProArt.
     foreach ($a in $script:VendorApps) {
         Test-GuiStop
         $miss = Get-VendorAppMiss $a $hw
@@ -2558,6 +2744,7 @@ function Invoke-InstallPhase {
         $script:ItemNote = ''; $script:ItemFail = ''
         Start-LiveItem -Name $a.Name -What 'installing'
         if ($a.Id -eq '9PMHP03NJ9QP') { $st = Install-Alienware }   # Store first, then Dell's direct installer
+        elseif ($a.Id -eq 'ArmouryCrate') { $st = Install-ArmouryCrate }   # ASUS's installer, finishes after a restart
         else { $st = Install-App -Id $a.Id -Name $a.Name -Source $a.Source }
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=$st; Detail=$(if ($st -eq 'FAILED' -and $script:ItemFail) { $script:ItemFail } else { $hw }) })
         Write-AppLine -Name $a.Name -Status $st -From $from

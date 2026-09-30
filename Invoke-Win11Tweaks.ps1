@@ -621,15 +621,14 @@ function Clear-StartPins {
 }
 
 function Initialize-NativeW11T {
-    # Screen modes (user32) and power-plan values (powrprof) for the refresh-rate and laptop-power tweaks. Compiled once
-    # per PowerShell session and KEPT there: when this C# changes, bump the namespace (W11T2 -> W11T3), or a second run in
-    # the same window would quietly use the old copy.
-    if ('W11T2.Power' -as [type]) { return }
+    # Screen modes (user32) for the refresh-rate tweak. Compiled once per PowerShell session and KEPT there: when this C#
+    # changes, bump the namespace (W11T3 -> W11T4), or a second run in the same window would quietly use the old copy.
+    if ('W11T3.Display' -as [type]) { return }
     Add-Type -ErrorAction Stop -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
-namespace W11T2 {
+namespace W11T3 {
     public static class Display {
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         public struct DEVMODE {
@@ -688,30 +687,6 @@ namespace W11T2 {
             return ChangeDisplaySettingsEx(device, ref dm, IntPtr.Zero, 1, IntPtr.Zero);   // CDS_UPDATEREGISTRY - saved
         }
     }
-    public static class Power {
-        [DllImport("powrprof.dll")] static extern uint PowerEnumerate(IntPtr root, ref Guid scheme, IntPtr sub, int flags, uint index, byte[] buffer, ref uint size);
-        [DllImport("powrprof.dll", EntryPoint = "PowerEnumerate")] static extern uint PowerEnumerateIn(IntPtr root, ref Guid scheme, ref Guid sub, int flags, uint index, byte[] buffer, ref uint size);
-        [DllImport("powrprof.dll")] static extern uint PowerReadDCValueIndex(IntPtr root, ref Guid scheme, ref Guid sub, ref Guid setting, out uint value);
-        [DllImport("powrprof.dll")] static extern uint PowerWriteDCValueIndex(IntPtr root, ref Guid scheme, ref Guid sub, ref Guid setting, uint value);
-        // Every battery (DC) value of plan "from" written into plan "to"; returns how many.
-        public static int CopyDc(Guid from, Guid to) {
-            int copied = 0; byte[] buf = new byte[16];
-            for (uint i = 0; ; i++) {
-                uint size = 16;
-                if (PowerEnumerate(IntPtr.Zero, ref from, IntPtr.Zero, 17, i, buf, ref size) != 0) break;        // ACCESS_SUBGROUP
-                Guid sub = new Guid(buf);
-                for (uint j = 0; ; j++) {
-                    uint s2 = 16;
-                    if (PowerEnumerateIn(IntPtr.Zero, ref from, ref sub, 18, j, buf, ref s2) != 0) break;       // ACCESS_INDIVIDUAL_SETTING
-                    Guid setting = new Guid(buf);
-                    uint v;
-                    if (PowerReadDCValueIndex(IntPtr.Zero, ref from, ref sub, ref setting, out v) == 0 &&
-                        PowerWriteDCValueIndex(IntPtr.Zero, ref to, ref sub, ref setting, v) == 0) copied++;
-                }
-            }
-            return copied;
-        }
-    }
 }
 '@
 }
@@ -733,7 +708,7 @@ function Get-DisplayRates {
     # and how it is connected (Link).
     Initialize-NativeW11T
     $links = Get-MonitorLinks
-    foreach ($l in [W11T2.Display]::List()) {
+    foreach ($l in [W11T3.Display]::List()) {
         $p = $l -split '\|'
         # interface path "\\?\DISPLAY#MSI3CB1#5&2e2a4b5&0&UID4353#{e6f07b5f-...}" -> WMI instance "DISPLAY\MSI3CB1\5&2E2A4B5&0&UID4353"
         $key = (($p[4] -replace '^\\\\\?\\', '') -replace '#\{[^}]*\}$', '' -replace '#', '\').ToUpperInvariant()
@@ -746,7 +721,7 @@ function Set-DisplayRate {
     # One screen to $Hz (tested, then saved); returns Windows' DISP_CHANGE code (0 = done, 1 = after a restart).
     param([string]$Device, [int]$Hz)
     Initialize-NativeW11T
-    return [W11T2.Display]::SetRate($Device, $Hz)
+    return [W11T3.Display]::SetRate($Device, $Hz)
 }
 
 function Test-ScreenLocked {
@@ -787,13 +762,6 @@ function Set-MaxRefreshRate {
     if ($notes.Count) { Set-UiNote $Id ($notes -join '; ') }
 }
 
-function Copy-PowerDcValues {
-    # Every battery (DC) value of plan $From into plan $To (GUIDs); returns how many were copied.
-    param([string]$From, [string]$To)
-    Initialize-NativeW11T
-    return [W11T2.Power]::CopyDc([guid]$From, [guid]$To)
-}
-
 function Find-PowerPlan {
     # A plan this script made on an earlier run: the GUID remembered under $script:StateKey (works in every Windows
     # language, and for a plan powercfg -list doesn't show), else a plan listed with exactly this name.
@@ -808,31 +776,13 @@ function Find-PowerPlan {
 }
 
 function New-PowerPlanCopy {
-    # powercfg -duplicatescheme: the NEW plan's GUID, or $null when Windows refuses (Ultimate on a Modern Standby laptop).
+    # powercfg -duplicatescheme: the NEW plan's GUID, or $null when Windows refuses.
     param([string]$From)
     $out = (powercfg -duplicatescheme $From 2>&1 | Out-String)
     if ($LASTEXITCODE -ne 0) { return $null }
     $m = [regex]::Match($out, '(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
     if ($m.Success) { return $m.Value }
     return $null
-}
-
-function Set-UltimateAcValues {
-    # Ultimate Performance's plugged-in (AC) values, for a plan made from Balanced: the CPU never below 100%, no core
-    # parking, aggressive boost, performance first; no sleep, hibernate, disk, USB or PCIe power saving on the charger.
-    param([string]$Plan)
-    $v = @(
-        @('54533251-82be-4824-96c1-47b60b740d00', '893dee8e-2bef-41e0-89c6-b55d0929964c', 100),   # processor minimum state
-        @('54533251-82be-4824-96c1-47b60b740d00', '0cc5b647-c1df-4637-891a-dec35c318583', 100),   # core parking: minimum cores
-        @('54533251-82be-4824-96c1-47b60b740d00', 'be337238-0d82-4146-a960-4f3749d470c7', 2),     # boost mode: aggressive
-        @('54533251-82be-4824-96c1-47b60b740d00', '36687f9e-e3a5-4dbf-b1dc-15eb381c6863', 0),     # energy performance preference
-        @('238c9fa8-0aad-41ed-83f4-97be242c8f20', '29f6c1db-86da-48c5-9fdb-f2b67b1f44da', 0),     # sleep after: never
-        @('238c9fa8-0aad-41ed-83f4-97be242c8f20', '9d7815a6-7ee4-497e-8888-515a05f02364', 0),     # hibernate after: never
-        @('0012ee47-9041-4b5d-9b77-535fba8b1442', '6738e2c4-e8a5-4a42-b16a-e040e769756e', 0),     # turn off the disk: never
-        @('2a737441-1930-4402-8d77-b2bebba308a3', '48e6b7a6-50f5-4782-a5d4-53bb8f07e226', 0),     # USB selective suspend: off
-        @('501a4d13-42af-4429-9fd1-a8218c268e20', 'ee12f906-d277-404b-b6da-e5fa1a576df5', 0)      # PCI Express link power saving: off
-    )
-    foreach ($x in $v) { $null = powercfg -setacvalueindex $Plan $x[0] $x[1] $x[2] }
 }
 
 function Set-BalancedForX3D {
@@ -856,33 +806,21 @@ function Set-PcPowerPlan {
     Write-Log DEBUG ("active scheme -> {0}" -f ((powercfg -getactivescheme | Out-String).Trim())) $Id
 }
 
-function Set-LaptopPowerPlan {
-    # Laptop: ONE plan that is Ultimate Performance on the charger and Balanced on battery - a copy of Ultimate
-    # Performance whose battery (DC) values are Balanced's, so Windows switches by itself when the cable comes out. A
-    # Modern Standby laptop refuses to copy Ultimate: then a copy of Balanced with Ultimate's plugged-in values. The plan
-    # is remembered (re-runs reuse it and refresh the battery values); it is never switched on without Balanced's
-    # battery values - that would be Ultimate on battery.
+function Reset-LaptopPowerPlan {
+    # Laptop (superuser, 2026-09-30): the power plan is Windows' own. 1.6 and 1.7 gave a laptop their plan "Ultimate +
+    # Balanced on battery" (remembered as LaptopPowerPlan): if it is the active one, Balanced is back; the plan is deleted.
     param([string]$Id = '')
-    if (Test-DualCcdX3D) { Set-BalancedForX3D -Id $Id; return }
-    $name = 'Ultimate + Balanced on battery'
     $balanced = '381b4222-f694-41f0-9685-ff5bb260df2e'
-    $guid = Find-PowerPlan -StateName 'LaptopPowerPlan' -Name $name
-    if (-not $guid) {
-        $guid = New-PowerPlanCopy -From 'e9a42b02-d5df-448d-aa00-03f14749eb61'
-        if (-not $guid) {
-            $guid = New-PowerPlanCopy -From $balanced
-            if (-not $guid) { throw 'Windows would not create a new power plan' }
-            Set-UltimateAcValues -Plan $guid
-            Write-Log INFO "No Ultimate Performance plan on this laptop (Modern Standby) - a copy of Balanced with Ultimate's plugged-in values instead" $Id
-        }
-        $null = powercfg -changename $guid $name 'win11-tweaks: Ultimate Performance when plugged in, Balanced on battery'
+    $guid = Find-PowerPlan -StateName 'LaptopPowerPlan' -Name 'Ultimate + Balanced on battery'
+    if (-not $guid) { Write-Log DEBUG 'no power plan from an earlier version - the plan stays as it is' $Id; return }
+    if ((powercfg -getactivescheme | Out-String) -match [regex]::Escape($guid)) {
+        $null = powercfg -setactive $balanced
+        Write-Log INFO "power plan: Balanced again - the laptop plan of an earlier version goes" $Id
     }
-    Set-Reg -Id $Id -Path $script:StateKey -Name 'LaptopPowerPlan' -Type String -Value $guid
-    $n = Copy-PowerDcValues -From $balanced -To $guid
-    if ($n -lt 1) { throw ("no battery setting could be taken from Balanced - '{0}' was not switched on (it would run Ultimate on battery)" -f $name) }
-    $null = powercfg -setactive $guid
-    if ($LASTEXITCODE -ne 0) { throw ("powercfg -setactive {0} failed (exit code {1})" -f $guid, $LASTEXITCODE) }
-    Write-Log DEBUG ("power plan '{0}' ({1}) active - {2} battery settings taken from Balanced" -f $name, $guid, $n) $Id
+    $null = powercfg -delete $guid
+    if ($LASTEXITCODE -ne 0) { Write-Log WARN ("the old laptop plan {0} could not be deleted (powercfg exit code {1})" -f $guid, $LASTEXITCODE) $Id }
+    else { Write-Log DEBUG "deleted the old laptop plan $guid" $Id }
+    Set-Reg -Id $Id -Path $script:StateKey -Name 'LaptopPowerPlan' -Type String -Value '<RemoveEntry>'
 }
 
 function Invoke-Step {
@@ -1531,16 +1469,16 @@ $script:Tweaks = @(
       }
   }}
 
-  # Ultimate Performance power plan - max performance, then ACTIVATE it. PC only (Machine='PC'): a laptop gets
-  # CustomLaptopPower instead (Ultimate on the charger only - on battery it would keep the CPU from idling).
+  # Ultimate Performance power plan - max performance, then ACTIVATE it. PC only (Machine='PC'): a laptop keeps Windows'
+  # own plan (superuser, 2026-09-30 - on battery Ultimate would keep the CPU from idling).
   [pscustomobject]@{ Id='CustomUltimatePerf'; Content='Ultimate Performance - power plan'; Category='Custom'; Machine='PC'; Apply={
       Invoke-Step -Id 'CustomUltimatePerf' -Description 'enable + activate Ultimate Performance power plan' -Action { Set-PcPowerPlan -Id 'CustomUltimatePerf' }
   }}
 
-  # Laptop power (superuser, 2026-09-27): Ultimate Performance on the charger, Balanced on battery - ONE plan, so
-  # Windows switches by itself when the cable comes out (see Set-LaptopPowerPlan). A PC keeps plain Ultimate.
-  [pscustomobject]@{ Id='CustomLaptopPower'; Content='Power plan - Ultimate on the charger, Balanced on battery'; Category='Custom'; Machine='Laptop'; Apply={
-      Invoke-Step -Id 'CustomLaptopPower' -Description 'power plan: Ultimate Performance on the charger, Balanced on battery' -Action { Set-LaptopPowerPlan -Id 'CustomLaptopPower' }
+  # Laptop power (superuser, 2026-09-30): Windows' own plan - the performance tweaks are for a PC. A laptop that ran 1.6 /
+  # 1.7 got their "Ultimate + Balanced on battery" plan: that goes, Balanced is back (Reset-LaptopPowerPlan).
+  [pscustomobject]@{ Id='CustomLaptopPower'; Content='Power plan - Windows'' own (an earlier version''s plan removed)'; Category='Custom'; Machine='Laptop'; Apply={
+      Invoke-Step -Id 'CustomLaptopPower' -Description "power plan: Windows' own - an earlier version's laptop plan removed" -Action { Reset-LaptopPowerPlan -Id 'CustomLaptopPower' }
   }}
 
   # Memory Integrity (HVCI) / VBS - disable it for gaming. Win11's Core Isolation "Memory Integrity"
@@ -1902,7 +1840,7 @@ $script:TweakGroups = @(
     [pscustomobject]@{ Name = 'Explorer'; Text = 'opens This PC, file extensions, classic menu'
         Ids = @('CustomExplorerThisPC', 'WPFTweaksDisableExplorerAutoDiscovery', 'WPFToggleShowExt', 'WPFTweaksRightClickMenu', 'CustomShortcutArrow', 'CustomRemoveEdgeShortcut') }
     [pscustomobject]@{ Name = 'Edge'; Text = 'no startup boost, promos or sidebar'; Ids = @('WPFTweaksEdgeDebloat') }
-    [pscustomobject]@{ Name = 'Performance'; Text = @{ PC = 'Ultimate Performance, Memory Integrity off, no hibernation'; Laptop = 'Ultimate on the charger, Balanced on battery' }
+    [pscustomobject]@{ Name = 'Performance'; Text = @{ PC = 'Ultimate Performance, Memory Integrity off, no hibernation'; Laptop = 'Memory Integrity off, Windows'' own power plan' }
         Ids = @('CustomUltimatePerf', 'CustomLaptopPower', 'CustomDisableVBS', 'WPFToggleGameMode', 'CustomHibernateOff', 'WPFToggleStandbyFix', 'CustomStandbyNoNetBattery') }
     [pscustomobject]@{ Name = 'Input & look'; Text = 'dark theme, Num Lock, Win+V history, no mouse acceleration'
         Ids = @('WPFToggleDarkMode', 'WPFToggleLoginBlur', 'WPFToggleNumLock', 'CustomMouseAccel', 'CustomStickyKeysOff', 'CustomClipboardHistory') }
@@ -1956,7 +1894,7 @@ $script:HardwareGroup = 'Drivers & hardware'   # their row in the window
 # the Visual C++ redists and .NET 3.5 aren't in the app lists at all).
 $script:RuntimeApps = @('Microsoft.DirectX')
 # What the script remembers between runs on this PC: the date the promo apps were removed (CustomRemoveMoreApps) and the
-# GUIDs of the power plans it made (PcPowerPlan / LaptopPowerPlan).
+# GUID of the power plan it made (PcPowerPlan; LaptopPowerPlan = 1.6 / 1.7's laptop plan, until it is removed).
 $script:StateKey = 'HKLM:\SOFTWARE\win11-tweaks'
 # The empty Start layout Clear-StartPins writes (start2.bin, 972 bytes, sha256 2378a237...81ee65). From Win11Debloat
 # (Assets/Start/start2.bin, MIT License, Copyright (c) 2020 Raphire).

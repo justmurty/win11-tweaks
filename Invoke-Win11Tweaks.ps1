@@ -448,7 +448,10 @@ function Read-Answer {
 }
 
 function Set-Reg {
-    param([string]$Path, [string]$Name, [string]$Type, [string]$Value, [string]$Id = '')
+    # -Guarded: a value Windows may guard (UCPD, the UserChoice Protection Driver, refuses PowerShell some Widgets / Search
+    # values - "Attempted to perform an unauthorized operation" on superuser's Razer, 2026-09-30): refused there = logged,
+    # not a WARN - the tweak has another way to its goal. Any other refusal is still a WARN.
+    param([string]$Path, [string]$Name, [string]$Type, [string]$Value, [string]$Id = '', [switch]$Guarded)
     if ($script:DryRun) {
         if ($Value -eq '<RemoveEntry>') { Write-Log DEBUG "[DRYRUN] would remove $Path\$Name" $Id }
         else { Write-Log DEBUG "[DRYRUN] would set $Path\$Name = $Value ($Type)" $Id }
@@ -467,6 +470,10 @@ function Set-Reg {
             Write-Log DEBUG "removed $Path\$Name" $Id
         }
     } catch {
+        if ($Guarded -and $_.Exception -is [System.UnauthorizedAccessException]) {
+            Write-Log INFO "reg $Path\$Name is protected by Windows (UCPD) - left as it is" $Id
+            return
+        }
         Write-Log WARN "reg $Path\$Name failed: $($_.Exception.Message)" $Id
     }
 }
@@ -1365,14 +1372,16 @@ $script:Tweaks = @(
       # Official Recall GP ("Turn off saving snapshots for Windows") - disables Recall instantly via registry
       # (fast + idempotent), independent of the slow DISM feature removal below.
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' -Name 'DisableAIDataAnalysis' -Type DWord -Value '1'
-      Invoke-Step -Id $id -Description 'remove AI packages (Copilot, CoreAI, OfficeHub), disable Recall + WSAIFabricSvc' -Action {
+      # Copilot (superuser, 2026-09-30: "remove it" - the WinUtil pipe here did it silently, for the users there were only):
+      # the Copilot app and Microsoft 365 Copilot, for every user AND for new accounts, checked afterwards (Remove-Appx)
+      Remove-Appx -Id $id -Name 'Microsoft.Copilot'
+      Remove-Appx -Id $id -Name 'Microsoft.MicrosoftOfficeHub'
+      Invoke-Step -Id $id -Description 'remove the CoreAI package, disable Recall + WSAIFabricSvc' -Action {
           $appx = (Get-AppxPackage MicrosoftWindows.Client.CoreAI -ErrorAction SilentlyContinue).PackageFullName
           $sid  = (Get-LocalUser $Env:UserName -ErrorAction SilentlyContinue).Sid.Value
           if ($sid -and $appx) {
               New-Item "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\EndOfLife\$sid\$appx" -Force | Out-Null
           }
-          Get-AppxPackage -AllUsers "*Copilot*" -ErrorAction SilentlyContinue | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-          Get-AppxPackage -AllUsers Microsoft.MicrosoftOfficeHub -ErrorAction SilentlyContinue | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
           if ($appx) { Remove-AppxPackage $appx -ErrorAction SilentlyContinue }
           Set-Service -Name WSAIFabricSvc -StartupType Disabled -ErrorAction SilentlyContinue
           # Only run the (slow) DISM disable if Recall is actually still Enabled - on a re-run it's already
@@ -1450,22 +1459,26 @@ $script:Tweaks = @(
       $script:NeedExplorerRestart = $true
   }}
 
-  # Windows Spotlight - turn off rotating desktop pictures + set the default Win11 wallpaper
-  [pscustomobject]@{ Id='CustomSpotlightOff'; Content='Windows Spotlight - Disable + default wallpaper'; Category='Custom'; Apply={
+  # Windows Spotlight - turn off rotating desktop pictures + the "Windows (dark)" theme's wallpaper (superuser, 2026-09-30:
+  # the dark theme with its wallpaper - it was the light Bloom). CurrentTheme = dark.theme: Settings > Personalization >
+  # Themes shows "Windows (dark)" (checked on VM 102), without opening Settings. A Windows without it: the light Bloom.
+  [pscustomobject]@{ Id='CustomSpotlightOff'; Content='Windows Spotlight - Disable + the Windows (dark) wallpaper'; Category='Custom'; Apply={
       $id='CustomSpotlightOff'
-      $wall = 'C:\Windows\Web\Wallpaper\Windows\img0.jpg'
+      $wall = Join-Path $env:SystemRoot 'Web\Wallpaper\Windows\img19.jpg'; $theme = Join-Path $env:SystemRoot 'resources\Themes\dark.theme'
+      if (-not ((Test-Path -LiteralPath $wall) -and (Test-Path -LiteralPath $theme))) { $wall = Join-Path $env:SystemRoot 'Web\Wallpaper\Windows\img0.jpg'; $theme = '' }
       # desktop background type: 3 = Spotlight -> 0 = Picture
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Wallpapers' -Name 'BackgroundType' -Type DWord -Value '0'
       # the wallpaper image + Fill style
       Set-Reg -Id $id -Path 'HKCU:\Control Panel\Desktop' -Name 'WallPaper'      -Type String -Value $wall
       Set-Reg -Id $id -Path 'HKCU:\Control Panel\Desktop' -Name 'WallpaperStyle' -Type String -Value '10'
       Set-Reg -Id $id -Path 'HKCU:\Control Panel\Desktop' -Name 'TileWallpaper'  -Type String -Value '0'
+      if ($theme) { Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes' -Name 'CurrentTheme' -Type String -Value $theme }
       Invoke-Step -Id $id -Description 'remove Spotlight desktop icon + apply wallpaper' -Action {
           Remove-Item 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{2cc5ca98-6485-489a-920e-b3e88a6ccce3}' -Recurse -Force -ErrorAction SilentlyContinue
           if (-not ([System.Management.Automation.PSTypeName]'Native.Wp').Type) {
               Add-Type -Namespace Native -Name Wp -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)] public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);'
           }
-          [Native.Wp]::SystemParametersInfo(20, 0, 'C:\Windows\Web\Wallpaper\Windows\img0.jpg', 3) | Out-Null
+          [Native.Wp]::SystemParametersInfo(20, 0, $wall, 3) | Out-Null
       }
   }}
 
@@ -1536,9 +1549,10 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path $p -Name 'TaskbarMn'          -Type DWord -Value '0'   # Chat button off
       # Resume ("continue on this PC" from your phone - Settings > Apps > Resume) off; applies at the next sign-in
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' -Name 'IsResumeAllowed' -Type DWord -Value '0'
-      # Widgets: HKCU 'TaskbarDa' is locked on 25H2 (Set fails "unauthorized"), so kill it via the
-      # HKLM policy instead - verified to set cleanly and it removes the Widgets button.
-      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' -Name 'AllowNewsAndInterests' -Type DWord -Value '0'
+      # Widgets: HKCU 'TaskbarDa' is locked on 25H2 (Set fails "unauthorized"), so kill it via the HKLM policy instead -
+      # which Windows (UCPD) guards too on newer machines (superuser's Razer, 2026-09-30); there the Widgets app itself
+      # goes (CustomRemoveMoreApps), so a refusal is not a warning.
+      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' -Name 'AllowNewsAndInterests' -Type DWord -Value '0' -Guarded
       $script:NeedExplorerRestart = $true
   }}
 

@@ -9,8 +9,9 @@ Every detail goes to a log file for later.
 ## What it does
 
 - **55 tweaks** — 25 standard (Essential + Advanced + Customize Preferences toggles) + 30
-  custom (shortcut-arrow off, Spotlight off + default wallpaper, **Ultimate Performance** on a PC — on a
-  laptop **Ultimate on the charger, Balanced on battery** (one plan, it switches by itself); a Ryzen X3D
+  custom (shortcut-arrow off, Spotlight off + the **Windows (dark)** theme with its dark wallpaper,
+  **Ultimate Performance** on a PC — a laptop keeps **Windows' own power plan** (the "Ultimate on the
+  charger, Balanced on battery" plan of v1.6 / v1.7 is removed); a Ryzen X3D
   with two CCDs (7950X3D, 9950X3D...) keeps **Balanced**: AMD's V-Cache driver needs its core parking,
   **Memory Integrity / VBS off** for gaming, mouse acceleration off, DNS → Cloudflare,
   Explorer → This PC, taskbar cleanup (Search / Task view / Widgets / Chat / Resume off),
@@ -33,7 +34,7 @@ Every detail goes to a log file for later.
     Cross Device are deleted);
   - **old components removed** at the end, after .NET 3.5 (Windows completes the removal at the next
     restart) — Steps Recorder, Math Recognizer, Internet Explorer mode, PowerShell ISE, Print Management,
-    Work Folders, Windows Media Player Legacy (kept when it is the only video player), and **VBScript**
+    Work Folders, Windows Media Player Legacy (the new Media Player stays), and **VBScript**
     last, after the installs (command-line activation with `slmgr.vbs` needs it — activate in Settings,
     or add it back under Optional features; **kept on AMD machines**: AMD's chipset installer runs a
     VBScript);
@@ -44,7 +45,9 @@ Every detail goes to a log file for later.
     Wallet, WAP Push, Smart Card, Remote Desktop (+ Configuration, UserMode
     Port Redirector), Telephony, TCP/IP NetBIOS Helper; **Disabled**: Connected User Experiences and
     Telemetry, Routing and Remote Access (a service that is Disabled is never raised to Manual);
-  - **Copilot** "share" button on taskbar previews and Click to Do off; **Windows Error Reporting** off;
+  - **Copilot** removed (the Copilot app and Microsoft 365 Copilot, for every user and new accounts), its
+    "share" button on taskbar previews and Click to Do off; **Paint** and **Media Player** always stay;
+    **Windows Error Reporting** off;
     the **Sticky / Filter / Toggle Keys** pop-ups (5× Shift in a game) off; **no automatic restart**
     while someone is signed in; **hibernation off** on a PC (frees `hiberfil.sys`); **no network while
     asleep on battery** on a laptop;
@@ -54,6 +57,13 @@ Every detail goes to a log file for later.
     GPU driver Windows only offers 60 Hz, and that driver often arrives during the run (if a screen stayed at
     60 Hz, run the script again once the driver is in).
 
+  New in v1.8.0: **one app list, everything picked** — take off what you don't want (a row at a time,
+  or all); **PC or laptop is detected**, not asked; the apps for **this PC's hardware** are found, not
+  asked (NVIDIA App, AMD / Intel chipset drivers, Intel Driver & Support Assistant, Adrenalin, NZXT CAM,
+  Armoury Crate, Alienware Command Center); **what is already installed goes to the latest**; new apps
+  (U.GG, Rockstar Games Launcher, TreeSize, qBittorrent, MSI Afterburner, Razer Synapse, Vencord);
+  a laptop keeps Windows' own power plan; the Windows (dark) theme; Copilot removed.
+
   New in v1.7.0: **a window** that asks the setup
   questions and shows the run (see [The window](#the-window)), **a call no longer turns the game
   down** (Windows lowers every other sound by 80% while a call runs — set to "Do nothing"), and the
@@ -62,33 +72,37 @@ Every detail goes to a log file for later.
   Fixed in v1.6.0: Activity History no longer breaks the clipboard history (Win+V), Get Help stays
   (the Settings troubleshooters need it), "ConsumerFeatures" now also works on Pro. Details:
   [`docs/2026-07-11-win11-tweaks-design.md`](docs/2026-07-11-win11-tweaks-design.md).
-- Shows the **MSUHost banner**, asks **`Continue? (Y/n)`**, then two small menus (one option per line,
-  answered with `Select [1/2]`). **`Is this a PC or a Laptop?`** — `[1] PC` / `[2] Laptop`.
-  On a laptop the power plan is **Ultimate on the charger, Balanced on battery** (plain Ultimate would
-  keep the CPU from idling on battery), hibernation and the panel's refresh rate stay as they are, and
-  **NZXT CAM** isn't installed (it's for desktop NZXT coolers/cases).
-- Then **`[1] Gele, is that you?`** / **`[2] New user`**. `1`: the full app set, as always. `2`: one **`(Y/n)`**
-  question per app (Enter = yes) before anything is downloaded; after the last answer the run goes on
-  by itself and installs only the picked apps (the rest show as SKIPPED "not selected"). Visual C++,
-  DirectX and .NET 3.5 are always installed. NVIDIA App is only offered with an NVIDIA card, Alienware
-  Command Center only on Alienware / Dell G hardware. Then **`Keep these Windows apps?`** — Paint and
-  Media Player (Enter keeps them, `n` removes them; Gele isn't asked — they go). Otherwise the tweaks
-  are the same for both.
-- Then the **install phase**: **12 Visual C++ redists** + **15 winget apps**
-  (incl. VLC, Lightshot, TurboTop, WinRAR; NZXT CAM on a PC only) + **6 direct-download**
-  (**Google Chrome**, **NVIDIA App** only if an NVIDIA GPU is present — found by its PCI ID, so also
-  before its driver is in, **Bitwarden**, **Parsec**, **Google Play Games**, **FL Studio**) + on a PC the
+- Shows the **MSUHost banner** and asks **`Continue? (Y/n)`**. **PC or laptop** is detected: the case
+  type the PC reports (a laptop / notebook / convertible case = laptop, a desktop case = PC even with a
+  UPS "battery"), else Windows' power profile, else a battery; `-Machine` overrides it. On a laptop the
+  power plan stays Windows' own, hibernation and the panel's refresh rate stay as they are.
+- The window lists **every app, picked**: click one to leave it out, a row's name (Games, Tools...) for
+  the whole row, **Deselect all** / **Select all**. **Drivers & hardware** lists only what this PC's
+  hardware needs. The apps taken off show as SKIPPED "not selected".
+  Visual C++, DirectX and .NET 3.5 always go in. On the console (no window) everything goes in.
+- Then the **install phase**: **12 Visual C++ redists** + **18 winget apps**
+  (incl. VLC, Lightshot, TurboTop, WinRAR, TreeSize, qBittorrent, MSI Afterburner; **NZXT CAM** only
+  where an NZXT device is found) + **direct downloads** from the vendor (**Google Chrome**, **Bitwarden**,
+  **Parsec**, **Google Play Games**, **FL Studio**, **U.GG**, **Rockstar Games Launcher**, **Razer
+  Synapse** — Razer's own parts, silent —, **Vencord** into the signed-in user's Discord; **NVIDIA App**
+  only if an NVIDIA GPU is present — found by its PCI ID, so also before its driver is in) + on a PC the
   **drivers from the maker's own site** (not Windows Update), picked by the hardware: **AMD Chipset
-  Software** on a Ryzen board, **Intel Chipset Device Software** on an Intel one, **AMD Software:
+  Software** on a Ryzen board, **Intel Chipset Device Software** on an Intel one plus **Intel Driver &
+  Support Assistant** with any Intel device (it keeps the Intel drivers current), **AMD Software:
   Adrenalin** with a Radeon card and no NVIDIA one (every download must carry the vendor's signature or
   it isn't run; a laptop keeps its maker's drivers; nothing of this in a virtual machine) +
-  **Alienware Command Center**, installed only on
-  Alienware / Dell G-series hardware, desktop or laptop (a New user is asked). It also applies the
+  **Alienware Command Center** on Alienware / Dell G-series hardware and **Armoury Crate** on an ASUS
+  ROG / TUF / PRIME / ProArt board or a ROG / TUF laptop (ASUS's installer downloads it in the
+  background; it finishes after a restart), desktop or laptop. It also applies the
   **WinRAR license** and enables **.NET 3.5**
   (incl. 2.0/3.0) **and .NET 4** via DISM (like "Turn Windows features on/off").
 - **Pins "This PC"** and **Google Chrome** to the taskbar (via a temporary helper that is deleted
   afterwards), and unpins Microsoft Edge + Microsoft Store.
-- Already-installed apps are **skipped** (checked via `winget list` + Add/Remove Programs).
+- Already-installed apps (found via `winget list` + Add/Remove Programs) **go to the latest**:
+  `winget upgrade`; FL Studio and AMD's chipset software (no updater of their own) when the vendor's
+  latest file is newer than the installed version; the other direct downloads update themselves.
+  A failed update leaves the app as it was — a warning, not a failure. DirectX and Visual C++
+  2005–2013 are out of support and left alone.
 - Makes **no** restore point and does **not** reboot on its own (unless `-Reboot`). Nothing that
   isn't selected is touched.
 
@@ -139,10 +153,10 @@ PowerShell 7 use `pwsh` instead of `powershell`.
 The one-liner (and the `.bat`) open a dark window — nothing to install, it is part of the script
 (WPF, built into Windows). Three screens:
 
-- **Set up this PC** — PC or laptop (preselected: a battery means a laptop), who it is (Gele gets
-  everything; a New user picks the apps, grouped, and which built-in Windows apps to keep), what
-  always goes in, what this PC is not offered and why. **Start** (or Enter) / **Cancel** — Cancel
-  changes nothing.
+- **Set up this PC** — the PC, its Windows and PC / laptop (detected), then the apps: every one
+  picked, in rows (Games, Chat & streaming, Media, Tools, Internet, and Drivers & hardware with only
+  what this PC needs); click an app to leave it out, a row's name for the whole row, **Deselect all**
+  / **Select all**; what always goes in. **Start** (or Enter) / **Cancel** — Cancel changes nothing.
 - **The run** — the clock, then the phases on one line down the left: Tweaks (n / N, then the
   groups), Apps (the last ones done with their times, the one installing now with its own clock,
   the next ones), .NET 3.5 (downloading in the background next to the apps), Finishing. **Log**
@@ -166,10 +180,9 @@ With `-Console` (and wherever there is no window): a rail down the left, from th
 the result:
 
 ```
-  ┌  MSUHost  win11-tweaks 1.7.0
+  ┌  MSUHost  win11-tweaks 1.8.0
   ?  Continue? (Y/n) › y
-  ?  Who is it?  1 Gele  2 New user  › 1
-  ├─ WIN11-TEST · Windows 11 Pro 25H2 (26200) · PC · Gele
+  ├─ WIN11-TEST · Windows 11 Pro 25H2 (26200) · PC · all 25 apps
   ├─ Tweaks
   │  √ Privacy           telemetry, activity history, location, error reports        4.3s
   │  ! Edge              Microsoft Edge - Debloat: 1 step(s) failed - see the log     140ms
@@ -218,7 +231,7 @@ default Windows 11 shell use; PowerShell 7 has an open bug where Ctrl+C can skip
 | (none) | Actually apply the tweaks + install the apps. |
 | `-Console` | The rail in the console instead of the window. |
 | `-Detailed` | The full log on the console instead of the rail (the log file is always full). |
-| `-Machine PC\|Laptop` | Skip the "PC or Laptop?" question (`Laptop`: Ultimate only on the charger, keeps hibernation and the panel's refresh rate, no NZXT CAM; `PC`: plain Ultimate, no battery tweaks). |
+| `-Machine PC\|Laptop` | PC or laptop without detecting it (`Laptop`: Windows' own power plan, keeps hibernation and the panel's refresh rate; `PC`: Ultimate, no battery tweaks). |
 | `-Reboot` | Reboot 15s after finishing (cancel with Ctrl+C). An unattended run: the console, no window. |
 | `-LogDir <path>` | Different folder for the log (default: `%TEMP%\win11-tweaks`). |
 
@@ -227,15 +240,19 @@ default Windows 11 shell use; PowerShell 7 has an open bug where Ctrl+C can skip
 Edit the arrays near the top of the install section of the script: `$script:AppsToInstall`
 for winget apps (add winget IDs, e.g. `'Mozilla.Firefox'`), `$script:DirectApps` for
 direct-download apps, or `$script:VendorApps` for apps that belong on one vendor's hardware
-(`Hardware` is a regex matched against the PC's manufacturer + model). A new app is offered to a
-New user automatically; if everyone must get it without being asked, also add its winget ID to
-`$script:RuntimeApps`.
+(`Hardware` is a regex matched against the PC's manufacturer + model). A new app shows up in the
+window's list, picked — in its row if it is in `$script:AppGroups`, else under Other. If everyone
+must get it without a choice, also add its winget ID to `$script:RuntimeApps`; an app for some
+hardware only goes in `$script:HardwareApps` (with its check).
 
 ## Notes
 
 - **NVIDIA App** and **FL Studio** are not (reliably) on winget → the script downloads them
   **directly from the vendor** and installs them silently. NVIDIA App runs **only** if an NVIDIA
   GPU is present.
+- **Vencord** comes from the Vencord organisation's GitHub releases (its command-line installer — not
+  code-signed, Vencord says so on its page). It patches the signed-in user's Discord and closes
+  Discord for that; without Discord it is SKIPPED "needs Discord".
 - Some direct installers return a non-standard exit code even on success (FL Studio returns
   `1223`), so the script verifies the actual install via Add/Remove Programs instead of trusting
   the exit code.
@@ -245,7 +262,8 @@ New user automatically; if everyone must get it without being asked, also add it
 - **No undo and no restore point** — if you want to roll back, take a snapshot/backup yourself
   before the real run. The script remembers a few things on the PC under `HKLM\SOFTWARE\win11-tweaks`:
   `PromoAppsRemoved` (the date the promo apps went — later runs leave Store apps alone) and
-  `PcPowerPlan` / `LaptopPowerPlan` (the power plan it made, so a re-run reuses it). The old Start
+  `PcPowerPlan` (the power plan it made, so a re-run reuses it; v1.6 / v1.7's `LaptopPowerPlan` goes
+  with its plan). The old Start
   layout is kept as `start2.bin.win11-tweaks.bak` next to the new one.
 - **winget needs an interactive session** — run via `Run-Win11Tweaks.bat` (double-click) or the
   one-liner in a PowerShell window on the PC itself, not over SSH/remoting (winget fails with

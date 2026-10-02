@@ -115,7 +115,7 @@ Every detail goes to a log file for later.
   motherboard in a PC (the version ASUS's own feed names, signed by ASUS — its page opens at the end:
   **Install all**); **Roland's Rubix driver** when a Rubix 22 / 24 / 44 is plugged in (USB). Every direct
   download is checked to be whole — a server that drops the connection part-way (Razer's did) is asked for
-  the rest, up to 5 times. It also applies the
+  the rest for as long as it comes. It also applies the
   **WinRAR license** and enables **.NET 3.5**
   (incl. 2.0/3.0) **and .NET 4** via DISM (like "Turn Windows features on/off").
 - At the end, the **taskbar**: File Explorer, **This PC** and **Google Chrome** pinned; the pins Windows

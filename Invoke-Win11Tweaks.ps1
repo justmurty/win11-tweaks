@@ -3374,10 +3374,10 @@ public static extern uint SetThreadExecutionState(uint esFlags);
 
 function Set-KeepAwake {
     # From Start until the run is over and its window closed, Windows neither sleeps nor turns the screen off - what
-    # installers and video players do. A laptop on battery could go to sleep mid-install, and the screen going off and
-    # on again took the window with it (VM 102, 2026-10-02: off 15 min after Done, back on 4 min later -> "Desktop
-    # composition is disabled" -> the window could not draw and went). -Off: Windows' own timers again (the request
-    # also ends with the run's process).
+    # installers and video players do. A laptop on battery could go to sleep mid-install, and a window broke when the
+    # screen came back on (VM 102, 2026-10-02: off 15 min after Done, back on 4 min later -> "Desktop composition is
+    # disabled" -> it could not draw and went; a 4 GB VM that had run low on memory - an off/on alone did not do it in
+    # a test). -Off: Windows' own timers again (the request also ends with the run's process).
     # Sleep from the Start menu, the power button or the lid still works.
     param([switch]$Off)
     try {
@@ -3867,7 +3867,7 @@ function Wait-GuiClose {
     $sh = $script:Gui.Shared
     while (-not $sh.Closed -and -not $sh.Action -and -not $script:Gui.Handle.IsCompleted) { Start-Sleep -Milliseconds 200 }
     if (($sh.Broke -or $sh.Error) -and -not $script:Gui.Replayed) {
-        # it went by itself after the run (it could not draw - after the screen went off and on, VM 102 2026-10-02): its
+        # it went by itself after the run (it could not draw - e.g. when the screen came back on, VM 102 2026-10-02): its
         # Done screen and "Restart now" went with it - the console shows the run, its summary and what to do next instead
         Write-Log WARN ('the window went by itself ({0}) - the console shows the run and its summary' -f $(if ($sh.Broke) { $sh.Broke } else { $sh.Error }))
         Resume-Console
@@ -4696,35 +4696,41 @@ catch [System.OperationCanceledException] {
     $script:MainEnded = $true
 }
 finally {
-    # The summary is written HERE so it also lands when the run is stopped early with Ctrl+C - e.g. during
-    # the .NET 3.5 wait, which then simply keeps installing in the background (/NoRestart).
-    if ($script:RunStarted) {
-        if (-not $script:RunFinished) {
-            if ($script:LiveOpen) { Clear-Live } elseif ($script:Detailed) { Write-Host '' }   # Ctrl+C can land mid-line (the live step / the .NET 3.5 heartbeat)
-            # e.g. Ctrl+C in the .NET 3.5 wait: the last steps (taskbar pins, old components, refresh rate, VBScript) come after it
-            Write-Log WARN "Stopped early - this summary only covers what ran. Run the script again to finish the rest."
+    try {
+        # The summary is written HERE so it also lands when the run is stopped early with Ctrl+C - e.g. during
+        # the .NET 3.5 wait, which then simply keeps installing in the background (/NoRestart).
+        if ($script:RunStarted) {
+            if (-not $script:RunFinished) {
+                if ($script:LiveOpen) { Clear-Live } elseif ($script:Detailed) { Write-Host '' }   # Ctrl+C can land mid-line (the live step / the .NET 3.5 heartbeat)
+                # e.g. Ctrl+C in the .NET 3.5 wait: the last steps (taskbar pins, old components, refresh rate, VBScript) come after it
+                Write-Log WARN "Stopped early - this summary only covers what ran. Run the script again to finish the rest."
+            }
+            Write-Summary
+            Write-Log INFO ("=========== WIN11-TWEAKS {0} ===========" -f $(if ($script:RunFinished) { 'DONE' } else { 'STOPPED' }))
+            Clear-StuckSearch   # a stuck Windows Search takes the clicks meant for the Done screen (and the desktop)
         }
-        Write-Summary
-        Write-Log INFO ("=========== WIN11-TWEAKS {0} ===========" -f $(if ($script:RunFinished) { 'DONE' } else { 'STOPPED' }))
-        Clear-StuckSearch   # a stuck Windows Search takes the clicks meant for the Done screen (and the desktop)
-    }
-    Set-QuickEdit -Restore
-    try { Stop-Transcript | Out-Null } catch { }
-    if ($script:SavedPrefs) { $ProgressPreference = $script:SavedPrefs.Progress; $WarningPreference = $script:SavedPrefs.Warning }   # the window's own settings
-    # the window: it shows the summary until it is closed (Restart now restarts) - or, cancelled at the start, it goes
-    # (the console the relaunch opened goes with it - unless something went wrong: then it shows what)
-    if ($script:Gui) {
-        $quiet = $script:Relaunched -and $script:MainEnded
-        if ($script:RunStarted) { Wait-GuiClose -Quiet:$quiet }
-        else {
-            $gsh = $script:Gui.Shared
-            Close-Gui
-            if ($quiet -and $script:Cancelled -and -not $gsh.Error -and -not $gsh.ErrorCount) { $script:ExitWhenDone = $true }
-            else { Set-ConsoleWindow -Show; if ($script:Cancelled) { Write-Markup "  {r:Cancelled - nothing was changed.}" } }
+        Set-QuickEdit -Restore
+        try { Stop-Transcript | Out-Null } catch { }
+        if ($script:SavedPrefs) { $ProgressPreference = $script:SavedPrefs.Progress; $WarningPreference = $script:SavedPrefs.Warning }   # the window's own settings
+        # the window: it shows the summary until it is closed (Restart now restarts) - or, cancelled at the start, it goes
+        # (the console the relaunch opened goes with it - unless something went wrong: then it shows what)
+        if ($script:Gui) {
+            $quiet = $script:Relaunched -and $script:MainEnded
+            if ($script:RunStarted) { Wait-GuiClose -Quiet:$quiet }
+            else {
+                $gsh = $script:Gui.Shared
+                Close-Gui
+                if ($quiet -and $script:Cancelled -and -not $gsh.Error -and -not $gsh.ErrorCount) { $script:ExitWhenDone = $true }
+                else { Set-ConsoleWindow -Show; if ($script:Cancelled) { Write-Markup "  {r:Cancelled - nothing was changed.}" } }
+            }
         }
+    } finally {
+        # whatever happened above (an error in it too - this thread runs the console's next prompt): Windows' own
+        # sleep / screen timers again, after the window (its Done screen kept the screen on too), and never a console
+        # left hidden
+        Set-KeepAwake -Off
+        if (-not $script:ExitWhenDone) { Set-ConsoleWindow -Show }
     }
-    Set-KeepAwake -Off                  # (after the window: its Done screen kept the screen on too)
-    if (-not $script:ExitWhenDone) { Set-ConsoleWindow -Show }   # whatever happened: never leave the console hidden
     # HERE, not after the finally: Cancel leaves Main with `return`, and that skips everything after it (no -Reboot
     # with the window, so nothing is lost)
     if ($script:ExitWhenDone) { Exit-Console }

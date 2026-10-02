@@ -198,8 +198,8 @@ window (or the `.bat`'s) comes back with the summary line and the log path. If t
 early or has an error, the console comes back and shows the run — and if it can no longer draw
 after the run, the console shows the whole run with its summary and what to do next (**Restart
 the PC to finish**). From **Start** until the window is closed, Windows doesn't go to sleep or
-turn the screen off (a laptop could sleep mid-install, and the screen going off and on again once
-took the window with it); closing the window gives Windows its own timers back. Without a desktop (SSH, a
+turn the screen off (a laptop could sleep mid-install, and on a test PC the window broke once when
+the screen came back on); closing the window gives Windows its own timers back. Without a desktop (SSH, a
 service), with `-Console`, `-Detailed` or `-Reboot`, or if the window cannot open, the console
 shows the run (below).
 

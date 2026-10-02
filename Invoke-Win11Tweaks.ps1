@@ -79,7 +79,7 @@ $script:SettingsPagesHidden  = @()     # Settings pages hidden so far in this ru
 $script:ConsoleModeSaved     = $null   # console input mode before Set-QuickEdit turned QuickEdit off (put back at the end)
 $script:Results              = [System.Collections.Generic.List[object]]::new()
 # The console view ("Rail", superuser's pick from the design page, 2026-09-28) - see Write-Ui
-$script:Version              = '1.8.0' # on the rail head and in the window's title bar - bumped with every release
+$script:Version              = '1.8.1' # on the rail head and in the window's title bar - bumped with every release
 $script:Ui                   = -not $script:Detailed   # the console shows the rail; -Detailed puts the full log there instead
 # Cmdlets' own warnings would print straight onto the rail's live line (superuser's run, 2026-09-28: DISM's "WARNING:
 # Restart is suppressed because NoRestart is specified.") - off in the rail view; -Detailed shows the other cmdlet warnings

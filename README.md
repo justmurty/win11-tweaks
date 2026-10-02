@@ -57,7 +57,7 @@ Every detail goes to a log file for later.
     GPU driver Windows only offers 60 Hz, and that driver often arrives during the run (if a screen stayed at
     60 Hz, run the script again once the driver is in).
 
-  Changed in the next release: **Core Isolation (Memory Integrity) stays on** — the script no longer
+  New in v1.8.1: **Core Isolation (Memory Integrity) stays on** — the script no longer
   turns it off. A PC that ran an earlier version has it off: turn it on in Windows Security > Device
   security > Core isolation (Windows checks the drivers first), then restart. Fixed: **the taskbar pins
   disappeared after the first restart** — they now go through Windows' own taskbar layout (see below).
@@ -68,6 +68,8 @@ Every detail goes to a log file for later.
   in. While it runs, and until its window is closed, **the PC doesn't sleep and the screen stays on**;
   a window that can no longer draw leaves the whole run and its summary in the console. A download that
   stopped part-way (Razer's server drops connections) now gets its rest instead of failing as "not signed".
+  **Windows activation**: when Windows is not activated, the run's first step puts in the product key that
+  comes with the script and activates Windows online (Settings > Activation opens if that does not work).
 
   New in v1.8.0: **one app list, everything picked** — take off what you don't want (a row at a time,
   or all); **PC or laptop is detected**, not asked; the apps for **this PC's hardware** are found, not
@@ -182,9 +184,11 @@ The one-liner (and the `.bat`) open a dark window — nothing to install, it is 
   picked, in rows (Games, Chat & streaming, Media, Tools, Internet, and Drivers & hardware with only
   what this PC needs); click an app to leave it out, a row's name for the whole row, **Deselect all**
   / **Select all**; what always goes in. When Windows is **not activated**, a **Windows** row on top
-  with **Activate in Settings** (picked): at Start the run's first line opens Settings > System >
-  Activation, where the key goes in — the script itself activates nothing. **Start** (or Enter) /
-  **Cancel** — Cancel changes nothing.
+  with **Windows 11 Pro** (picked): at Start the run's first step puts in the product key that comes
+  with the script and activates Windows online (Windows' own licensing — no `slmgr`, so it works
+  without VBScript too); with no key, a key Windows refuses, or no activation (no internet), Settings >
+  System > Activation opens instead. The key never goes to the log — only its last 5 characters.
+  **Start** (or Enter) / **Cancel** — Cancel changes nothing.
 - **The run** — the clock, then the phases on one line down the left: Tweaks (n / N, then the
   groups), Apps (the last ones done with their times, the one installing now with its own clock,
   the next ones), .NET 3.5 (downloading in the background next to the apps), Finishing. **Log**
@@ -212,7 +216,7 @@ With `-Console` (and wherever there is no window): a rail down the left, from th
 the result:
 
 ```
-  ┌  MSUHost  win11-tweaks 1.8.0
+  ┌  MSUHost  win11-tweaks 1.8.1
   ?  Continue? (Y/n) › y
   ├─ WIN11-TEST · Windows 11 Pro 25H2 (26200) · PC · all 27 apps
   ├─ Tweaks

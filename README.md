@@ -66,7 +66,8 @@ Every detail goes to a log file for later.
   of the run its page opens, and **Install all** there puts in the board's drivers (ASUS has no way to
   do that without the click). **Roland's driver** when a Rubix 22 / 24 / 44 audio interface is plugged
   in. While it runs, and until its window is closed, **the PC doesn't sleep and the screen stays on**;
-  a window that can no longer draw leaves the whole run and its summary in the console.
+  a window that can no longer draw leaves the whole run and its summary in the console. A download that
+  stopped part-way (Razer's server drops connections) now gets its rest instead of failing as "not signed".
 
   New in v1.8.0: **one app list, everything picked** — take off what you don't want (a row at a time,
   or all); **PC or laptop is detected**, not asked; the apps for **this PC's hardware** are found, not
@@ -112,7 +113,9 @@ Every detail goes to a log file for later.
   ROG / TUF / PRIME / ProArt board or a ROG / TUF laptop (ASUS's installer downloads it in the
   background; it finishes after a restart), desktop or laptop; **ASUS DriverHub** on any ASUS
   motherboard in a PC (the version ASUS's own feed names, signed by ASUS — its page opens at the end:
-  **Install all**); **Roland's Rubix driver** when a Rubix 22 / 24 / 44 is plugged in (USB). It also applies the
+  **Install all**); **Roland's Rubix driver** when a Rubix 22 / 24 / 44 is plugged in (USB). Every direct
+  download is checked to be whole — a server that drops the connection part-way (Razer's did) is asked for
+  the rest, up to 5 times. It also applies the
   **WinRAR license** and enables **.NET 3.5**
   (incl. 2.0/3.0) **and .NET 4** via DISM (like "Turn Windows features on/off").
 - At the end, the **taskbar**: File Explorer, **This PC** and **Google Chrome** pinned; the pins Windows

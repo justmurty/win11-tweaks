@@ -1165,6 +1165,61 @@ function Get-DirectFailStatus {
     $script:ItemFail = $Why; return 'FAILED'
 }
 
+function Get-DownloadLength {
+    # The size the server gives for a download (a HEAD request with the download's own headers); 0 when it gives none or
+    # will not answer one - the download then goes as before
+    param([string]$Url, [hashtable]$Headers, [string]$UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
+    try {
+        $iwr = @{ Uri = $Url; Method = 'Head'; UseBasicParsing = $true; UserAgent = $UserAgent; ErrorAction = 'Stop' }
+        if ($Headers) { $iwr.Headers = $Headers }
+        $r = Invoke-WebRequest @iwr
+        $n = [int64]0
+        if ([int64]::TryParse((@($r.Headers['Content-Length']) -join ''), [ref]$n)) { return $n }
+    } catch { }
+    return [int64]0
+}
+
+function Receive-DownloadRest {
+    # The rest of a download that stopped part-way: a Range request from where the file ends, added to it (206). A server
+    # that sends the whole file again (200) writes it over. Returns the file's length after it.
+    param([string]$Url, [string]$OutFile, [hashtable]$Headers, [string]$UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
+    $have = (Get-Item -LiteralPath $OutFile).Length
+    $req = [System.Net.HttpWebRequest]::Create($Url)
+    $req.UserAgent = $UserAgent; $req.Timeout = 60000; $req.ReadWriteTimeout = 60000
+    if ($Headers) { foreach ($k in $Headers.Keys) { if ($k -eq 'Referer') { $req.Referer = [string]$Headers[$k] } else { $req.Headers[[string]$k] = [string]$Headers[$k] } } }
+    $req.AddRange([int64]$have)
+    $resp = $req.GetResponse()
+    try {
+        $mode = if ([int]$resp.StatusCode -eq 206) { [IO.FileMode]::Append } else { [IO.FileMode]::Create }
+        $in = $resp.GetResponseStream(); $out = [IO.File]::Open($OutFile, $mode, [IO.FileAccess]::Write)
+        try { $in.CopyTo($out) } finally { $out.Close(); $in.Close() }
+    } finally { $resp.Close() }
+    return (Get-Item -LiteralPath $OutFile).Length
+}
+
+function Save-Download {
+    # A download to a file, checked to be whole. Invoke-WebRequest (Windows PowerShell 5.1) can stop part-way WITHOUT an
+    # error: Razer's download server dropped connections at random (VM 102, 2026-10-02: 176 / 12 / 8 MB of its 220 MB
+    # installer, no error - the run then said "not signed"; curl saw "transfer closed" from the Mac too). The size the
+    # server gives (a HEAD request) is checked; short: the rest is fetched (a Range request) - 5 tries in all, a few
+    # seconds apart. A server that gives no size: as before (a signature check after it still decides what runs).
+    # Throws when it stays short.
+    param([string]$Url, [string]$OutFile, [hashtable]$Headers, [string]$UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', [int]$Tries = 5)
+    $want = Get-DownloadLength -Url $Url -Headers $Headers -UserAgent $UserAgent
+    $iwr = @{ Uri = $Url; OutFile = $OutFile; UseBasicParsing = $true; UserAgent = $UserAgent; ErrorAction = 'Stop' }
+    if ($Headers) { $iwr.Headers = $Headers }
+    $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'   # (5.1's progress bar slows a download to a crawl)
+    try { Invoke-WebRequest @iwr } finally { $ProgressPreference = $pp }
+    $got = (Get-Item -LiteralPath $OutFile).Length
+    for ($try = 2; $want -gt 0 -and $got -lt $want -and $try -le $Tries; $try++) {
+        Write-Log DEBUG ('download stopped at {0:N1} of {1:N1} MB - fetching the rest ({2}/{3})' -f ($got / 1MB), ($want / 1MB), $try, $Tries)
+        Start-Sleep -Seconds 3
+        try { $got = Receive-DownloadRest -Url $Url -OutFile $OutFile -Headers $Headers -UserAgent $UserAgent }
+        catch { Write-Log DEBUG "download: $($_.Exception.Message)"; $got = (Get-Item -LiteralPath $OutFile).Length }
+    }
+    if ($want -gt 0 -and $got -lt $want) { throw ('the download stopped early ({0:N1} of {1:N1} MB)' -f ($got / 1MB), ($want / 1MB)) }
+}
+
 function Install-DirectDownload {
     # Download a vendor installer straight from a URL (or a scraped URL) and run it silently.
     # For apps NOT on winget (e.g. NVIDIA App). DryRun-aware. Returns OK/SKIPPED/FAILED/DRYRUN.
@@ -1215,11 +1270,7 @@ function Install-DirectDownload {
     $tmp = Join-Path $env:TEMP ("{0}_{1}.{2}" -f ($Name -replace '\W','_'), (Get-Date -Format 'yyyyMMddHHmmss'), $ext)
     Write-Log DEBUG "downloading $Name from $Url"
     try {
-        $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-        $iwr = @{ Uri = $Url; OutFile = $tmp; UseBasicParsing = $true; UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'; ErrorAction = 'Stop' }
-        if ($Headers) { $iwr.Headers = $Headers }
-        Invoke-WebRequest @iwr
-        $ProgressPreference = $pp
+        Save-Download -Url $Url -OutFile $tmp -Headers $Headers   # checked to be whole - a download can stop part-way without an error
     } catch {
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue   # no half file left in TEMP (Adrenalin alone is 1.6 GB)
         Write-Log WARN "$failed (download failed: $($_.Exception.Message))"; return (Get-DirectFailStatus 'download failed' ([bool]$from))
@@ -2648,7 +2699,7 @@ function Install-DirectXRuntime {
     $tmp = Join-Path $env:TEMP ('directx_Jun2010_redist_{0}.exe' -f (Get-Date -Format 'yyyyMMddHHmmss')); $dir = $tmp -replace '\.exe$', ''
     try {
         $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -ErrorAction Stop
+        Save-Download -Url $url -OutFile $tmp
         $ProgressPreference = $pp
         $sig = Get-AuthenticodeSignature -FilePath $tmp -ErrorAction SilentlyContinue
         if (-not $sig -or "$($sig.Status)" -ne 'Valid' -or "$($sig.SignerCertificate.Subject)" -notmatch 'Microsoft Corporation') {
@@ -2722,7 +2773,7 @@ function Install-Vencord {
     $tmp = Join-Path $env:TEMP ('VencordInstallerCli_{0}.exe' -f (Get-Date -Format 'yyyyMMddHHmmss'))
     try {
         $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri 'https://github.com/Vencord/Installer/releases/latest/download/VencordInstallerCli.exe' -OutFile $tmp -UseBasicParsing -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -ErrorAction Stop
+        Save-Download -Url 'https://github.com/Vencord/Installer/releases/latest/download/VencordInstallerCli.exe' -OutFile $tmp
         $ProgressPreference = $pp
         $fs = [System.IO.File]::OpenRead($tmp); $mz = New-Object byte[] 2; [void]$fs.Read($mz, 0, 2); $fs.Close()
         if (-not ($mz[0] -eq 0x4D -and $mz[1] -eq 0x5A)) { throw 'the download is not a program' }
@@ -2773,7 +2824,7 @@ function Install-ArmouryCrate {
     $zip = Join-Path $env:TEMP ('ArmouryCrateInstallTool_{0}.zip' -f (Get-Date -Format 'yyyyMMddHHmmss')); $dir = $zip -replace '\.zip$', ''
     try {
         $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri 'https://dlcdnets.asus.com/pub/ASUS/mb/14Utilities/ArmouryCrateInstallTool.zip' -OutFile $zip -UseBasicParsing -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -ErrorAction Stop
+        Save-Download -Url 'https://dlcdnets.asus.com/pub/ASUS/mb/14Utilities/ArmouryCrateInstallTool.zip' -OutFile $zip
         Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force -ErrorAction Stop
         $ProgressPreference = $pp
         $exe = @(Get-ChildItem -LiteralPath $dir -Recurse -Filter 'ArmouryCrateInstaller.exe' -ErrorAction Stop)[0]
@@ -2829,7 +2880,7 @@ function Install-AsusDriverHub {
         $url = "https://driverhub.asus.com/download/$ver/ASUS-DriverHub-Installer.exe"
         Write-Log DEBUG "downloading $name $ver from $url"
         $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing -UserAgent $ua -ErrorAction Stop
+        Save-Download -Url $url -OutFile $exe -UserAgent $ua
         $ProgressPreference = $pp
         $sig = Get-AuthenticodeSignature -FilePath $exe -ErrorAction SilentlyContinue
         if (-not $sig -or "$($sig.Status)" -ne 'Valid' -or "$($sig.SignerCertificate.Subject)" -notmatch '(?i)ASUSTeK') { throw "the installer is not signed by ASUS ($(if ($sig) { $sig.Status }))" }
@@ -2881,7 +2932,7 @@ function Install-Alienware {
     $tmp = Join-Path $env:TEMP 'AWCC_dell.exe'
     try {
         $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -Uri $dellUrl -OutFile $tmp -UseBasicParsing -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -ErrorAction Stop
+        Save-Download -Url $dellUrl -OutFile $tmp
         $ProgressPreference = $pp
         $dp = Start-Process -FilePath $tmp -ArgumentList '/s' -Wait -PassThru
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue

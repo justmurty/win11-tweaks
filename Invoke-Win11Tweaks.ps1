@@ -99,6 +99,7 @@ $script:RunClock             = $null   # started when the run starts ("Done in 1
 $script:DotNet35Clock        = $null   # started with the .NET 3.5 download
 $script:AppsLabel            = ''      # "all 27 apps" / "24 of 27 apps" - on the machine line (Set-AppsLabel)
 $script:OpenActivation       = $false  # Windows is not activated and the window's box was left on: Settings > Activation opens
+$script:DriverHubReady       = $false  # ASUS DriverHub is on this PC (installed now or before) - its page opens at the end of the run
 $script:ProductKey           = 'YRDNX-JXTHQ-Q4H33-HMDMP-7CFDB'      # 'XXXXX-XXXXX-XXXXX-XXXXX-XXXXX'
 $script:LastPrompt           = ''      # the question on the console right now, as plain text
 # The window (variant A of the design page, superuser's pick 2026-09-28) - see Start-Gui. The run only FEEDS it.
@@ -2095,6 +2096,9 @@ $script:VendorApps = @(
     @{ Id='9PMHP03NJ9QP'; Name='Alienware Command Center'; Vendor='Alienware/Dell G'; Hardware='Alienware|^Dell\b.*\bG\d{1,2}\s+\d{4}\b'; Source='msstore' }
     # Armoury Crate (superuser, 2026-09-30) -> ASUS ROG / TUF / PRIME / ProArt boards and ROG / TUF laptops (Install-ArmouryCrate)
     @{ Id='ArmouryCrate'; Name='Armoury Crate'; Vendor='ASUS ROG / TUF'; Require={ Test-ArmouryCrateHardware }; RequireMsg='not ASUS ROG / TUF / PRIME / ProArt' }
+    # ASUS DriverHub (superuser, 2026-10-02) -> any ASUS motherboard in a PC: ASUS's own driver tool for its boards -
+    # Armoury Crate 6 no longer offers drivers and points to it (Install-AsusDriverHub; its page opens at the end of the run)
+    @{ Id='ASUS.DriverHub'; Name='ASUS DriverHub'; Vendor='ASUS'; Require={ Test-AsusDriverHubHardware }; RequireMsg='not an ASUS motherboard in a PC' }
 )
 # winget apps that need their hardware (like the direct apps' Require) - SKIPPED with the reason where it isn't there.
 # Keyed by winget ID.
@@ -2105,7 +2109,7 @@ $script:AppRequire = @{
 # list - picked, in their own row - only where their hardware is found; the install phase checks it again. Keys as the
 # install phase knows them: winget ID / direct-app Name / vendor-app Id.
 $script:HardwareApps = @('NZXT.CAM', 'NVIDIA App', 'AMD Chipset Software', 'Intel Chipset Device Software', 'AMD Software Adrenalin',
-                         'Intel Driver & Support Assistant', 'ArmouryCrate', '9PMHP03NJ9QP')
+                         'Intel Driver & Support Assistant', 'Roland Rubix Driver', 'ArmouryCrate', 'ASUS.DriverHub', '9PMHP03NJ9QP')
 $script:HardwareGroup = 'Drivers & hardware'   # their row in the window
 # Runtimes in $script:AppsToInstall: installed for EVERY machine - never in the window's list (games and apps need them;
 # the Visual C++ redists and .NET 3.5 aren't in the app lists at all).
@@ -2265,6 +2269,18 @@ $script:DirectApps = @(
         Machine    = 'PC'
         Require    = { (Test-PciVendor '8086') -and -not (Test-VirtualMachine) }
         RequireMsg = 'no Intel hardware'
+    }
+    @{  # Roland Rubix driver (superuser, 2026-10-02) - only with a Rubix 22 / 24 / 44 audio interface plugged in (Roland's
+        # USB IDs in its INF). Without it Windows' own USB audio driver runs the box, and its firmware-update part shows up
+        # as "Rubix22 DFU" with no driver; ASIO needs Roland's driver too. Any machine (it's not the maker's chipset). Roland's
+        # 2021 package (1.0.7 - the newest there is): a 7-Zip box around Roland's driver setup.
+        Name       = 'Roland Rubix Driver'
+        Url        = 'https://static.roland.com/assets/media/exe/rubix_wind_v107.exe'
+        SilentArgs = '/S'
+        DetectName = 'Roland*Rubix*'
+        Signer     = 'Roland'
+        Require    = { (Test-UsbVendor '0582&PID_01DF') -or (Test-UsbVendor '0582&PID_01E0') -or (Test-UsbVendor '0582&PID_01E1') }
+        RequireMsg = 'no Roland Rubix plugged in'
     }
     @{  # U.GG (superuser, 2026-09-30) - League of Legends builds and runes. Its own installer (electron-builder NSIS, not
         # Overwolf any more), always the latest; installs for the signed-in user (%LOCALAPPDATA%\Programs\U.GG). The
@@ -2761,6 +2777,61 @@ function Install-ArmouryCrate {
                                                                             # it - the next run's temporary-files cleanup takes it)
 }
 
+function Test-AsusDriverHubHardware {
+    # What ASUS DriverHub is for: an ASUS motherboard in a PC. Its installer checks the same (ASUS's SMBIOS, product line
+    # "Motherboard") and refuses laptops, other makers and virtual machines; some older ASUS boards it does not support.
+    return ($script:MachineType -eq 'PC' -and (Get-Board) -match '(?i)^ASUSTeK' -and -not (Test-VirtualMachine))
+}
+
+function Test-AsusDriverHubInstalled {
+    # its uninstall entry (machine-wide, the GUID its installer writes)
+    return [bool](Get-Item -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{A8761B4B-A179-4469-99B7-FDFA94E551F9}' -ErrorAction SilentlyContinue)
+}
+
+function Install-AsusDriverHub {
+    # ASUS DriverHub (superuser, 2026-10-02): the version ASUS's feed names, from THAT version's folder - the plain
+    # .../download/ASUS-DriverHub-Installer.exe is still 1.0.4.8 (2024), the one with the remote-code holes
+    # (CVE-2025-3462 / 3463, fixed in 1.0.6.0). Signed by ASUS or never run; --silent = no licence window. Already there:
+    # it updates itself. The drivers come from its page, at the end of the run (Open-DriverHubPage) - ASUS has no way to
+    # install them without that one click.
+    $name = 'ASUS DriverHub'
+    if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $name (ASUS's installer, --silent) and open its page at the end"; return 'DRYRUN' }
+    if (Test-AsusDriverHubInstalled) {
+        Write-Log OK "Already installed - $name (it updates itself)"; $script:ItemNote = 'already installed'; $script:DriverHubReady = $true; return 'OK'
+    }
+    Write-Log INFO "Installing $name"
+    $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+    $exe = Join-Path $env:TEMP ('ASUS-DriverHub-Installer_{0}.exe' -f (Get-Date -Format 'yyyyMMddHHmmss'))
+    try {
+        $feed = Invoke-RestMethod 'https://driverhub.asus.com/download/ASUS-DriverHub-Installer.json' -UseBasicParsing -UserAgent $ua -ErrorAction Stop
+        $ver = [string]$feed.latestVersion
+        if ($ver -notmatch '^\d+(\.\d+){1,3}$') { throw "ASUS's feed names no version ('$ver')" }
+        $url = "https://driverhub.asus.com/download/$ver/ASUS-DriverHub-Installer.exe"
+        Write-Log DEBUG "downloading $name $ver from $url"
+        $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing -UserAgent $ua -ErrorAction Stop
+        $ProgressPreference = $pp
+        $sig = Get-AuthenticodeSignature -FilePath $exe -ErrorAction SilentlyContinue
+        if (-not $sig -or "$($sig.Status)" -ne 'Valid' -or "$($sig.SignerCertificate.Subject)" -notmatch '(?i)ASUSTeK') { throw "the installer is not signed by ASUS ($(if ($sig) { $sig.Status }))" }
+        $p = Start-Process -FilePath $exe -ArgumentList '--silent' -WindowStyle Hidden -PassThru
+        $null = $p.Handle
+        if (-not $p.WaitForExit(300000)) { Stop-ProcessTree -Id $p.Id; throw 'its installer did not finish in 5 minutes - stopped' }
+        if (Test-AsusDriverHubInstalled) { Write-Log OK 'Done!'; $script:DriverHubReady = $true; return 'OK' }
+        Write-Log WARN ("Failed - {0}: not installed (the installer's exit code {1}) - DriverHub does not support every ASUS board" -f $name, $p.ExitCode)
+        $script:ItemFail = 'not installed - DriverHub may not support this board'; return 'FAILED'
+    } catch {
+        Write-Log WARN "Failed - $name ($($_.Exception.Message))"; $script:ItemFail = $_.Exception.Message; return 'FAILED'
+    } finally { Remove-Item $exe -Force -ErrorAction SilentlyContinue }
+}
+
+function Open-DriverHubPage {
+    # ASUS DriverHub puts the drivers in only from its page (driverhub.asus.com talks to the DriverHub service on this PC):
+    # one click on "Install all". At the end of the run, when DriverHub is on this PC - the summary says so too.
+    if (-not $script:DriverHubReady -or $script:DryRun) { return }
+    try { Start-Process 'https://driverhub.asus.com' -ErrorAction Stop; Write-Log INFO 'ASUS DriverHub''s page opened - "Install all" there puts in this board''s drivers' }
+    catch { Write-Log INFO "ASUS DriverHub's page could not be opened ($($_.Exception.Message)) - Start > ASUS DriverHub" }
+}
+
 function Install-Alienware {
     # Alienware Command Center - only called on Alienware / Dell G hardware (the vendor gate in
     # Invoke-InstallPhase checks Win32_ComputerSystem, so other boxes show SKIPPED, not a scary "Failed").
@@ -3034,6 +3105,7 @@ function Invoke-InstallPhase {
         Start-LiveItem -Name $a.Name -What 'installing'
         if ($a.Id -eq '9PMHP03NJ9QP') { $st = Install-Alienware }   # Store first, then Dell's direct installer
         elseif ($a.Id -eq 'ArmouryCrate') { $st = Install-ArmouryCrate }   # ASUS's installer, finishes after a restart
+        elseif ($a.Id -eq 'ASUS.DriverHub') { $st = Install-AsusDriverHub }   # its page opens at the end (Open-DriverHubPage)
         else { $st = Install-App -Id $a.Id -Name $a.Name -Source $a.Source }
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=$st; Detail=$(if ($st -eq 'FAILED' -and $script:ItemFail) { $script:ItemFail } else { $hw }) })
         Write-AppLine -Name $a.Name -Status $st -From $from
@@ -3214,6 +3286,7 @@ function Write-Summary {
         elseif ($script:DryRun) { 'Dry run - nothing was changed.' }
         elseif ($restart) { 'Restart the PC to finish. Windows completes some changes only at a restart.' }
         else { 'Restart or sign out to apply everything.' }
+        if ($script:DriverHubReady -and $script:RunFinished -and -not $script:DryRun) { 'ASUS DriverHub is open in the browser: "Install all" puts in this board''s drivers (later: Start > ASUS DriverHub).' }
     )
     $script:SummaryLine = "$head   " + (Get-Visible ($parts -join " $($gl.Dot) "))
     Send-GuiEvent 'summary' @{ Head = $head; Ok = [int]$count['OK']; Skipped = [int]$count['SKIPPED']; Warn = [int]$count['WARN']
@@ -4545,6 +4618,7 @@ try {
     Enable-DotNetFeatures     # finish .NET 3.5 (usually already done) + .NET 4
     Invoke-Tweaks -Late       # last: what must wait for the installers (taskbar pins: Chrome; VBScript) and for .NET 3.5 (old components) - DISM is free again here
     $script:RunFinished = $true
+    Open-DriverHubPage        # an ASUS board: DriverHub's page - "Install all" there puts in the board's drivers
     $script:MainEnded = $true
 }
 catch [System.OperationCanceledException] {

@@ -61,6 +61,11 @@ Every detail goes to a log file for later.
   turns it off. A PC that ran an earlier version has it off: turn it on in Windows Security > Device
   security > Core isolation (Windows checks the drivers first), then restart. Fixed: **the taskbar pins
   disappeared after the first restart** — they now go through Windows' own taskbar layout (see below).
+  New: **ASUS DriverHub**
+  on an ASUS motherboard (ASUS's own driver tool — Armoury Crate no longer offers drivers): at the end
+  of the run its page opens, and **Install all** there puts in the board's drivers (ASUS has no way to
+  do that without the click). **Roland's driver** when a Rubix 22 / 24 / 44 audio interface is plugged
+  in.
 
   New in v1.8.0: **one app list, everything picked** — take off what you don't want (a row at a time,
   or all); **PC or laptop is detected**, not asked; the apps for **this PC's hardware** are found, not
@@ -104,7 +109,9 @@ Every detail goes to a log file for later.
   it isn't run; a laptop keeps its maker's drivers; nothing of this in a virtual machine) +
   **Alienware Command Center** on Alienware / Dell G-series hardware and **Armoury Crate** on an ASUS
   ROG / TUF / PRIME / ProArt board or a ROG / TUF laptop (ASUS's installer downloads it in the
-  background; it finishes after a restart), desktop or laptop. It also applies the
+  background; it finishes after a restart), desktop or laptop; **ASUS DriverHub** on any ASUS
+  motherboard in a PC (the version ASUS's own feed names, signed by ASUS — its page opens at the end:
+  **Install all**); **Roland's Rubix driver** when a Rubix 22 / 24 / 44 is plugged in (USB). It also applies the
   **WinRAR license** and enables **.NET 3.5**
   (incl. 2.0/3.0) **and .NET 4** via DISM (like "Turn Windows features on/off").
 - At the end, the **taskbar**: File Explorer, **This PC** and **Google Chrome** pinned; the pins Windows

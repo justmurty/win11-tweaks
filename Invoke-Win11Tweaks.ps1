@@ -8,7 +8,7 @@
     Everything goes to a log file for later.
 
 .DESCRIPTION
-    The 55 tweaks (25 standard + 30 custom) and the install list are a fixed, curated set
+    The 54 tweaks (25 standard + 29 custom) and the install list are a fixed, curated set
     (see docs/2026-07-11-win11-tweaks-design.md). Only the ON toggles / checked items are
     applied; nothing else is touched.
     The script makes NO restore point and does NOT reboot unless -Reboot is given.
@@ -1623,18 +1623,7 @@ $script:Tweaks = @(
       Invoke-Step -Id 'CustomLaptopPower' -Description "power plan: Windows' own - an earlier version's laptop plan removed" -Action { Reset-LaptopPowerPlan -Id 'CustomLaptopPower' }
   }}
 
-  # Memory Integrity (HVCI) / VBS - disable it for gaming. Win11's Core Isolation "Memory Integrity"
-  # runs kernel code-integrity checks inside a hypervisor (VBS); every 2026 gaming guide calls turning it
-  # off the single biggest FREE performance win (avg +5-10% FPS in CPU-bound games, 1% lows +15-25%). This
-  # registry method == the Core Isolation toggle; it takes effect after a REBOOT. Reversible: set both back
-  # to 1 (or flip Memory Integrity back On in Windows Security). We deliberately do NOT run
-  # 'bcdedit /set hypervisorlaunchtype off' - that fully kills the hypervisor and would break WSL2 /
-  # Hyper-V / Windows Sandbox; disabling HVCI alone gives the gaming win and keeps those working.
-  [pscustomobject]@{ Id='CustomDisableVBS'; Content='Memory Integrity (VBS/HVCI) - disable for gaming'; Category='Custom'; Apply={
-      $id='CustomDisableVBS'
-      Set-Reg -Id $id -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard' -Name 'EnableVirtualizationBasedSecurity' -Type DWord -Value '0'
-      Set-Reg -Id $id -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' -Name 'Enabled' -Type DWord -Value '0'
-  }}
+  # (Core Isolation / Memory Integrity - no longer turned off: superuser 2026-10-02, it stays as Windows has it, on)
 
   # Mouse - disable "Enhance pointer precision" (mouse acceleration); preferred for gaming/consistency
   [pscustomobject]@{ Id='CustomMouseAccel'; Content='Mouse - disable Enhance Pointer Precision'; Category='Custom'; Apply={
@@ -1984,8 +1973,8 @@ $script:TweakGroups = @(
     [pscustomobject]@{ Name = 'Explorer'; Text = 'opens This PC, file extensions, classic menu'
         Ids = @('CustomExplorerThisPC', 'WPFTweaksDisableExplorerAutoDiscovery', 'WPFToggleShowExt', 'WPFTweaksRightClickMenu', 'CustomShortcutArrow', 'CustomRemoveEdgeShortcut') }
     [pscustomobject]@{ Name = 'Edge'; Text = 'no startup boost, promos or sidebar'; Ids = @('WPFTweaksEdgeDebloat') }
-    [pscustomobject]@{ Name = 'Performance'; Text = @{ PC = 'Ultimate Performance, Memory Integrity off, no hibernation'; Laptop = 'Memory Integrity off, Windows'' own power plan' }
-        Ids = @('CustomUltimatePerf', 'CustomLaptopPower', 'CustomDisableVBS', 'WPFToggleGameMode', 'CustomHibernateOff', 'WPFToggleStandbyFix', 'CustomStandbyNoNetBattery') }
+    [pscustomobject]@{ Name = 'Performance'; Text = @{ PC = 'Ultimate Performance, no hibernation'; Laptop = 'Windows'' own power plan' }
+        Ids = @('CustomUltimatePerf', 'CustomLaptopPower', 'WPFToggleGameMode', 'CustomHibernateOff', 'WPFToggleStandbyFix', 'CustomStandbyNoNetBattery') }
     [pscustomobject]@{ Name = 'Input & look'; Text = 'dark theme, Num Lock, Win+V history, no mouse acceleration'
         Ids = @('WPFToggleDarkMode', 'WPFToggleLoginBlur', 'WPFToggleNumLock', 'CustomMouseAccel', 'CustomStickyKeysOff', 'CustomClipboardHistory') }
     [pscustomobject]@{ Name = 'Sound'; Text = 'no volume drop during calls'; Ids = @('CustomNoCallDucking') }

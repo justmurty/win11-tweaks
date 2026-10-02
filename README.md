@@ -8,12 +8,12 @@ Every detail goes to a log file for later.
 
 ## What it does
 
-- **55 tweaks** — 25 standard (Essential + Advanced + Customize Preferences toggles) + 30
+- **54 tweaks** — 25 standard (Essential + Advanced + Customize Preferences toggles) + 29
   custom (shortcut-arrow off, Spotlight off + the **Windows (dark)** theme with its dark wallpaper,
   **Ultimate Performance** on a PC — a laptop keeps **Windows' own power plan** (the "Ultimate on the
   charger, Balanced on battery" plan of v1.6 / v1.7 is removed); a Ryzen X3D
   with two CCDs (7950X3D, 9950X3D...) keeps **Balanced**: AMD's V-Cache driver needs its core parking,
-  **Memory Integrity / VBS off** for gaming, mouse acceleration off, DNS → Cloudflare,
+  mouse acceleration off, DNS → Cloudflare,
   Explorer → This PC, taskbar cleanup (Search / Task view / Widgets / Chat / Resume off),
   **web/Bing, Store, highlights and cloud results in Start search off**, remove the Edge desktop
   shortcut, and since v1.6.0:
@@ -56,6 +56,10 @@ Every detail goes to a log file for later.
     adapter can fail at a rate Windows lists and leave the screen black), at the very end: without the real
     GPU driver Windows only offers 60 Hz, and that driver often arrives during the run (if a screen stayed at
     60 Hz, run the script again once the driver is in).
+
+  Changed in the next release: **Core Isolation (Memory Integrity) stays on** — the script no longer
+  turns it off. A PC that ran an earlier version has it off: turn it on in Windows Security > Device
+  security > Core isolation (Windows checks the drivers first), then restart.
 
   New in v1.8.0: **one app list, everything picked** — take off what you don't want (a row at a time,
   or all); **PC or laptop is detected**, not asked; the apps for **this PC's hardware** are found, not

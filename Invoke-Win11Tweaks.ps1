@@ -114,6 +114,7 @@ $script:Relaunched           = [bool]$Relaunched   # this console was opened by 
 $script:ConsoleHidden        = $false  # the console is hidden behind the window (Set-ConsoleWindow)
 $script:MainEnded            = $false  # Main got to its end - or was stopped / cancelled; not an error
 $script:ExitWhenDone         = $false  # the run's own console closes at the very end (Exit-Console)
+$script:KeepAwake            = $false  # no sleep, the screen on - from Start until the run is over and its window closed (Set-KeepAwake)
 # Console glyphs - made at run time, so this file stays pure ASCII. Only characters Cascadia Mono AND Consolas have: the
 # old console (conhost) has no fallback font, so anything else (rounded corners, check marks, braille spinners) shows as a box.
 $script:G = @{
@@ -308,8 +309,9 @@ function Write-Ui {
 }
 
 function Resume-Console {
-    # The window went before the end (it failed): the console takes over - shown again, with the rail so far, once.
-    # From Write-Ui AND Show-Live: a long step (the .NET 3.5 wait) only redraws its live line.
+    # The window went by itself (it failed): the console takes over - shown again, with the rail so far, once. From
+    # Write-Ui AND Show-Live (a long step - the .NET 3.5 wait - only redraws its live line), and from Wait-GuiClose when
+    # it went after the run (the rail then ends with the summary).
     if (-not ($script:Gui -and $script:Gui.Shared.Closed -and -not $script:Gui.Replayed)) { return }
     $script:Gui.Replayed = $true
     Set-ConsoleWindow -Show
@@ -3358,6 +3360,41 @@ public static extern bool SetConsoleMode(System.IntPtr hConsoleHandle, uint dwMo
     } catch { Write-Log DEBUG "console mode left as is: $($_.Exception.Message)" }
 }
 
+function Set-ExecutionState {
+    # SetThreadExecutionState: what this thread asks of Windows' power management. Returns the state before (0: refused).
+    param([uint32]$Flags)
+    if (-not ([System.Management.Automation.PSTypeName]'Native.Power').Type) {
+        Add-Type -Namespace Native -Name Power -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll")]
+public static extern uint SetThreadExecutionState(uint esFlags);
+'@ -ErrorAction Stop
+    }
+    return [Native.Power]::SetThreadExecutionState($Flags)
+}
+
+function Set-KeepAwake {
+    # From Start until the run is over and its window closed, Windows neither sleeps nor turns the screen off - what
+    # installers and video players do. A laptop on battery could go to sleep mid-install, and the screen going off and
+    # on again took the window with it (VM 102, 2026-10-02: off 15 min after Done, back on 4 min later -> "Desktop
+    # composition is disabled" -> the window could not draw and went). -Off: Windows' own timers again (the request
+    # also ends with the run's process).
+    # Sleep from the Start menu, the power button or the lid still works.
+    param([switch]$Off)
+    try {
+        if ($Off) {
+            if (-not $script:KeepAwake) { return }
+            $script:KeepAwake = $false
+            $null = Set-ExecutionState ([uint32]2147483648)   # ES_CONTINUOUS alone: nothing kept any more
+            Write-Log DEBUG "keep awake: off - sleep and the screen go by Windows' own timers again"
+            return
+        }
+        # ES_CONTINUOUS (0x80000000) | ES_DISPLAY_REQUIRED (2) | ES_SYSTEM_REQUIRED (1)
+        if ((Set-ExecutionState ([uint32]2147483651)) -eq 0) { Write-Log DEBUG 'keep awake: Windows refused it'; return }
+        $script:KeepAwake = $true
+        Write-Log DEBUG 'keep awake: on - no sleep and the screen stays on until the run is over (and its window closed)'
+    } catch { Write-Log DEBUG "keep awake: $($_.Exception.Message)" }
+}
+
 function Test-Interactive {
     # Is someone at a console to answer questions? (Not over SSH / a service - there it's $false.) Wrapped so the
     # tests can say yes on a non-interactive runner.
@@ -3829,6 +3866,12 @@ function Wait-GuiClose {
     if (-not $script:Gui) { return }
     $sh = $script:Gui.Shared
     while (-not $sh.Closed -and -not $sh.Action -and -not $script:Gui.Handle.IsCompleted) { Start-Sleep -Milliseconds 200 }
+    if (($sh.Broke -or $sh.Error) -and -not $script:Gui.Replayed) {
+        # it went by itself after the run (it could not draw - after the screen went off and on, VM 102 2026-10-02): its
+        # Done screen and "Restart now" went with it - the console shows the run, its summary and what to do next instead
+        Write-Log WARN ('the window went by itself ({0}) - the console shows the run and its summary' -f $(if ($sh.Broke) { $sh.Broke } else { $sh.Error }))
+        Resume-Console
+    }
     $action = $sh.Action; $replayed = [bool]$script:Gui.Replayed
     Close-Gui
     if ($Quiet -and -not $replayed -and -not $sh.Error -and -not $sh.ErrorCount) { $script:ExitWhenDone = $true }
@@ -4451,6 +4494,10 @@ function Add-GuiError([string]$Text) {
     $sh = $script:GuiShared; $sh.ErrorCount = 1 + [int]$sh.ErrorCount; $sh.LastError = $Text
 }
 function Close-GuiWindowNow { $script:GuiAllowClose = $true; $script:GuiWin.Close() }
+function Close-GuiBroken([string]$Why) {
+    # it cannot draw any more: it goes, and the run is told (Broke) - the console then shows the run and its summary
+    Add-GuiError $Why; $script:GuiShared.Broke = $Why; Close-GuiWindowNow
+}
 function Set-GuiFallbackFont { $script:GuiWin.FontFamily = New-Object Windows.Media.FontFamily('Consolas') }
 function Register-GuiRenderFailure {
     # A window that cannot draw fails on every frame (a font file gone from under it, 2026-09-29). 10 failures within
@@ -4465,8 +4512,7 @@ function Register-GuiRenderFailure {
         Add-GuiError 'the window could not draw - its text font is Consolas now'
         try { Set-GuiFallbackFont; Invoke-GuiRender } catch { }
     } else {
-        Add-GuiError 'the window still could not draw - it closed, the console shows the run'
-        Close-GuiWindowNow
+        Close-GuiBroken 'the window still could not draw - it closed, the console shows the run'
     }
 }
 function Add-GuiClick([string]$Tag) {
@@ -4609,7 +4655,7 @@ function Show-GuiWindow {
                 $script:GuiFails = 0
             } catch {
                 Add-GuiError $_.Exception.Message
-                if (++$script:GuiFails -ge 5) { Add-GuiError "closed after 5 failures in a row: $($_.Exception.Message)"; Close-GuiWindowNow }
+                if (++$script:GuiFails -ge 5) { Close-GuiBroken "closed after 5 failures in a row: $($_.Exception.Message)" }
             }
         })
         Invoke-GuiRender
@@ -4630,6 +4676,7 @@ try {
     Show-Intro
     if ($script:Cancelled) { $script:MainEnded = $true; return }   # user answered "n" to Continue
     $script:RunStarted = $true          # from here on the summary is written - also if the run is stopped (see finally)
+    Set-KeepAwake                       # no sleep, the screen on - until the run is over and its window closed (finally)
     $script:RunClock = [System.Diagnostics.Stopwatch]::StartNew()
     Write-Banner
     if ($script:DryRun) { Write-Log WARN "DRY RUN - no changes will be made." }
@@ -4676,6 +4723,7 @@ finally {
             else { Set-ConsoleWindow -Show; if ($script:Cancelled) { Write-Markup "  {r:Cancelled - nothing was changed.}" } }
         }
     }
+    Set-KeepAwake -Off                  # (after the window: its Done screen kept the screen on too)
     if (-not $script:ExitWhenDone) { Set-ConsoleWindow -Show }   # whatever happened: never leave the console hidden
     # HERE, not after the finally: Cancel leaves Main with `return`, and that skips everything after it (no -Reboot
     # with the window, so nothing is lost)

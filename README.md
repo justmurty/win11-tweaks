@@ -65,7 +65,8 @@ Every detail goes to a log file for later.
   on an ASUS motherboard (ASUS's own driver tool — Armoury Crate no longer offers drivers): at the end
   of the run its page opens, and **Install all** there puts in the board's drivers (ASUS has no way to
   do that without the click). **Roland's driver** when a Rubix 22 / 24 / 44 audio interface is plugged
-  in.
+  in. While it runs, and until its window is closed, **the PC doesn't sleep and the screen stays on**;
+  a window that can no longer draw leaves the whole run and its summary in the console.
 
   New in v1.8.0: **one app list, everything picked** — take off what you don't want (a row at a time,
   or all); **PC or laptop is detected**, not asked; the apps for **this PC's hardware** are found, not
@@ -194,7 +195,11 @@ The run itself is the same as in the console — the window only shows it (it ha
 so it never waits on an installer). Once the window is up, the PowerShell window hides behind it:
 the one the one-liner opens for the run closes with the window at the end; your own PowerShell
 window (or the `.bat`'s) comes back with the summary line and the log path. If the window goes
-early or has an error, the console comes back and shows the run. Without a desktop (SSH, a
+early or has an error, the console comes back and shows the run — and if it can no longer draw
+after the run, the console shows the whole run with its summary and what to do next (**Restart
+the PC to finish**). From **Start** until the window is closed, Windows doesn't go to sleep or
+turn the screen off (a laptop could sleep mid-install, and the screen going off and on again once
+took the window with it); closing the window gives Windows its own timers back. Without a desktop (SSH, a
 service), with `-Console`, `-Detailed` or `-Reboot`, or if the window cannot open, the console
 shows the run (below).
 

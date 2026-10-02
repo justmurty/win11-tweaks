@@ -8,7 +8,7 @@ Every detail goes to a log file for later.
 
 ## What it does
 
-- **54 tweaks** — 25 standard (Essential + Advanced + Customize Preferences toggles) + 29
+- **55 tweaks** — 25 standard (Essential + Advanced + Customize Preferences toggles) + 30
   custom (shortcut-arrow off, Spotlight off + the **Windows (dark)** theme with its dark wallpaper,
   **Ultimate Performance** on a PC — a laptop keeps **Windows' own power plan** (the "Ultimate on the
   charger, Balanced on battery" plan of v1.6 / v1.7 is removed); a Ryzen X3D
@@ -297,8 +297,8 @@ hardware only goes in `$script:HardwareApps` (with its check).
   On a normal connection this is seconds; on a WU-throttled box it can take ~30 min. Ctrl+C stops
   the script there (the summary is still written — see [The log](#the-log)), and .NET 3.5 keeps
   installing in the background (`/NoRestart`, so no surprise reboot — just don't reboot until
-  it's done). The last steps (old components, refresh rate, VBScript) come after that wait, so
-  after a Ctrl+C there run the script again once .NET 3.5 is done. When Windows is already
+  it's done). The last steps (taskbar pins, old components, refresh rate, VBScript) come after that
+  wait, so after a Ctrl+C there run the script again once .NET 3.5 is done. When Windows is already
   waiting for a restart (a Windows update, or the components an earlier run removed), it installs
   .NET 3.5 but finishes it only at that restart: the run then says
   `Done! (finishes at the next restart)` and ends with "Restart the PC to finish".

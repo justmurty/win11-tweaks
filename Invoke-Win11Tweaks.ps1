@@ -8,7 +8,7 @@
     Everything goes to a log file for later.
 
 .DESCRIPTION
-    The 54 tweaks (25 standard + 29 custom) and the install list are a fixed, curated set
+    The 55 tweaks (25 standard + 30 custom) and the install list are a fixed, curated set
     (see docs/2026-07-11-win11-tweaks-design.md). Only the ON toggles / checked items are
     applied; nothing else is touched.
     The script makes NO restore point and does NOT reboot unless -Reboot is given.
@@ -100,6 +100,7 @@ $script:DotNet35Clock        = $null   # started with the .NET 3.5 download
 $script:AppsLabel            = ''      # "all 27 apps" / "24 of 27 apps" - on the machine line (Set-AppsLabel)
 $script:OpenActivation       = $false  # Windows is not activated and the window's box was left on: Settings > Activation opens
 $script:DriverHubReady       = $false  # ASUS DriverHub is on this PC (installed now or before) - its page opens at the end of the run
+$script:DriverHubOpened      = $false  # ... and the page did open (the summary says "open in the browser" only then)
 $script:ProductKey           = 'YRDNX-JXTHQ-Q4H33-HMDMP-7CFDB'      # 'XXXXX-XXXXX-XXXXX-XXXXX-XXXXX'
 $script:LastPrompt           = ''      # the question on the console right now, as plain text
 # The window (variant A of the design page, superuser's pick 2026-09-28) - see Start-Gui. The run only FEEDS it.
@@ -641,13 +642,25 @@ function Get-TaskbarLayoutPolicy {
     Get-ItemProperty -LiteralPath 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' -ErrorAction SilentlyContinue
 }
 
+function Test-PinGenerationSupported {
+    # PinGeneration (a pin the user takes off stays off) came with 24H2 KB5060829 (26100.4484) and 22H2 / 23H2 KB5060826
+    # (2262x.5549); 25H2 has it. Microsoft: a Windows without it does not apply a layout that has it.
+    $cv = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+    $build = [int]$cv.CurrentBuild; $ubr = [int]$cv.UBR
+    if ($build -gt 26100) { return $true }
+    if ($build -eq 26100) { return ($ubr -ge 4484) }
+    if ($build -in 22621, 22631) { return ($ubr -ge 5549) }
+    return $false
+}
+
 function Get-TaskbarLayoutXml {
     # Windows' own taskbar layout (Microsoft Learn: "Configure the Windows taskbar pinned apps with policy settings").
-    # Replace: the pins Windows comes with go - File Explorer stays because it is in the list. PinGeneration="1" (24H2 /
-    # 25H2): a pin the user takes off stays off (without it Windows would pin it again).
-    param([string[]]$LinkPaths)
-    $pins = @('        <taskbar:DesktopApp DesktopApplicationID="Microsoft.Windows.Explorer" PinGeneration="1"/>')
-    foreach ($l in $LinkPaths) { $pins += ('        <taskbar:DesktopApp DesktopApplicationLinkPath="{0}" PinGeneration="1"/>' -f [Security.SecurityElement]::Escape($l)) }
+    # Replace: the pins Windows comes with go - File Explorer stays because it is in the list. -PinGeneration (24H2 /
+    # 25H2): a pin the user takes off stays off (without it Windows could pin it again when the layout changes).
+    param([string[]]$LinkPaths, [switch]$PinGeneration)
+    $gen = if ($PinGeneration) { ' PinGeneration="1"' } else { '' }
+    $pins = @(('        <taskbar:DesktopApp DesktopApplicationID="Microsoft.Windows.Explorer"{0}/>' -f $gen))
+    foreach ($l in $LinkPaths) { $pins += ('        <taskbar:DesktopApp DesktopApplicationLinkPath="{0}"{1}/>' -f [Security.SecurityElement]::Escape($l), $gen) }
     return ((@('<?xml version="1.0" encoding="utf-8"?>',
         '<LayoutModificationTemplate xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification" xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout" xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout" xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout" Version="1">',
         '  <CustomTaskbarLayoutCollection PinListPlacement="Replace">', '    <defaultlayout:TaskbarLayout>', '      <taskbar:TaskbarPinList>') +
@@ -672,7 +685,7 @@ function Set-TaskbarLayout {
     $links = @($pc); $names = @('File Explorer', 'This PC')
     $chrome = if ($env:ProgramData) { Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Google Chrome.lnk' } else { '' }
     if ($chrome -and (Test-Path -LiteralPath $chrome)) { $links += $chrome; $names += 'Google Chrome' }
-    $xml = Get-TaskbarLayoutXml -LinkPaths $links
+    $xml = Get-TaskbarLayoutXml -LinkPaths $links -PinGeneration:(Test-PinGenerationSupported)
     $file = Join-Path $dir 'TaskbarLayout.xml'
     $changed = $false
     $old = if (Test-Path -LiteralPath $file) { [IO.File]::ReadAllText($file) } else { '' }
@@ -1297,8 +1310,8 @@ function Enable-Feature {
 }
 
 # --------------------------------------------------------------------------------------
-#  The tweaks - 53 total: 25 standard Win11 tweaks (values verbatim, except where a comment
-#  says why) + 28 custom at the end. Toggles apply their ON value only. No restore point
+#  The tweaks - 55 total: 25 standard Win11 tweaks (values verbatim, except where a comment
+#  says why) + 30 custom at the end. Toggles apply their ON value only. No restore point
 #  (removed per user request). A tweak with Late=$true runs after the installs (Main).
 # --------------------------------------------------------------------------------------
 $script:Tweaks = @(
@@ -2784,8 +2797,12 @@ function Test-AsusDriverHubHardware {
 }
 
 function Test-AsusDriverHubInstalled {
-    # its uninstall entry (machine-wide, the GUID its installer writes)
-    return [bool](Get-Item -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{A8761B4B-A179-4469-99B7-FDFA94E551F9}' -ErrorAction SilentlyContinue)
+    # its uninstall entry - the GUID its installer writes (in either registry view) - or its name (a DriverHub the board's
+    # BIOS put in may have come another way)
+    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall') {
+        if (Test-Path -LiteralPath "$k\{A8761B4B-A179-4469-99B7-FDFA94E551F9}") { return $true }
+    }
+    return [bool](Test-AppInstalled -NamePattern 'ASUS DriverHub*')
 }
 
 function Install-AsusDriverHub {
@@ -2800,6 +2817,7 @@ function Install-AsusDriverHub {
         Write-Log OK "Already installed - $name (it updates itself)"; $script:ItemNote = 'already installed'; $script:DriverHubReady = $true; return 'OK'
     }
     Write-Log INFO "Installing $name"
+    Set-LiveWhat "from ASUS's site" -NoClock   # download + a 5-minute wait: nothing ticks the clock
     $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
     $exe = Join-Path $env:TEMP ('ASUS-DriverHub-Installer_{0}.exe' -f (Get-Date -Format 'yyyyMMddHHmmss'))
     try {
@@ -2826,9 +2844,12 @@ function Install-AsusDriverHub {
 
 function Open-DriverHubPage {
     # ASUS DriverHub puts the drivers in only from its page (driverhub.asus.com talks to the DriverHub service on this PC):
-    # one click on "Install all". At the end of the run, when DriverHub is on this PC - the summary says so too.
+    # one click on "Install all". At the end of the run, when DriverHub is on this PC - the summary says so too (and where
+    # to find it when the page did not open). Not with -Reboot: the PC restarts 15 s later.
+    $script:DriverHubOpened = $false
     if (-not $script:DriverHubReady -or $script:DryRun) { return }
-    try { Start-Process 'https://driverhub.asus.com' -ErrorAction Stop; Write-Log INFO 'ASUS DriverHub''s page opened - "Install all" there puts in this board''s drivers' }
+    if ($Reboot) { Write-Log INFO 'ASUS DriverHub''s page not opened - the PC restarts (-Reboot); after it: Start > ASUS DriverHub'; return }
+    try { Start-Process 'https://driverhub.asus.com' -ErrorAction Stop; $script:DriverHubOpened = $true; Write-Log INFO 'ASUS DriverHub''s page opened - "Install all" there puts in this board''s drivers' }
     catch { Write-Log INFO "ASUS DriverHub's page could not be opened ($($_.Exception.Message)) - Start > ASUS DriverHub" }
 }
 
@@ -2966,7 +2987,7 @@ function Format-ItemLine {
 }
 
 function Write-AppLine {
-    # An app's line once it - and its desktop icon / license / taskbar pin, the records from index $From on - is done
+    # An app's line once it - and its desktop icon / license, the records from index $From on - is done
     param([string]$Name, [string]$Status, [int]$From)
     $secs = Stop-LiveItem
     $extras = [System.Collections.Generic.List[string]]::new(); $warn = $script:ItemNote -like 'update failed*'   # still installed - yellow
@@ -3077,7 +3098,7 @@ function Invoke-InstallPhase {
             Write-Log INFO ("Skipping {0} ({1})" -f $d.Name, $(if ($d.RequireMsg) { $d.RequireMsg } else { 'not for this PC' }))
             continue
         }
-        if (Skip-NotSelected -Key $d.Name -Content $d.Name -Label $d.Name) { continue }   # no icon / Chrome pin either
+        if (Skip-NotSelected -Key $d.Name -Content $d.Name -Label $d.Name) { continue }   # no icon either
         $from = $script:Results.Count + 1
         $script:ItemNote = ''; $script:ItemFail = ''
         Start-LiveItem -Name $d.Name -What 'downloading' -NoClock   # Invoke-WebRequest blocks - no clock to tick
@@ -3286,7 +3307,9 @@ function Write-Summary {
         elseif ($script:DryRun) { 'Dry run - nothing was changed.' }
         elseif ($restart) { 'Restart the PC to finish. Windows completes some changes only at a restart.' }
         else { 'Restart or sign out to apply everything.' }
-        if ($script:DriverHubReady -and $script:RunFinished -and -not $script:DryRun) { 'ASUS DriverHub is open in the browser: "Install all" puts in this board''s drivers (later: Start > ASUS DriverHub).' }
+        if ($script:DriverHubReady -and $script:RunFinished -and -not $script:DryRun) {
+            if ($script:DriverHubOpened) { 'ASUS DriverHub is open in the browser: "Install all" puts in this board''s drivers (later: Start > ASUS DriverHub).' }
+            else { 'ASUS DriverHub: Start > ASUS DriverHub, then "Install all" for this board''s drivers.' } }
     )
     $script:SummaryLine = "$head   " + (Get-Visible ($parts -join " $($gl.Dot) "))
     Send-GuiEvent 'summary' @{ Head = $head; Ok = [int]$count['OK']; Skipped = [int]$count['SKIPPED']; Warn = [int]$count['WARN']
@@ -4631,7 +4654,7 @@ finally {
     if ($script:RunStarted) {
         if (-not $script:RunFinished) {
             if ($script:LiveOpen) { Clear-Live } elseif ($script:Detailed) { Write-Host '' }   # Ctrl+C can land mid-line (the live step / the .NET 3.5 heartbeat)
-            # e.g. Ctrl+C in the .NET 3.5 wait: the last steps (old components, refresh rate, VBScript) come after it
+            # e.g. Ctrl+C in the .NET 3.5 wait: the last steps (taskbar pins, old components, refresh rate, VBScript) come after it
             Write-Log WARN "Stopped early - this summary only covers what ran. Run the script again to finish the rest."
         }
         Write-Summary

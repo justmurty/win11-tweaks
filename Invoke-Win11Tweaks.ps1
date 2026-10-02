@@ -72,8 +72,6 @@ $script:WarnCount            = 0       # WARN lines logged so far - a tweak that
 $script:RunStarted           = $false  # past the intro -> Main's finally writes the summary (also after Ctrl+C)
 $script:RunFinished          = $false  # got to the end without being stopped
 $script:DotNet35Proc         = $null   # background DISM process for .NET 3.5 (started early, finished at the end)
-$script:PinHelper            = $null   # Pin-Taskbar helper path (kept after Invoke-TaskbarPins for the Chrome pin)
-$script:ChromePinned         = $false  # set by Add-ChromeTaskbarPin (right after Chrome installs) - Main refreshes the taskbar if true
 $script:NotSelected          = @{}     # apps taken off the window's list (winget ID / direct-app Name / vendor Id) - the install phase skips them
 $script:PnpIds               = $null   # every device's ID (PCI\VEN_..., USB\VID_...), read once per run - Get-PnpIds
 $script:DetectedWhy          = ''      # why the machine is a PC or a laptop, in words - for the log (Get-DetectedMachineType)
@@ -627,6 +625,66 @@ function Clear-StartPins {
     }
     # killed, not closed: a clean exit could save the old layout from memory over the new file. Windows restarts it.
     if ($changed) { Get-Process StartMenuExperienceHost -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
+}
+
+function New-ThisPcShortcut {
+    # "This PC" as a shortcut the taskbar layout can pin (explorer.exe shell:MyComputerFolder, the This PC icon)
+    param([string]$Path)
+    $wsh = New-Object -ComObject WScript.Shell; $sc = $wsh.CreateShortcut($Path)
+    $sc.TargetPath = Join-Path $env:SystemRoot 'explorer.exe'; $sc.Arguments = 'shell:MyComputerFolder'
+    $sc.IconLocation = (Join-Path $env:SystemRoot 'System32\imageres.dll') + ',-109'; $sc.Description = 'This PC'; $sc.Save()
+}
+
+function Get-TaskbarLayoutPolicy {
+    # this user's Start Layout policy as it is now (StartLayoutFile / LockedStartLayout), $null if there is none
+    Get-ItemProperty -LiteralPath 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' -ErrorAction SilentlyContinue
+}
+
+function Get-TaskbarLayoutXml {
+    # Windows' own taskbar layout (Microsoft Learn: "Configure the Windows taskbar pinned apps with policy settings").
+    # Replace: the pins Windows comes with go - File Explorer stays because it is in the list. PinGeneration="1" (24H2 /
+    # 25H2): a pin the user takes off stays off (without it Windows would pin it again).
+    param([string[]]$LinkPaths)
+    $pins = @('        <taskbar:DesktopApp DesktopApplicationID="Microsoft.Windows.Explorer" PinGeneration="1"/>')
+    foreach ($l in $LinkPaths) { $pins += ('        <taskbar:DesktopApp DesktopApplicationLinkPath="{0}" PinGeneration="1"/>' -f [Security.SecurityElement]::Escape($l)) }
+    return ((@('<?xml version="1.0" encoding="utf-8"?>',
+        '<LayoutModificationTemplate xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification" xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout" xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout" xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout" Version="1">',
+        '  <CustomTaskbarLayoutCollection PinListPlacement="Replace">', '    <defaultlayout:TaskbarLayout>', '      <taskbar:TaskbarPinList>') +
+        $pins + @('      </taskbar:TaskbarPinList>', '    </defaultlayout:TaskbarLayout>', '  </CustomTaskbarLayoutCollection>', '</LayoutModificationTemplate>')) -join "`r`n")
+}
+
+function Set-TaskbarLayout {
+    # The taskbar (superuser): File Explorer, This PC and Google Chrome pinned, the pins Windows comes with gone - through
+    # Windows' own taskbar layout: this user's Start Layout policy (StartLayoutFile + LockedStartLayout = what the Group
+    # Policy "Start Layout" writes) points at our XML in %LOCALAPPDATA%\win11-tweaks; Explorer applies it when it starts.
+    # Until 1.8.0 a helper wrote the taskbar's own registry data instead, and Windows threw ALL pins away at the next
+    # restart (superuser 2026-10-02; on VM 102 into User Pinned\TaskBar\Tombstones). Verified on VM 102 (25H2): applied at
+    # the Explorer restart, kept over a forced restart, a pin the user takes off stays off, "Pin to Start" still there.
+    # An unchanged layout is left alone: a re-run keeps what the user changed since. Chrome only when it is installed (a
+    # later run that installs it changes the layout, so it comes then).
+    param([string]$Id = '')
+    if (-not $env:LOCALAPPDATA -or -not $env:SystemRoot) { throw 'LOCALAPPDATA / SystemRoot not set' }
+    $dir = Join-Path $env:LOCALAPPDATA 'win11-tweaks'
+    $null = New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop
+    $pc = Join-Path $dir 'This PC.lnk'
+    if (-not (Test-Path -LiteralPath $pc)) { New-ThisPcShortcut -Path $pc }
+    $links = @($pc); $names = @('File Explorer', 'This PC')
+    $chrome = if ($env:ProgramData) { Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Google Chrome.lnk' } else { '' }
+    if ($chrome -and (Test-Path -LiteralPath $chrome)) { $links += $chrome; $names += 'Google Chrome' }
+    $xml = Get-TaskbarLayoutXml -LinkPaths $links
+    $file = Join-Path $dir 'TaskbarLayout.xml'
+    $changed = $false
+    $old = if (Test-Path -LiteralPath $file) { [IO.File]::ReadAllText($file) } else { '' }
+    if ($old -ne $xml) { [IO.File]::WriteAllText($file, $xml, (New-Object Text.UTF8Encoding($false))); $changed = $true; Write-Log DEBUG "taskbar layout written: $file ($($names -join ', '))" $Id }
+    $pol = Get-TaskbarLayoutPolicy
+    if (-not $pol -or "$($pol.StartLayoutFile)" -ne $file -or "$($pol.LockedStartLayout)" -ne '1') {
+        Set-Reg -Id $Id -Path 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' -Name 'StartLayoutFile' -Type ExpandString -Value $file
+        Set-Reg -Id $Id -Path 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' -Name 'LockedStartLayout' -Type DWord -Value '1'
+        $changed = $true
+    }
+    Set-UiNote $Id ($names -join ', ')
+    if ($changed) { Update-Explorer -Action restart }   # Explorer reads the layout when it starts
+    else { Write-Log DEBUG 'taskbar layout unchanged - left as it is (what the user changed since stays)' $Id }
 }
 
 function Initialize-NativeW11T {
@@ -1915,6 +1973,13 @@ $script:Tweaks = @(
       foreach ($k in $keys) { Remove-RegKey -Id $id -Path "$base\$k" }
   }}
 
+  # The taskbar (superuser): File Explorer, This PC and Google Chrome pinned; the pins Windows comes with go (Edge, the
+  # Store, Microsoft 365 Copilot, Outlook). LATE: after the installs, so Chrome is there. Windows' own taskbar layout - see
+  # Set-TaskbarLayout (until 1.8.0 a helper wrote the taskbar's registry data and every pin was gone after the next restart).
+  [pscustomobject]@{ Id='CustomTaskbarPins'; Content='Taskbar - File Explorer, This PC and Chrome pinned'; Category='Custom'; Late=$true; Apply={
+      Invoke-Step -Id 'CustomTaskbarPins' -Description "taskbar layout (Windows' own): File Explorer, This PC, Google Chrome" -Action { Set-TaskbarLayout -Id 'CustomTaskbarPins' }
+  }}
+
   # Old Windows components nobody uses at home (42-47, 50) - they come back from Settings > System > Optional
   # features. (Windows Media Player Legacy can go: the new Media Player is never removed.)
   # LATE, after .NET 3.5: removing IE mode / Work Folders leaves Windows waiting for a restart, and while it waits
@@ -1968,7 +2033,7 @@ $script:TweakGroups = @(
     [pscustomobject]@{ Name = 'Windows AI'; Text = 'Copilot, Recall and Click to Do off'; Ids = @('WPFTweaksWindowsAI', 'CustomCopilotBits') }
     [pscustomobject]@{ Name = 'Start & search'; Text = 'no tips, nags, ads or web results'
         Ids = @('CustomStartCleanup', 'CustomStartPins', 'CustomNagsOff', 'CustomLockScreen', 'CustomSpotlightOff', 'WPFToggleStartMenuRecommendations', 'WPFToggleHideSettingsHome', 'CustomDisableWebSearch') }
-    [pscustomobject]@{ Name = 'Taskbar'; Text = 'This PC pinned, Edge unpinned, no Search or Widgets'; Pins = $true
+    [pscustomobject]@{ Name = 'Taskbar'; Text = 'no Search, Task view or Widgets'
         Ids = @('CustomTaskbarCleanup', 'WPFTweaksEndTaskOnTaskbar', 'WPFToggleTaskbarAlignment', 'WPFToggleBatteryPercentage') }
     [pscustomobject]@{ Name = 'Explorer'; Text = 'opens This PC, file extensions, classic menu'
         Ids = @('CustomExplorerThisPC', 'WPFTweaksDisableExplorerAutoDiscovery', 'WPFToggleShowExt', 'WPFTweaksRightClickMenu', 'CustomShortcutArrow', 'CustomRemoveEdgeShortcut') }
@@ -2415,14 +2480,12 @@ function Write-TweakGroups {
     $late = @{}; foreach ($t in $script:Tweaks) { if ($t.Late) { $late[$t.Id] = $true } }
     $done = @($script:Results | Where-Object { $_.Phase -eq 'Tweak' -and -not $late.ContainsKey($_.Id) })
     $of = { param($r) if ("$($r.Id)" -like 'Trialware.*') { 'CustomOemTrialware' } else { [string]$r.Id } }   # McAfee / Norton rows belong to that tweak
-    $pins = @($script:Results | Where-Object { $_.Phase -eq 'Taskbar' -and $_.Id -ne 'Chrome.Pin' })
     $known = @{}; foreach ($grp in $script:TweakGroups) { foreach ($id in $grp.Ids) { $known[$id] = $true } }
     $groups = [System.Collections.Generic.List[object]]::new(); foreach ($grp in $script:TweakGroups) { $groups.Add($grp) }
     $other = @($done | Where-Object { -not $known.ContainsKey((& $of $_)) } | ForEach-Object { $_.Id })
     if ($other) { $groups.Add([pscustomobject]@{ Name = 'Other'; Text = ''; Ids = $other }) }
     foreach ($grp in $groups) {
         $rs = @($done | Where-Object { $grp.Ids -contains (& $of $_) -and $_.Status -ne 'SKIPPED' })
-        if ($grp.PSObject.Properties['Pins'] -and $grp.Pins) { $rs += $pins }
         if (-not $rs) { continue }
         $secs = 0.0; foreach ($r in $rs) { if ($r.PSObject.Properties['Seconds']) { $secs += [double]$r.Seconds } }
         $bad = @($rs | Where-Object { $_.Status -in 'FAILED', 'WARN' })
@@ -2838,7 +2901,7 @@ function Write-AppLine {
     $extras = [System.Collections.Generic.List[string]]::new(); $warn = $script:ItemNote -like 'update failed*'   # still installed - yellow
     for ($i = $From; $i -lt $script:Results.Count; $i++) {
         $x = $script:Results[$i]
-        $what = switch -Wildcard ($x.Id) { 'Desktop.*' { 'desktop icon' } 'WinRAR.License' { 'license' } 'Chrome.Pin' { 'pinned to the taskbar' } default { $null } }
+        $what = switch -Wildcard ($x.Id) { 'Desktop.*' { 'desktop icon' } 'WinRAR.License' { 'license' } default { $null } }
         if (-not $what) { continue }
         if ($x.Status -eq 'OK' -and $x.Detail -ne 'exists') { $extras.Add("+ $what") }
         elseif ($x.Status -eq 'FAILED') { $extras.Add("$what failed"); $warn = $true }
@@ -2951,7 +3014,6 @@ function Invoke-InstallPhase {
         if ($st -eq 'SKIPPED') { $null = Stop-LiveItem; continue }   # e.g. Vencord with no Discord: the installer logged why - not listed
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$d.Name; Content=$d.Name; Status=$st; Detail=$(if ($st -eq 'FAILED' -and $script:ItemFail) { $script:ItemFail } elseif ($st -eq 'SKIPPED' -and $script:ItemNote) { $script:ItemNote } else { 'direct' }) })
         if ($st -eq 'OK' -and $script:DesktopShortcutApps.ContainsKey($d.Name)) { $sc = $script:DesktopShortcutApps[$d.Name]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
-        if ($d.Name -eq 'Google Chrome') { $script:ChromePinned = Add-ChromeTaskbarPin }   # pin Chrome to the taskbar RIGHT AFTER it installs
         Write-AppLine -Name $d.Name -Status $st -From $from
     }
 
@@ -3165,128 +3227,6 @@ function Write-Summary {
     Write-Ui ''
     foreach ($line in $next) { Write-Ui "     {y:$($gl.Run)} $line" }
     Write-Ui "       {d:Log}  $($script:LogFile)"
-}
-
-function Test-TaskbarPinned {
-    # A taskbar-pinned item has a matching <Name>.lnk in the User Pinned\TaskBar Quick Launch folder (Win11).
-    param([string]$Name)
-    Test-Path (Join-Path $env:APPDATA "Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\$Name.lnk")
-}
-
-function Get-PinHelper {
-    # Return a ready-to-use Pin-Taskbar helper path (in TEMP), fetching it ONCE and only when needed. Prefer
-    # OUR copy next to the script (download/.bat -> no download); else fetch OUR copy from OUR repo (one-liner).
-    # Cached in $script:PinHelper (deleted by Add-ChromeTaskbarPin, else at the end of Main). Returns $null on failure.
-    if ($script:PinHelper -and (Test-Path $script:PinHelper)) { return $script:PinHelper }
-    $helper = Join-Path $env:TEMP 'Pin-Taskbar.ps1'
-    try {
-        $bundled = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'Pin-Taskbar.ps1' } else { $null }
-        if ($bundled -and (Test-Path $bundled)) {
-            Copy-Item -LiteralPath $bundled -Destination $helper -Force
-            Write-Log DEBUG "using the bundled Pin-Taskbar helper (next to the script - no download)"
-        } else {
-            Write-Log INFO "fetching the Pin-Taskbar helper (our copy, from our repo; temporary)"
-            if (-not $script:Live) { Show-LiveText 'fetching the Pin-Taskbar helper' }
-            $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-            Invoke-WebRequest -Uri 'https://gitlab.msuhost.com/superuser/win11-tweaks/-/raw/main/Pin-Taskbar.ps1' -OutFile $helper -UseBasicParsing -ErrorAction Stop
-            $ProgressPreference = $pp
-        }
-        Unblock-File $helper -ErrorAction SilentlyContinue
-        $script:PinHelper = $helper
-        return $helper
-    } catch { Write-Log WARN "could not get the Pin-Taskbar helper: $($_.Exception.Message)"; return $null }
-}
-
-function Invoke-PinHelper {
-    # Run the Pin-Taskbar helper in its OWN Windows PowerShell process with -ExecutionPolicy Bypass (like the
-    # .bat and the self-elevation relaunch do). Run in-process, the helper - a .ps1 FILE - was blocked by
-    # Windows' default 'Restricted' policy whenever the `irm | iex` one-liner was started from an already
-    # elevated window (iex itself isn't subject to the policy, script files are). A separate process also
-    # keeps the helper's own `exit` / error handling out of this session.
-    # The helper's exit code: 0 = OK, 2 = nothing found to pin/unpin, 3 = failed, 1 = it crashed - anything
-    # but 0 becomes an exception that the caller records as FAILED.
-    param([string]$Helper, [string]$Target, [switch]$Unpin)
-    $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    if (-not (Test-Path -LiteralPath $ps)) { throw "Windows PowerShell not found at $ps" }
-    $helperArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Helper, $Target, '-Silent')
-    if ($Unpin) { $helperArgs += '-Unpin' }
-    $out = & $ps @helperArgs 2>&1   # it runs -Silent, so anything it prints is an error message - kept for the log
-    if ($LASTEXITCODE -ne 0) {
-        # FIRST lines: a crash prints the message first, then "At ...", code context, CategoryInfo, ErrorId
-        @($out) | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Select-Object -First 10 | ForEach-Object { Write-Log DEBUG "  pin-helper> $_" }
-        $why = switch ($LASTEXITCODE) { 2 { 'nothing found to pin/unpin' } 3 { 'pin/unpin failed' } default { 'helper error' } }
-        throw ("Pin-Taskbar exit code {0} ({1})" -f $LASTEXITCODE, $why)
-    }
-}
-
-function Invoke-TaskbarPins {
-    # Pin "This PC" + unpin Edge/Store on the taskbar via the Pin-Taskbar helper. IDEMPOTENT: skips any item
-    # already in the desired state, so a re-run doesn't re-pin. The helper is fetched only if something's needed.
-    if ($script:DryRun) {
-        Write-Log DEBUG "[DRYRUN] would pin 'This PC' and unpin Edge + Store on the taskbar (only what's not already set)"
-        $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Taskbar.Pins'; Content='Taskbar pins (This PC / -Edge / -Store)'; Status='DRYRUN'; Detail='' }); return
-    }
-    $needThisPC = -not (Test-TaskbarPinned 'This PC')
-    $needEdge   = Test-TaskbarPinned 'Microsoft Edge'
-    $needStore  = Test-TaskbarPinned 'Microsoft Store'
-    if (-not ($needThisPC -or $needEdge -or $needStore)) {
-        Write-Log DEBUG "taskbar already set (This PC pinned, Edge/Store unpinned) - nothing to do"; return
-    }
-    $helper = Get-PinHelper
-    if (-not $helper) { $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Taskbar.Pins'; Content='Taskbar pins'; Status='FAILED'; Detail='no helper' }); return }
-    # (a) PIN "This PC" - only if not already pinned
-    if ($needThisPC) {
-        $r = [pscustomobject]@{ Phase='Taskbar'; Id='ThisPC.Pin'; Content='This PC pinned to taskbar'; Status='FAILED'; Detail='' }
-        try {
-            $lnk = Join-Path $env:LOCALAPPDATA 'This PC.lnk'
-            $wsh = New-Object -ComObject WScript.Shell; $sc = $wsh.CreateShortcut($lnk)
-            $sc.TargetPath = "$env:SystemRoot\explorer.exe"; $sc.Arguments = 'shell:MyComputerFolder'
-            $sc.IconLocation = "$env:SystemRoot\System32\imageres.dll,-109"; $sc.Description = 'This PC'; $sc.Save()
-            Show-LiveText 'pinning This PC to the taskbar'
-            Invoke-PinHelper -Helper $helper -Target $lnk
-            Write-Log OK "pinned This PC to the taskbar"; $r.Status = 'OK'
-        } catch { Write-Log WARN "This PC pin failed: $($_.Exception.Message)"; $r.Detail = $_.Exception.Message }
-        $script:Results.Add($r)
-    } else { Write-Log DEBUG "This PC already pinned - skipping" }
-    # (b) UNPIN Edge + Store - only if currently pinned
-    foreach ($app in 'Microsoft Edge', 'Microsoft Store') {
-        if (-not (Test-TaskbarPinned $app)) { Write-Log DEBUG "$app already unpinned - skipping"; continue }
-        $u = [pscustomobject]@{ Phase='Taskbar'; Id="Unpin.$app"; Content="Unpinned $app from taskbar"; Status='FAILED'; Detail='' }
-        try { Show-LiveText "unpinning $app"; Invoke-PinHelper -Helper $helper -Target $app -Unpin; Write-Log OK "unpinned $app from the taskbar"; $u.Status = 'OK' }
-        catch { Write-Log WARN "unpin $app failed: $($_.Exception.Message)"; $u.Detail = $_.Exception.Message }
-        $script:Results.Add($u)
-    }
-    # (helper kept for Add-ChromeTaskbarPin, which deletes it - Main's finally does if Chrome was left out)
-}
-
-function Add-ChromeTaskbarPin {
-    # Pin Google Chrome to the taskbar AFTER it installs (Chrome is a direct-download app in the install
-    # phase, so this can't run in Invoke-TaskbarPins, which is before the installs). Reuses the kept
-    # Pin-Taskbar helper, then DELETES it. Returns $true if it pinned, so Main knows to refresh the taskbar.
-    $pinned = $false
-    try {
-        if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would pin Google Chrome to the taskbar (if not already)"; return $false }
-        $chromeExe = "$env:ProgramFiles\Google\Chrome\Application\chrome.exe"
-        if (-not (Test-Path $chromeExe)) { Write-Log DEBUG "Chrome not installed - skipping taskbar pin"; return $false }
-        if (Test-TaskbarPinned 'Google Chrome') { Write-Log DEBUG "Google Chrome already pinned - skipping"; return $false }
-        $helper = Get-PinHelper
-        if (-not $helper) {
-            $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Chrome.Pin'; Content='Google Chrome pinned to taskbar'; Status='FAILED'; Detail='no Pin-Taskbar helper' })
-            return $false
-        }
-        $lnk = Get-ChildItem "$env:ProgramData\Microsoft\Windows\Start Menu\Programs" -Filter 'Google Chrome.lnk' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-        $target = if ($lnk) { $lnk.FullName } else { $chromeExe }
-        Invoke-PinHelper -Helper $helper -Target $target
-        Write-Log OK "pinned Google Chrome to the taskbar"
-        $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Chrome.Pin'; Content='Google Chrome pinned to taskbar'; Status='OK'; Detail='' })
-        $pinned = $true
-    } catch {
-        Write-Log WARN "Chrome taskbar pin failed: $($_.Exception.Message)"
-        $script:Results.Add([pscustomobject]@{ Phase='Taskbar'; Id='Chrome.Pin'; Content='Google Chrome pinned to taskbar'; Status='FAILED'; Detail=$_.Exception.Message })
-    } finally {
-        if ($script:PinHelper) { Remove-Item $script:PinHelper -Force -ErrorAction SilentlyContinue; $script:PinHelper = $null }   # delete the kept helper
-    }
-    return $pinned
 }
 
 function Set-QuickEdit {
@@ -4234,7 +4174,7 @@ function Get-GuiRunParts($M) {
     $fn = $M.Finishing
     $fnInner = (@($fn.Rows) | ForEach-Object { New-GuiResultRow $_ }) -join ''
     if ($M.Live -and $fn.State -eq 'live') { $fnInner += New-GuiLiveRow $M.Live.Name $M.Live.What $M.Live.Clock }
-    $fnRight = if ($fn.State -eq 'todo') { New-GuiRight "old components $([char]0xB7) monitors $([char]0xB7) VBScript" } else { '' }
+    $fnRight = if ($fn.State -eq 'todo') { New-GuiRight "taskbar $([char]0xB7) old components $([char]0xB7) monitors $([char]0xB7) VBScript" } else { '' }
     $fnTitle = if ($fn.State -eq 'todo') { New-GuiTitle 'Finishing' $GuiC.tx3 'Medium' } else { New-GuiTitle 'Finishing' }
     $body += New-GuiNode (Get-GuiKind $fn) $fnTitle $fnRight $fnInner -Last
     # the footer: where the run is (Apps is the long one), Log / Stop - Stop asks first
@@ -4598,14 +4538,12 @@ try {
     Write-Banner
     if ($script:DryRun) { Write-Log WARN "DRY RUN - no changes will be made." }
     Invoke-Tweaks
-    Invoke-TaskbarPins        # This PC pin + unpin Edge/Store BEFORE installs...
-    if ($script:NeedExplorerRestart -and -not $script:DryRun) { Update-Explorer -Action restart }   # ...then restart explorer so the taskbar/desktop is already clean (no Widgets/Search) during the installs
+    if ($script:NeedExplorerRestart -and -not $script:DryRun) { Update-Explorer -Action restart }   # restart explorer so the taskbar/desktop is already clean (no Widgets/Search) during the installs
     Write-TweakGroups         # the tweak phase on the rail: one line per group, now that it's over
     Start-DotNet35            # fire the slow .NET 3.5 WU download NOW so it overlaps the install phase (parallel)
-    Invoke-InstallPhase       # apps + per-app desktop icons (Chrome is pinned right after it installs, inside this)
-    if ($script:ChromePinned -and -not $script:DryRun) { Update-Explorer -Action restart }   # refresh the taskbar to show the Chrome pin
+    Invoke-InstallPhase       # apps + per-app desktop icons
     Enable-DotNetFeatures     # finish .NET 3.5 (usually already done) + .NET 4
-    Invoke-Tweaks -Late       # last: what must wait for the installers (VBScript) and for .NET 3.5 (old components) - DISM is free again here
+    Invoke-Tweaks -Late       # last: what must wait for the installers (taskbar pins: Chrome; VBScript) and for .NET 3.5 (old components) - DISM is free again here
     $script:RunFinished = $true
     $script:MainEnded = $true
 }
@@ -4626,9 +4564,6 @@ finally {
         Write-Log INFO ("=========== WIN11-TWEAKS {0} ===========" -f $(if ($script:RunFinished) { 'DONE' } else { 'STOPPED' }))
         Clear-StuckSearch   # a stuck Windows Search takes the clicks meant for the Done screen (and the desktop)
     }
-    # The Pin-Taskbar helper is normally deleted by the Chrome pin - but not when Chrome was taken off the list
-    # or the run was stopped before it. Don't leave it in TEMP.
-    if ($script:PinHelper) { Remove-Item $script:PinHelper -Force -ErrorAction SilentlyContinue; $script:PinHelper = $null }
     Set-QuickEdit -Restore
     try { Stop-Transcript | Out-Null } catch { }
     if ($script:SavedPrefs) { $ProgressPreference = $script:SavedPrefs.Progress; $WarningPreference = $script:SavedPrefs.Warning }   # the window's own settings

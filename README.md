@@ -59,7 +59,8 @@ Every detail goes to a log file for later.
 
   Changed in the next release: **Core Isolation (Memory Integrity) stays on** — the script no longer
   turns it off. A PC that ran an earlier version has it off: turn it on in Windows Security > Device
-  security > Core isolation (Windows checks the drivers first), then restart.
+  security > Core isolation (Windows checks the drivers first), then restart. Fixed: **the taskbar pins
+  disappeared after the first restart** — they now go through Windows' own taskbar layout (see below).
 
   New in v1.8.0: **one app list, everything picked** — take off what you don't want (a row at a time,
   or all); **PC or laptop is detected**, not asked; the apps for **this PC's hardware** are found, not
@@ -106,8 +107,10 @@ Every detail goes to a log file for later.
   background; it finishes after a restart), desktop or laptop. It also applies the
   **WinRAR license** and enables **.NET 3.5**
   (incl. 2.0/3.0) **and .NET 4** via DISM (like "Turn Windows features on/off").
-- **Pins "This PC"** and **Google Chrome** to the taskbar (via a temporary helper that is deleted
-  afterwards), and unpins Microsoft Edge + Microsoft Store.
+- At the end, the **taskbar**: File Explorer, **This PC** and **Google Chrome** pinned; the pins Windows
+  comes with (Edge, Store, Microsoft 365 Copilot, Outlook) gone. Through Windows' own taskbar layout
+  (this user's *Start Layout* policy → `%LOCALAPPDATA%\win11-tweaks\TaskbarLayout.xml`), so the pins
+  stay after a restart; a pin you take off stays off, and a re-run doesn't touch a taskbar you changed.
 - Already-installed apps (found via `winget list` + Add/Remove Programs) **go to the latest**:
   `winget upgrade`; FL Studio and AMD's chipset software (no updater of their own) when the vendor's
   latest file is newer than the installed version; the other direct downloads update themselves.

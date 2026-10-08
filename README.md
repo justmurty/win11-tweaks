@@ -57,6 +57,13 @@ Every detail goes to a log file for later.
     GPU driver Windows only offers 60 Hz, and that driver often arrives during the run (if a screen stayed at
     60 Hz, run the script again once the driver is in).
 
+  New in v1.9.0: **Low-end PC** — a box in the window, empty by default (see [Low-end PC](#low-end-pc)):
+  for a weak PC it turns off animations, transparency, Windows Search and its indexing, background apps,
+  Game DVR and Storage Sense, starts Windows with every processor, makes Defender's scans lighter, puts a
+  plugged-in laptop on Best performance, and at the end keeps the launchers (Steam, Discord, Battle.net…)
+  from starting with Windows. And **no install can hold the run any more**: one that takes over 30 minutes
+  (a setup waiting on a question nobody sees) is stopped and listed as failed, and the run goes on.
+
   New in v1.8.1: **Core Isolation (Memory Integrity) stays on** — the script no longer
   turns it off. A PC that ran an earlier version has it off: turn it on in Windows Security > Device
   security > Core isolation (Windows checks the drivers first), then restart. Fixed: **the taskbar pins
@@ -188,6 +195,8 @@ The one-liner (and the `.bat`) open a dark window — nothing to install, it is 
   with the script and activates Windows online (Windows' own licensing — no `slmgr`, so it works
   without VBScript too); with no key, a key Windows refuses, or no activation (no internet), Settings >
   System > Activation opens instead. The key never goes to the log — only its last 5 characters.
+  Then **Performance**: the PC's RAM, cores / threads and disk (SSD / HDD), and the **Low-end PC**
+  box — empty; pick it on a weak PC (see [Low-end PC](#low-end-pc)).
   **Start** (or Enter) / **Cancel** — Cancel changes nothing.
 - **The run** — the clock, then the phases on one line down the left: Tweaks (n / N, then the
   groups), Apps (the last ones done with their times, the one installing now with its own clock,
@@ -209,6 +218,32 @@ turn the screen off (a laptop could sleep mid-install, and on a test PC the wind
 the screen came back on); closing the window gives Windows its own timers back. Without a desktop (SSH, a
 service), with `-Console`, `-Detailed` or `-Reboot`, or if the window cannot open, the console
 shows the run (below).
+
+## Low-end PC
+
+The **Low-end PC** box (window) or `-LowEnd` (console / `.bat`) adds, before the apps install:
+
+| What | Where Windows has it |
+|------|----------------------|
+| Animations and shadows off ("Adjust for best performance") — **font smoothing and thumbnails stay** | System Properties > Advanced > Performance |
+| Transparency off | Settings > Personalization > Colors |
+| Windows Search and its indexing off (the service is Disabled) — Start still finds apps and settings; a search in File Explorer reads the files themselves (slower) | Services > Windows Search |
+| Background apps off — Store apps only; Steam, Discord & co. are desktop apps and not affected | Settings > Apps > Installed apps > Advanced options |
+| Game DVR off — Game Bar's recording (Win+Alt+R); OBS records, Game Bar stays | Settings > Gaming > Captures |
+| Storage Sense off | Settings > System > Storage |
+| Every processor at boot | msconfig > Boot > Advanced options > Number of processors |
+| Defender's scheduled scans at low priority, at most 20% CPU — the same protection, a scan takes longer | (Defender preferences) |
+| A laptop on the charger: Best performance (a PC has Ultimate Performance already; on battery it is left) | Settings > System > Power > Power mode |
+
+and at the end, after the installs: **the launchers don't start with Windows** — Steam, Discord, Battle.net,
+Epic, Ubisoft, Rockstar, U.GG, the EA app — switched off the way Task Manager > Startup apps does; they open as
+usual when you start them. Lightshot, TurboTop, Razer Synapse, NZXT CAM and Nextcloud keep starting (they
+have to run to work). Epic and Ubisoft add themselves on their first start — off in their own settings.
+
+The animations and the processor count take effect at the next start: the end says **Restart**. Without the
+box none of this is touched — nor turned back from an earlier run. "Number of processors" stays at this PC's
+count: after a CPU with more cores, run the script again with the box (or clear the box in msconfig).
+Hardware-accelerated GPU scheduling and Game Mode stay as they are (Game Mode is on anyway).
 
 ## The console
 
@@ -266,6 +301,7 @@ default Windows 11 shell use; PowerShell 7 has an open bug where Ctrl+C can skip
 | `-DryRun` | Log what it WOULD do, change **nothing**. Run this first. |
 | (none) | Actually apply the tweaks + install the apps. |
 | `-Console` | The rail in the console instead of the window. |
+| `-LowEnd` | The **Low-end PC** box picked (the console: on) — see [Low-end PC](#low-end-pc). |
 | `-Detailed` | The full log on the console instead of the rail (the log file is always full). |
 | `-Machine PC\|Laptop` | PC or laptop without detecting it (`Laptop`: Windows' own power plan, keeps hibernation and the panel's refresh rate; `PC`: Ultimate, no battery tweaks). |
 | `-Reboot` | Reboot 15s after finishing (cancel with Ctrl+C). An unattended run: the console, no window. |

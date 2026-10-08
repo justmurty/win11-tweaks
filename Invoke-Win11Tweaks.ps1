@@ -32,6 +32,11 @@
     Directory for the log file. Default: %TEMP%\win11-tweaks (the Temporary Files tweak leaves it
     alone; fallback: the Desktop if it cannot be written).
 
+.PARAMETER LowEnd
+    The window's "Low-end PC" box picked (on the console: on) - for a weak PC: animations, transparency, Windows Search and
+    indexing, background apps, Game DVR and Storage Sense off, every processor at boot, lighter Defender scans, Best
+    performance when a laptop is plugged in; at the end the launchers (Steam, Discord, Battle.net...) don't start with Windows.
+
 .PARAMETER Console
     The rail in this console instead of the window. The console is also what you get without a
     desktop (SSH, a service), with -Detailed or -Reboot, or when the window cannot open.
@@ -50,6 +55,7 @@ param(
     [string]$Machine,   # 'PC' or 'Laptop' (validated in Show-Intro, NOT via [ValidateSet] - that breaks `irm|iex`)
     [string]$LogDir,
     [switch]$Console,   # the rail in this console instead of the window
+    [switch]$LowEnd,    # the "Low-end PC" box picked from the start (the console: on) - the extra tweaks for a weak PC
     [switch]$Relaunched # internal: set by the elevation relaunch below - that console is the run's own, it goes with the window
 )
 
@@ -115,6 +121,8 @@ $script:ConsoleHidden        = $false  # the console is hidden behind the window
 $script:MainEnded            = $false  # Main got to its end - or was stopped / cancelled; not an error
 $script:ExitWhenDone         = $false  # the run's own console closes at the very end (Exit-Console)
 $script:KeepAwake            = $false  # no sleep, the screen on - from Start until the run is over and its window closed (Set-KeepAwake)
+$script:LowEnd               = [bool]$LowEnd   # the "Low-end PC" box (or -LowEnd): the tweaks marked LowEnd run too
+$script:NeedRestart          = $false  # a change that takes effect only at the next start (numproc, the animations) - the end says "Restart"
 # Console glyphs - made at run time, so this file stays pure ASCII. Only characters Cascadia Mono AND Consolas have: the
 # old console (conhost) has no fallback font, so anything else (rounded corners, check marks, braille spinners) shows as a box.
 $script:G = @{
@@ -467,7 +475,8 @@ function Set-Reg {
             New-Item -Path $Path -Force -ErrorAction Stop | Out-Null
         }
         if ($Value -ne '<RemoveEntry>') {
-            Set-ItemProperty -Path $Path -Name $Name -Type $Type -Value $Value -Force -ErrorAction Stop | Out-Null
+            $v = if ($Type -eq 'Binary') { ConvertTo-RegBinary $Value } else { $Value }
+            Set-ItemProperty -Path $Path -Name $Name -Type $Type -Value $v -Force -ErrorAction Stop | Out-Null
             Write-Log DEBUG "set $Path\$Name = $Value" $Id
         } else {
             Remove-ItemProperty -Path $Path -Name $Name -Force -ErrorAction SilentlyContinue | Out-Null
@@ -480,6 +489,12 @@ function Set-Reg {
         }
         Write-Log WARN "reg $Path\$Name failed: $($_.Exception.Message)" $Id
     }
+}
+
+function ConvertTo-RegBinary {
+    # '90,12,03,80' (hex bytes, the way regedit shows them) -> the bytes a REG_BINARY value takes
+    param([string]$Hex)
+    return , [byte[]]@($Hex -split ',' | Where-Object { $_.Trim() } | ForEach-Object { [Convert]::ToByte($_.Trim(), 16) })   # (one array, not its bytes one by one)
 }
 
 function Set-Svc {
@@ -911,6 +926,109 @@ function Reset-LaptopPowerPlan {
     Set-Reg -Id $Id -Path $script:StateKey -Name 'LaptopPowerPlan' -Type String -Value '<RemoveEntry>'
 }
 
+function Set-BootProcessors {
+    # Low-end PC (superuser, 2026-10-09): msconfig > Boot > Advanced options > "Number of processors" at its highest =
+    # bcdedit's numproc with every logical processor this PC has. (Windows uses them all without it too; a CPU with more
+    # cores later stays at this count until the next run with Low-end or msconfig's box is cleared. BitLocker does not
+    # check numproc - no recovery screen at the next start.)
+    param([string]$Id = '')
+    $n = [int](@(Get-CimInstance Win32_ComputerSystem -Property NumberOfLogicalProcessors -ErrorAction Stop)[0].NumberOfLogicalProcessors)
+    if ($n -lt 1) { throw 'the number of processors is unknown' }
+    $out = & bcdedit.exe /set '{current}' numproc $n 2>&1
+    if ($LASTEXITCODE -ne 0) { throw ("bcdedit exit code {0}: {1}" -f $LASTEXITCODE, (@($out) -join ' ').Trim()) }
+    Write-Log DEBUG "boot: numproc $n" $Id
+    Set-UiNote -Id $Id -Text "all $n processors at boot"
+    $script:NeedRestart = $true
+}
+
+function Set-DefenderLight {
+    # Low-end PC: Microsoft Defender's scheduled scans at low priority and on at most 20% CPU (Windows' default: 50) - the
+    # same protection, a scan just takes longer. Another antivirus in charge (Defender off or passive): nothing to change.
+    param([string]$Id = '')
+    $other = { Write-Log INFO 'Defender is not the antivirus in charge here - its scans left as they are' $Id; Set-UiNote -Id $Id -Text 'another antivirus is in charge - left' }
+    if (-not (Get-Command Set-MpPreference -ErrorAction SilentlyContinue)) { & $other; return }
+    try { Set-MpPreference -EnableLowCpuPriority $true -ScanAvgCPULoadFactor 20 -ErrorAction Stop }
+    catch {
+        $st = $null; try { $st = Get-MpComputerStatus -ErrorAction Stop } catch { }
+        if (-not $st -or -not $st.AMServiceEnabled -or "$($st.AMRunningMode)" -match 'Passive|Not running') { & $other; return }
+        throw
+    }
+    Write-Log DEBUG 'Defender: EnableLowCpuPriority, ScanAvgCPULoadFactor 20' $Id
+    Set-UiNote -Id $Id -Text 'Defender scans lighter'
+}
+
+function Test-OnAcPower {
+    # on the charger now (a desktop: always)
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    return "$([System.Windows.Forms.SystemInformation]::PowerStatus.PowerLineStatus)" -ne 'Offline'
+}
+
+function Set-PowerOverlay {
+    # Settings > System > Power > Power mode, through Windows' own call (the registry values behind it are Windows'
+    # alone - refused even to an admin). 0 = done.
+    param([guid]$Guid)
+    if (-not ('W11TP.Power' -as [type])) {
+        Add-Type -Namespace W11TP -Name Power -ErrorAction Stop -MemberDefinition '[System.Runtime.InteropServices.DllImport("powrprof.dll")] public static extern uint PowerSetActiveOverlayScheme(System.Guid g);'
+    }
+    return [W11TP.Power]::PowerSetActiveOverlayScheme($Guid)
+}
+
+function Set-PowerModeBest {
+    # Low-end laptop (superuser, 2026-10-09): Power mode "Best performance" when plugged in - on battery Windows keeps its
+    # own. Windows has one mode for plugged in and one for battery and sets the one for the power it is on: only on the
+    # charger (a run usually is); on battery it is left, and the note says where to set it.
+    param([string]$Id = '')
+    if (-not (Test-OnAcPower)) {
+        Write-Log INFO 'on battery now - the power mode is left; plugged in: Settings > System > Power > Power mode > Best performance' $Id
+        Set-UiNote -Id $Id -Text 'on battery - left (Settings > Power mode)'; return
+    }
+    $r = Set-PowerOverlay -Guid 'ded574b5-45a0-4f42-8737-46345c09c238'   # Best performance
+    if ($r -ne 0) { throw "Windows refused the power mode (error $r)" }
+    Write-Log DEBUG 'power mode (plugged in): Best performance' $Id
+    Set-UiNote -Id $Id -Text 'Best performance when plugged in'
+}
+
+function Get-StartupEntries {
+    # What starts with Windows (Task Manager > Startup apps): this user's and the machine's Run entries (and its 32-bit
+    # view), and the shortcuts in both Startup folders - Name, what it runs, and where Windows keeps its on/off switch.
+    $base = 'Software\Microsoft\Windows\CurrentVersion'
+    foreach ($r in @(@{ Run = "HKCU:\$base\Run"; Approved = "HKCU:\$base\Explorer\StartupApproved\Run" },
+                     @{ Run = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; Approved = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" },
+                     @{ Run = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run"; Approved = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32" })) {
+        $k = Get-Item -LiteralPath $r.Run -ErrorAction SilentlyContinue
+        if (-not $k) { continue }
+        foreach ($n in $k.GetValueNames()) { if ($n) { [pscustomobject]@{ Name = $n; Command = [string]$k.GetValue($n); Approved = $r.Approved } } }
+    }
+    $sh = $null
+    foreach ($f in @(@{ Dir = [Environment]::GetFolderPath('Startup'); Approved = "HKCU:\$base\Explorer\StartupApproved\StartupFolder" },
+                     @{ Dir = [Environment]::GetFolderPath('CommonStartup'); Approved = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder" })) {
+        if (-not $f.Dir) { continue }
+        foreach ($l in @(Get-ChildItem -LiteralPath $f.Dir -Filter '*.lnk' -File -ErrorAction SilentlyContinue)) {
+            try { if (-not $sh) { $sh = New-Object -ComObject WScript.Shell }; $s = $sh.CreateShortcut($l.FullName); $cmd = ('{0} {1}' -f $s.TargetPath, $s.Arguments).Trim() } catch { $cmd = $l.Name }
+            [pscustomobject]@{ Name = $l.Name; Command = $cmd; Approved = $f.Approved }
+        }
+    }
+}
+
+function Disable-LauncherStartup {
+    # Low-end PC (superuser, 2026-10-09): the launchers in $script:LauncherStartup don't start with Windows - their switch in
+    # Task Manager > Startup apps turned off (03 + when). Tools that must run to work (Lightshot, TurboTop, Razer Synapse,
+    # NZXT CAM, Nextcloud) stay. Epic and Ubisoft add their entry on their first start - off in their own settings.
+    param([string]$Id = '')
+    $off = [System.Collections.Generic.List[string]]::new()
+    foreach ($e in @(Get-StartupEntries)) {
+        foreach ($k in $script:LauncherStartup.Keys) {
+            if ($e.Command -notmatch $script:LauncherStartup[$k]) { continue }
+            $when = ([BitConverter]::GetBytes([DateTime]::UtcNow.ToFileTimeUtc()) | ForEach-Object { '{0:X2}' -f $_ }) -join ','
+            Set-Reg -Id $Id -Path $e.Approved -Name $e.Name -Type Binary -Value "03,00,00,00,$when"
+            Write-Log DEBUG ("startup off: {0} ({1})" -f $k, $e.Name) $Id
+            if (-not $off.Contains($k)) { $off.Add($k) }
+            break
+        }
+    }
+    Set-UiNote -Id $Id -Text $(if ($off.Count) { '{0} don''t start with Windows' -f ($off -join ', ') } else { 'no launcher starts with Windows' })
+}
+
 function Invoke-Step {
     param([string]$Description, [scriptblock]$Action, [string]$Id = '')
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would run: $Description" $Id; return }
@@ -1045,6 +1163,67 @@ function Stop-ProcessTree {
     foreach ($x in $ids) { if ($x -ne $PID) { Stop-Process -Id $x -Force -ErrorAction SilentlyContinue } }
 }
 
+function New-InstallerJob {
+    # A Windows job object around an installer: every process it starts lands in it too (what Start-Process -Wait waits
+    # on). $null when Windows refuses - the wait is then for the installer alone.
+    param($Process)
+    try {
+        if (-not ('W11TJ.Job' -as [type])) {
+            Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace W11TJ {
+    public static class Job {
+        [StructLayout(LayoutKind.Sequential)] struct Acct { public long U, K, PU, PK; public uint Faults, Total, Active, Ended; }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr CreateJobObject(IntPtr a, string n);
+        [DllImport("kernel32.dll")] static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p);
+        [DllImport("kernel32.dll")] static extern bool QueryInformationJobObject(IntPtr j, int c, out Acct i, int l, IntPtr r);
+        [DllImport("kernel32.dll")] static extern bool TerminateJobObject(IntPtr j, uint code);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+        public static IntPtr Open(IntPtr process) {
+            IntPtr j = CreateJobObject(IntPtr.Zero, null);
+            if (j == IntPtr.Zero) return IntPtr.Zero;
+            if (!AssignProcessToJobObject(j, process)) { CloseHandle(j); return IntPtr.Zero; }
+            return j;
+        }
+        public static int Active(IntPtr j) { Acct a; return QueryInformationJobObject(j, 1, out a, Marshal.SizeOf(typeof(Acct)), IntPtr.Zero) ? (int)a.Active : 0; }
+        public static void Stop(IntPtr j) { TerminateJobObject(j, 1); }
+        public static void Close(IntPtr j) { CloseHandle(j); }
+    }
+}
+'@
+        }
+        $j = [W11TJ.Job]::Open($Process.Handle)
+        if ($j -ne [IntPtr]::Zero) { return $j }
+    } catch { Write-Log DEBUG "no job object for the installer ($($_.Exception.Message)) - waiting for it alone" }
+    return $null
+}
+
+function Wait-Installer {
+    # Wait for an installer: it and everything it starts, like Start-Process -Wait - or, -MainOnly, the installer alone (an
+    # app the setup leaves running would hold the run). Never longer than -TimeoutSec (superuser, 2026-10-09: a setup that
+    # waits on a question nobody sees held the whole run - no .NET 3.5, no summary): then it and what it started are
+    # stopped, and it throws. The live line's clock ticks meanwhile.
+    param($Process, [int]$TimeoutSec = 0, [switch]$MainOnly)
+    $null = $Process.Handle   # open it now - Windows PowerShell returns the process by PID, and without a handle ExitCode can be empty
+    $job = if ($MainOnly) { $null } else { New-InstallerJob $Process }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        while ($true) {
+            if ($Process.HasExited) { Start-Sleep -Milliseconds 500 } else { Wait-Process -InputObject $Process -Timeout 1 -ErrorAction Ignore }
+            Update-LiveTick
+            $busy = -not $Process.HasExited
+            if (-not $busy -and $job) { $busy = [W11TJ.Job]::Active($job) -gt 0 }
+            if (-not $busy) { return }
+            if ($TimeoutSec -gt 0 -and $sw.Elapsed.TotalSeconds -ge $TimeoutSec) {
+                Stop-ProcessTree -Id $Process.Id
+                if ($job) { [W11TJ.Job]::Stop($job) }
+                throw ('took too long - stopped after {0} (maybe a question on the screen)' -f (Format-Span $TimeoutSec))
+            }
+        }
+    } finally { if ($job) { [W11TJ.Job]::Close($job) } }
+}
+
 function Install-App {
     # Clean console output: just "Installing <name>" then "Done!" (or "Failed"). winget's own chatter
     # (Found / Downloading / Successfully installed) is redirected to a temp file - shown only in the
@@ -1061,7 +1240,7 @@ function Install-App {
     Write-Log INFO "Installing $label"
     $wo = Join-Path $env:TEMP 'winget_out.log'
     try {
-        $code = Invoke-Winget -ArgumentList $wingetArgs -OutFile $wo
+        $code = Invoke-Winget -ArgumentList $wingetArgs -OutFile $wo -TimeoutSec $script:InstallTimeoutSec
         if ($code -eq 0) { Remove-Item $wo -Force -ErrorAction SilentlyContinue; Write-Log OK "Done!"; return 'OK' }
         # A non-zero exit code is not the last word - trust the system over it (like Install-DirectDownload does):
         # an installer can return an odd code and still install. E_ABORT (0x80004004) means winget stopped
@@ -1320,18 +1499,15 @@ function Install-DirectDownload {
             Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return (Get-DirectFailStatus "not signed by $Signer - not run" ([bool]$from))
         }
     }
-    Set-LiveWhat $(if ($from) { 'updating' } else { 'installing' }) -NoClock:(-not $WaitMainOnly)   # only the WaitMainOnly wait below can tick the clock
+    Set-LiveWhat $(if ($from) { 'updating' } else { 'installing' })   # Wait-Installer ticks the clock
     try {
         $sp = if ($isMsi) { @{ FilePath = 'msiexec.exe'; ArgumentList = "/i `"$tmp`" $SilentArgs" } }
               elseif ($SilentArgs) { @{ FilePath = $tmp; ArgumentList = $SilentArgs } }
               else { @{ FilePath = $tmp } }
-        if ($WaitMainOnly) {
-            # the installer alone: Start-Process -Wait also waits for every process it started, so an app the setup
-            # leaves running (the Radeon app) would hold the run - the same trap as in Invoke-Winget
-            $p = Start-Process @sp -PassThru
-            $null = $p.Handle   # open it now, or ExitCode can be empty afterwards
-            do { Wait-Process -InputObject $p -Timeout 1 -ErrorAction Ignore; Update-LiveTick } until ($p.HasExited)   # the clock ticks
-        } else { $p = Start-Process @sp -Wait -PassThru }
+        # -WaitMainOnly: the installer alone - an app the setup leaves running (the Radeon app) would hold the run, the same
+        # trap as in Invoke-Winget; the others: it and what it starts. Never longer than InstallTimeoutSec.
+        $p = Start-Process @sp -PassThru
+        Wait-Installer -Process $p -TimeoutSec $script:InstallTimeoutSec -MainOnly:$WaitMainOnly
         $code = $p.ExitCode
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         Write-Log DEBUG "$Name installer exit code: $code"
@@ -2067,11 +2243,82 @@ $script:Tweaks = @(
       foreach ($k in $keys) { Remove-RegKey -Id $id -Path "$base\$k" }
   }}
 
+  # ---- Low-end PC (superuser, 2026-10-09): the window's "Low-end PC" box (or -LowEnd) - extra tweaks for a weak PC, only
+  # with the box picked (LowEnd = $true). Here, before the installs; the launchers' startup after them (CustomLowEndStartup).
+  # Performance Options > "Adjust for best performance" - Windows' own mask for it - but the font smoothing and the
+  # thumbnails stay (without them text is jagged and folders show only icons, for no speed); the animations follow at the
+  # next sign-in. Transparency (Settings > Personalization > Colors) off at once.
+  [pscustomobject]@{ Id='CustomLowEndVisual'; Content='Low-end PC - animations and transparency off'; Category='LowEnd'; LowEnd=$true; Apply={
+      $id='CustomLowEndVisual'; $d='HKCU:\Control Panel\Desktop'; $adv='HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+      Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Name 'VisualFXSetting' -Type DWord -Value '3'   # Custom
+      Set-Reg -Id $id -Path $d -Name 'UserPreferencesMask' -Type Binary -Value '90,12,03,80,10,00,00,00'
+      Set-Reg -Id $id -Path $d -Name 'DragFullWindows' -Type String -Value '0'
+      Set-Reg -Id $id -Path $d -Name 'FontSmoothing' -Type String -Value '2'
+      Set-Reg -Id $id -Path "$d\WindowMetrics" -Name 'MinAnimate' -Type String -Value '0'
+      Set-Reg -Id $id -Path $adv -Name 'TaskbarAnimations' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $adv -Name 'ListviewAlphaSelect' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $adv -Name 'ListviewShadow' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path $adv -Name 'IconsOnly' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\DWM' -Name 'EnableAeroPeek' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name 'EnableTransparency' -Type DWord -Value '0'
+      $script:NeedRestart = $true
+  }}
+
+  # Windows Search's indexer off for good: nothing indexes files in the background. Start still finds apps and settings
+  # without it (VM 102, 2026-10-09); a search in File Explorer looks through the files themselves (slower).
+  [pscustomobject]@{ Id='CustomLowEndSearch'; Content='Low-end PC - Windows Search and indexing off'; Category='LowEnd'; LowEnd=$true; Apply={
+      $id='CustomLowEndSearch'
+      Set-Svc -Id $id -Name 'WSearch' -StartupType 'Disabled'
+      if ($script:DryRun -or (Get-Service -Name 'WSearch' -ErrorAction SilentlyContinue)) {
+          Invoke-Step -Id $id -Description 'stop Windows Search (WSearch)' -Action { Stop-Service -Name 'WSearch' -Force -ErrorAction Stop }
+      }
+  }}
+
+  # Store apps don't run in the background (Settings > Apps: background permissions, for every app). Desktop apps - Steam,
+  # Discord... - are not Store apps: not affected.
+  [pscustomobject]@{ Id='CustomLowEndBackgroundApps'; Content='Low-end PC - background apps off'; Category='LowEnd'; LowEnd=$true; Apply={
+      Set-Reg -Id 'CustomLowEndBackgroundApps' -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' -Name 'LetAppsRunInBackground' -Type DWord -Value '2'   # Force Deny
+  }}
+
+  # Game DVR: Game Bar's recording (Win+Alt+R, record what happened) off - OBS records. Game Bar itself stays.
+  [pscustomobject]@{ Id='CustomLowEndGameDvr'; Content='Low-end PC - Game DVR off'; Category='LowEnd'; LowEnd=$true; Apply={
+      $id='CustomLowEndGameDvr'
+      Set-Reg -Id $id -Path 'HKCU:\System\GameConfigStore' -Name 'GameDVR_Enabled' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' -Name 'AppCaptureEnabled' -Type DWord -Value '0'
+      Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR' -Name 'AllowGameDVR' -Type DWord -Value '0'
+  }}
+
+  # Storage Sense (Settings > System > Storage) off - it cleans temp files and the Recycle Bin in the background.
+  [pscustomobject]@{ Id='CustomLowEndStorageSense'; Content='Low-end PC - Storage Sense off'; Category='LowEnd'; LowEnd=$true; Apply={
+      Set-Reg -Id 'CustomLowEndStorageSense' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' -Name '01' -Type DWord -Value '0'
+  }}
+
+  # msconfig > Boot > Advanced options > "Number of processors" at its highest (superuser's ask) - see Set-BootProcessors.
+  [pscustomobject]@{ Id='CustomLowEndProcessors'; Content='Low-end PC - every processor at boot (msconfig)'; Category='LowEnd'; LowEnd=$true; Apply={
+      Invoke-Step -Id 'CustomLowEndProcessors' -Description 'msconfig > Boot > Advanced: Number of processors = all' -Action { Set-BootProcessors -Id 'CustomLowEndProcessors' }
+  }}
+
+  # Defender's scheduled scans at low priority, on at most 20% CPU - see Set-DefenderLight.
+  [pscustomobject]@{ Id='CustomLowEndDefender'; Content='Low-end PC - Defender scans lighter'; Category='LowEnd'; LowEnd=$true; Apply={
+      Invoke-Step -Id 'CustomLowEndDefender' -Description 'Defender: scheduled scans at low priority, at most 20% CPU' -Action { Set-DefenderLight -Id 'CustomLowEndDefender' }
+  }}
+
+  # A laptop: Power mode "Best performance" when plugged in (a PC has Ultimate Performance already) - see Set-PowerModeBest.
+  [pscustomobject]@{ Id='CustomLowEndPower'; Content='Power mode - Best performance plugged in (low-end)'; Category='LowEnd'; LowEnd=$true; Machine='Laptop'; Apply={
+      Invoke-Step -Id 'CustomLowEndPower' -Description 'Power mode: Best performance when plugged in' -Action { Set-PowerModeBest -Id 'CustomLowEndPower' }
+  }}
+
   # The taskbar (superuser): File Explorer, This PC and Google Chrome pinned; the pins Windows comes with go (Edge, the
   # Store, Microsoft 365 Copilot, Outlook). LATE: after the installs, so Chrome is there. Windows' own taskbar layout - see
   # Set-TaskbarLayout (until 1.8.0 a helper wrote the taskbar's registry data and every pin was gone after the next restart).
   [pscustomobject]@{ Id='CustomTaskbarPins'; Content='Taskbar - File Explorer, This PC and Chrome pinned'; Category='Custom'; Late=$true; Apply={
       Invoke-Step -Id 'CustomTaskbarPins' -Description "taskbar layout (Windows' own): File Explorer, This PC, Google Chrome" -Action { Set-TaskbarLayout -Id 'CustomTaskbarPins' }
+  }}
+
+  # Low-end PC: the launchers don't start with Windows (Steam, Discord, Battle.net...) - switched off the way Task Manager >
+  # Startup apps does; they run as usual when opened. LATE: their startup entries come with their installs.
+  [pscustomobject]@{ Id='CustomLowEndStartup'; Content='Startup - launchers don''t start with Windows (low-end)'; Category='LowEnd'; LowEnd=$true; Late=$true; Apply={
+      Invoke-Step -Id 'CustomLowEndStartup' -Description "the launchers' startup off (Task Manager > Startup apps)" -Action { Disable-LauncherStartup -Id 'CustomLowEndStartup' }
   }}
 
   # Old Windows components nobody uses at home (42-47, 50) - they come back from Settings > System > Optional
@@ -2134,6 +2381,11 @@ $script:TweakGroups = @(
     [pscustomobject]@{ Name = 'Edge'; Text = 'no startup boost, promos or sidebar'; Ids = @('WPFTweaksEdgeDebloat') }
     [pscustomobject]@{ Name = 'Performance'; Text = @{ PC = 'Ultimate Performance, no hibernation'; Laptop = 'Windows'' own power plan' }
         Ids = @('CustomUltimatePerf', 'CustomLaptopPower', 'WPFToggleGameMode', 'CustomHibernateOff', 'WPFToggleStandbyFix', 'CustomStandbyNoNetBattery') }
+    [pscustomobject]@{ Name = 'Low-end PC'; Text = {   # only with the box - what came of each, from their notes
+            $t = 'animations, search, background apps off'   # (Game DVR, Storage Sense, Defender: the log and the window)
+            foreach ($id in 'CustomLowEndProcessors', 'CustomLowEndPower') { if ($script:UiNotes.ContainsKey($id)) { $t += " $($script:G.Dot) " + $script:UiNotes[$id] } }
+            $t }
+        Ids = @('CustomLowEndVisual', 'CustomLowEndSearch', 'CustomLowEndBackgroundApps', 'CustomLowEndGameDvr', 'CustomLowEndStorageSense', 'CustomLowEndProcessors', 'CustomLowEndDefender', 'CustomLowEndPower') }
     [pscustomobject]@{ Name = 'Input & look'; Text = 'dark theme, Num Lock, Win+V history, no mouse acceleration'
         Ids = @('WPFToggleDarkMode', 'WPFToggleLoginBlur', 'WPFToggleNumLock', 'CustomMouseAccel', 'CustomStickyKeysOff', 'CustomClipboardHistory') }
     [pscustomobject]@{ Name = 'Sound'; Text = 'no volume drop during calls'; Ids = @('CustomNoCallDucking') }
@@ -2443,6 +2695,20 @@ $script:NoUpdateApps = @('Microsoft.DirectX', 'Microsoft.VCRedist.2005.*', 'Micr
 # How long one update may take: an app that is running (Afterburner, Discord...) can make its installer wait on a question
 # nobody sees - then it is stopped and the app stays as it was ("update failed"). The biggest one (MSI Afterburner) needs ~3 min.
 $script:UpdateTimeoutSec = 900
+# How long one install may take (superuser, 2026-10-09): a setup that waits on a question nobody sees is stopped after this
+# long - FAILED "took too long", the run goes on. The longest real ones (Adrenalin, FL Studio, Battle.net) take ~10 min.
+$script:InstallTimeoutSec = 1800
+# Low-end PC: the launchers that don't start with Windows - by what their startup entry runs (Disable-LauncherStartup)
+$script:LauncherStartup = [ordered]@{
+    'Steam'                   = '\\steam\.exe'
+    'Discord'                 = '--processStart\s+"?Discord\.exe'
+    'Battle.net'              = '\\Battle\.net( Launcher)?\.exe'
+    'Epic Games Launcher'     = '\\EpicGamesLauncher\.exe'
+    'Ubisoft Connect'         = '\\(UbisoftConnect|upc)\.exe'
+    'Rockstar Games Launcher' = '\\Rockstar Games\\Launcher\\'
+    'U.GG'                    = '\\U\.GG\.exe'
+    'EA app'                  = '\\EA(Desktop|Launcher)\.exe'
+}
 
 # WinRAR license embedded as base64 (the only source) - the WinRAR step decodes this and writes
 # rarreg.key into the WinRAR dir(s), so both download-and-run AND the `irm|iex` one-liner license WinRAR.
@@ -2512,9 +2778,10 @@ function Write-Banner {
     $g = $script:G
     $osName = Get-OsName -Os $os
     $pcName = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { 'this PC' }
-    Send-GuiEvent 'banner' @{ Machine = $pcName; Os = (Get-Visible $osName); MachineType = $script:MachineType; User = $script:AppsLabel; DryRun = [bool]$script:DryRun; Log = $script:LogFile }
+    $type = if ($script:LowEnd) { "$($script:MachineType) $($g.Dot) low-end" } else { $script:MachineType }
+    Send-GuiEvent 'banner' @{ Machine = $pcName; Os = (Get-Visible $osName); MachineType = $type; User = $script:AppsLabel; DryRun = [bool]$script:DryRun; Log = $script:LogFile }
     Write-Ui "  {d:$($g.Bar)}"
-    $bits = @(@($osName, $script:MachineType, $script:AppsLabel) | Where-Object { $_ } | ForEach-Object { "{d:$($g.Dot)} $_" })
+    $bits = @(@($osName, $type, $script:AppsLabel) | Where-Object { $_ } | ForEach-Object { "{d:$($g.Dot)} $_" })
     Write-Ui ("  {d:$($g.Tee)$($g.Rule)} {w:$pcName} " + ($bits -join ' '))
     if ($script:DryRun) { Write-Ui "  {d:$($g.Bar)}  {y:DRY RUN - nothing will be changed}" }
 }
@@ -2524,7 +2791,7 @@ function Invoke-Tweaks {
     # The rail: one live line while the phase runs (the groups are printed after it - Write-TweakGroups); the Late
     # ones are "Finishing", one line each.
     param([switch]$Late)
-    $list = @($script:Tweaks | Where-Object { [bool]$_.Late -eq [bool]$Late })
+    $list = @($script:Tweaks | Where-Object { [bool]$_.Late -eq [bool]$Late -and (-not $_.LowEnd -or $script:LowEnd) })   # Low-end: only with its box
     Write-UiPhase $(if ($Late) { 'Finishing' } else { 'Tweaks' })
     if (-not $Late -and $script:OpenActivation) {   # first of all (superuser, 2026-09-30): Windows not activated, the box left on
         Test-GuiStop
@@ -2732,12 +2999,14 @@ function Install-DirectXRuntime {
         if (-not $sig -or "$($sig.Status)" -ne 'Valid' -or "$($sig.SignerCertificate.Subject)" -notmatch 'Microsoft Corporation') {
             throw ("the download is not signed by Microsoft ({0}) - not run" -f $(if ($sig) { $sig.Status } else { 'no signature' }))
         }
-        Set-LiveWhat 'unpacking' -NoClock
-        $p = Start-Process -FilePath $tmp -ArgumentList "/Q /T:`"$dir`"" -Wait -PassThru -WindowStyle Hidden
+        Set-LiveWhat 'unpacking'
+        $p = Start-Process -FilePath $tmp -ArgumentList "/Q /T:`"$dir`"" -PassThru -WindowStyle Hidden
+        Wait-Installer -Process $p -TimeoutSec $script:InstallTimeoutSec
         $setup = Join-Path $dir 'DXSETUP.exe'
         if (-not (Test-Path -LiteralPath $setup)) { throw "unpacking failed (exit code $($p.ExitCode))" }
-        Set-LiveWhat 'installing' -NoClock
-        $p = Start-Process -FilePath $setup -ArgumentList '/silent' -Wait -PassThru
+        Set-LiveWhat 'installing'
+        $p = Start-Process -FilePath $setup -ArgumentList '/silent' -PassThru
+        Wait-Installer -Process $p -TimeoutSec $script:InstallTimeoutSec
         Write-Log DEBUG "DXSETUP exit code: $($p.ExitCode)"
         if (@($files | Where-Object { Test-Path -LiteralPath $_ }).Count -eq $files.Count) { Write-Log OK 'Done!'; return 'OK' }
         throw "DXSETUP exit code $($p.ExitCode), the runtime is not there"
@@ -2949,19 +3218,20 @@ function Install-Alienware {
     # 1) Microsoft Store (official, always-latest)
     $wo = Join-Path $env:TEMP 'winget_awcc.log'
     try {
-        $code = Invoke-Winget -OutFile $wo -ArgumentList "install $id --accept-package-agreements --accept-source-agreements --source msstore --silent"
+        $code = Invoke-Winget -OutFile $wo -TimeoutSec $script:InstallTimeoutSec -ArgumentList "install $id --accept-package-agreements --accept-source-agreements --source msstore --silent"
         if ($code -eq 0) { Remove-Item $wo -Force -EA SilentlyContinue; Write-Log OK "Done!"; return 'OK' }
     } catch { }
     Remove-Item $wo -Force -ErrorAction SilentlyContinue
     # 2) Dell direct Full Installer fallback (bypasses the Store's hardware gating)
     Write-Log DEBUG "Store install failed/gated -> trying Dell's direct AWCC installer"
-    Set-LiveWhat "from Dell's site" -NoClock   # download + Start-Process -Wait: nothing ticks the clock
+    Set-LiveWhat "from Dell's site" -NoClock   # the download: nothing ticks the clock
     $tmp = Join-Path $env:TEMP 'AWCC_dell.exe'
     try {
         $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
         Save-Download -Url $dellUrl -OutFile $tmp
         $ProgressPreference = $pp
-        $dp = Start-Process -FilePath $tmp -ArgumentList '/s' -Wait -PassThru
+        $dp = Start-Process -FilePath $tmp -ArgumentList '/s' -PassThru
+        Wait-Installer -Process $dp -TimeoutSec $script:InstallTimeoutSec
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         if (Test-AppInstalled -NamePattern 'Alienware Command Center*') { Write-Log OK "Done!"; return 'OK' }
         Write-Log WARN "Failed - $label (install manually from dell.com/support)"; $script:ItemFail = 'install it from dell.com/support'; return 'FAILED'
@@ -3355,7 +3625,7 @@ function Write-Summary {
         $lines | Out-File -FilePath $resultsFile -Encoding UTF8 -Force
         Write-Log INFO ("results summary: {0}" -f $resultsFile)
     } catch { Write-Log WARN "could not write results file: $($_.Exception.Message)" }
-    $restart = -not $script:DryRun -and (Test-RestartPending)
+    $restart = -not $script:DryRun -and ((Test-RestartPending) -or $script:NeedRestart)   # (Low-end: numproc, the animations)
     if ($script:DotNet35Proc -and -not $script:DotNet35Proc.HasExited) {
         Write-Log WARN ".NET 3.5 is still installing in the background - reboot / sign out only after it finishes."
     } elseif ($restart) {
@@ -3504,6 +3774,7 @@ function Show-Intro {
     $mc = Get-MachineChoice
     $script:MachineType = $mc.Type
     Write-Log INFO ("Machine type: {0} ({1})" -f $mc.Type, $mc.Why)
+    if ($script:LowEnd) { Write-Log INFO 'Low-end PC: yes (-LowEnd) - the extra tweaks for a weak PC run too' }
     if (-not (Get-WindowsActivation).Activated) { Write-Log INFO 'Windows is not activated - activate it in Settings > System > Activation' }
     $hw = @(Get-HardwareApps)
     Write-HardwareLog $hw
@@ -3714,6 +3985,28 @@ function Get-AppGroup {
     return 'Other'
 }
 
+function Get-PcSpecs {
+    # What the window's Performance row shows - to see a weak PC at a glance: the RAM put in (GB), cores / threads, and the
+    # system disk (SSD / HDD; a virtual disk says neither - left out)
+    $s = @{ RamGB = 0; Cores = 0; Threads = 0; Disk = '' }
+    try {
+        $ram = (@(Get-CimInstance Win32_PhysicalMemory -Property Capacity -ErrorAction Stop) | Measure-Object -Property Capacity -Sum).Sum
+        if (-not $ram) { $ram = @(Get-CimInstance Win32_ComputerSystem -Property TotalPhysicalMemory -ErrorAction Stop)[0].TotalPhysicalMemory }
+        $s.RamGB = [int][Math]::Round([double]$ram / 1GB)
+    } catch { }
+    try { $s.Threads = [int]@(Get-CimInstance Win32_ComputerSystem -Property NumberOfLogicalProcessors -ErrorAction Stop)[0].NumberOfLogicalProcessors } catch { }
+    try { $s.Cores = [int](@(Get-CimInstance Win32_Processor -Property NumberOfCores -ErrorAction Stop) | Measure-Object -Property NumberOfCores -Sum).Sum } catch { }
+    try {
+        $letter = ([string]$env:SystemDrive).TrimEnd(':', '\')
+        if ($letter) {
+            $num = (Get-Partition -DriveLetter $letter -ErrorAction Stop).DiskNumber
+            $pd = @(Get-PhysicalDisk -ErrorAction Stop | Where-Object { [string]$_.DeviceId -eq [string]$num })[0]
+            if ("$($pd.MediaType)" -in 'SSD', 'HDD') { $s.Disk = "$($pd.MediaType)" }
+        }
+    } catch { }
+    return $s
+}
+
 function Get-SetupPayload {
     # What the window's Setup screen needs: this PC and its type (and why), the app list - row by row, in the rows' order,
     # the hardware apps found here in their own row -, what always goes in, how many tweaks run on this machine type
@@ -3737,7 +4030,10 @@ function Get-SetupPayload {
         Apps = @($apps); Hardware = @($hw | Where-Object { $_.Found } | ForEach-Object { $_.Name })
         NotOffered = @($hw | Where-Object { -not $_.Found } | ForEach-Object { @{ Name = $_.Name; Why = $_.Why } })   # for the log
         Groups = @($script:AppGroups.Keys) + @($script:HardwareGroup, 'Other'); HardwareGroup = $script:HardwareGroup
-        TweakCount = @($script:Tweaks | Where-Object { -not $_.Machine -or $_.Machine -eq $mc.Type }).Count; Log = $script:LogFile
+        TweakCount = @($script:Tweaks | Where-Object { -not $_.LowEnd -and (-not $_.Machine -or $_.Machine -eq $mc.Type) }).Count; Log = $script:LogFile
+        LowEndCount = @($script:Tweaks | Where-Object { $_.LowEnd -and (-not $_.Machine -or $_.Machine -eq $mc.Type) }).Count   # the box adds these
+        LowEnd = [bool]$script:LowEnd   # -LowEnd: the box picked from the start
+        Specs = (Get-PcSpecs)           # the Performance row: RAM, cores / threads, SSD / HDD
         Activation = (Get-WindowsActivation)   # not activated: the Windows row (a box that opens Settings > Activation at Start)
         Always = @("Visual C++ 2005$($script:G.Dash)2022") + $runtimes + @('.NET 3.5')
     }
@@ -3757,6 +4053,8 @@ function Set-SetupAnswer {
     Set-AppsLabel -Total $list.Count -Left $left
     $script:OpenActivation = [bool]$Answer.OpenActivation
     if ($script:OpenActivation) { Write-Log INFO 'Windows is not activated - Settings > System > Activation opens at the start' }
+    if ($Answer.ContainsKey('LowEnd')) { $script:LowEnd = [bool]$Answer.LowEnd }
+    if ($script:LowEnd) { Write-Log INFO 'Low-end PC: yes - the extra tweaks for a weak PC run too' }
 }
 
 function Get-WindowsActivation {
@@ -4186,7 +4484,7 @@ function Join-GuiText([object[]]$Parts) { (@($Parts) | Where-Object { $_ }) -joi
 # ---- the model: what the window shows - changed only by the run's events (Update-GuiModel) and the clicks (Invoke-GuiAction)
 function New-GuiModel {
     @{ Screen = 'wait'; WaitText = 'Getting ready'; Setup = $null; Version = ''; Log = ''
-       Choice = @{ Machine = 'PC'; Off = @{}; OpenActivation = $true }   # the apps taken off the list (key -> $true); the Windows row's box
+       Choice = @{ Machine = 'PC'; Off = @{}; OpenActivation = $true; LowEnd = $false }   # the apps taken off the list (key -> $true); the Windows row's box; Low-end PC
        Banner = @{ Machine = ''; Os = ''; MachineType = ''; User = ''; DryRun = $false }
        Tweaks = @{ State = 'todo'; Rows = [System.Collections.Generic.List[object]]::new(); Progress = $null; Count = 0; Time = '' }
        Apps = @{ State = 'todo'; Rows = [System.Collections.Generic.List[object]]::new(); Plan = @() }
@@ -4207,6 +4505,7 @@ function Update-GuiModel($M, $Ev) {
             $M.Choice.Machine = if ($p.Machine) { [string]$p.Machine } else { 'PC' }   # detected (or -Machine) - shown, not a choice
             $M.Choice.Off = @{}   # everything picked
             $M.Choice.OpenActivation = $true   # (the Windows row, when there is one: picked)
+            $M.Choice.LowEnd = [bool]$p.LowEnd   # the Low-end PC box: empty (superuser, 2026-10-09) - picked only with -LowEnd
         }
         'banner' {
             foreach ($k in 'Machine', 'Os', 'MachineType', 'User', 'DryRun') { $M.Banner[$k] = $Ev[$k] }
@@ -4311,9 +4610,18 @@ function Get-GuiSetupParts($M) {
         $wRight = (New-GuiText 'not activated' $GuiC.warn 12) + (New-GuiRight (' {0} {1}' -f [char]0xB7, [string]$act.Edition))   # (New-GuiRight escapes)
         $body += New-GuiNode 'notice' (New-GuiTitle 'Windows') $wRight (& $row 'Activation' (& $chip 'Windows 11 Pro' ([bool]$ch.OpenActivation) 'pick:activation') '' '')
     }
+    # Performance (superuser, 2026-10-09): the PC's RAM / cores / disk, and the Low-end PC box - empty, a click picks it
+    $sp = $p.Specs; $specs = @()
+    if ($sp -and $sp.RamGB) { $specs += "$($sp.RamGB) GB RAM" }
+    if ($sp -and $sp.Cores) { $specs += $(if ($sp.Threads -and $sp.Threads -ne $sp.Cores) { "$($sp.Cores) cores / $($sp.Threads) threads" } else { "$($sp.Cores) cores" }) }
+    elseif ($sp -and $sp.Threads) { $specs += "$($sp.Threads) threads" }
+    if ($sp -and $sp.Disk) { $specs += [string]$sp.Disk }
+    $pRight = if ($specs) { New-GuiRight ($specs -join (' {0} ' -f [char]0xB7)) } else { '' }   # (New-GuiRight escapes)
+    $body += New-GuiNode 'ask' (& $q 'Performance') $pRight (& $row 'Weak PC' (& $chip 'Low-end PC' ([bool]$ch.LowEnd) 'pick:lowend') '' '')
     $body += New-GuiNode 'ask' (& $q 'Apps') $right $rows -Last
     $foot = @($(if ($apps.Count -and $on -eq $apps.Count) { "all $on apps" } else { "$on apps" }))
-    if ($p.TweakCount) { $foot += "$($p.TweakCount) tweaks" }
+    if ($p.TweakCount) { $foot += "$([int]$p.TweakCount + $(if ($ch.LowEnd) { [int]$p.LowEndCount } else { 0 })) tweaks" }
+    if ($ch.LowEnd) { $foot += 'low-end' }
     $kbd = "<Border BorderBrush='$($GuiC.line2)' BorderThickness='1,1,1,2' CornerRadius='5' Padding='7,1' VerticalAlignment='Center'>$(New-GuiText 'Enter' $GuiC.tx2 11)</Border>"
     $hl = (New-GuiText 'Set up this PC' $GuiC.tx 17 'Bold') + (New-GuiText (ConvertTo-GuiXml (Join-GuiText @($p.PcName, $p.Os, $ch.Machine))) $GuiC.tx3 12 'Normal' '0,3,0,0')
     (Get-GuiHeader $hl ($kbd + (New-GuiText 'to start' $GuiC.tx3 12 'Normal' '10,0,0,0'))) +
@@ -4600,7 +4908,8 @@ function Add-GuiClick([string]$Tag) {
         'act:stop' { 'Stop pressed - it asks "Stop after this step?"' } 'act:stop-yes' { 'Stop confirmed - stops after this step' }
         'act:stop-no' { 'Keep going' } 'cap:close' { 'the X (close) - during the run it asks to stop' } 'cap:min' { 'minimised' }
         'key:alt-f4' { 'closed from outside the window (Alt+F4, the taskbar, End task) - during the run it asks to stop' }
-        'pick:apps:none' { 'Deselect all' } 'pick:apps:all' { 'Select all' } 'pick:activation' { 'Activate in Settings (the box)' } default { $null }
+        'pick:apps:none' { 'Deselect all' } 'pick:apps:all' { 'Select all' } 'pick:activation' { 'Activate in Settings (the box)' }
+        'pick:lowend' { 'Low-end PC (the box)' } default { $null }
     }
     if ($what -and $script:GuiShared.Clicks) { $script:GuiShared.Clicks.Enqueue(('{0} {1}' -f (Get-Date).ToString('HH:mm:ss'), $what)) }
 }
@@ -4622,11 +4931,12 @@ function Invoke-GuiAction([string]$Tag) {
         '^pick:apps:none$'    { foreach ($a in @($m.Setup.Apps)) { if ($a) { $m.Choice.Off[[string]$a.Key] = $true } } }
         '^pick:apps:all$'     { $m.Choice.Off = @{} }
         '^pick:activation$'   { $m.Choice.OpenActivation = -not $m.Choice.OpenActivation }
+        '^pick:lowend$'       { $m.Choice.LowEnd = -not $m.Choice.LowEnd }
         '^act:start$'         {
             if ($m.Screen -ne 'setup' -or $sh.Answer) { return }
             $act = $m.Setup.Activation
             $sh.Answer = @{ Machine = $m.Choice.Machine; Off = @($m.Choice.Off.Keys)
-                            OpenActivation = [bool]($act -and -not $act.Activated -and $m.Choice.OpenActivation) }
+                            OpenActivation = [bool]($act -and -not $act.Activated -and $m.Choice.OpenActivation); LowEnd = [bool]$m.Choice.LowEnd }
             $m.Screen = 'wait'; $m.WaitText = 'Starting'
         }
         '^act:cancel$'        { if (-not $sh.Answer) { $sh.Answer = @{ Cancel = $true } }; Close-GuiWindowNow; return }
@@ -4653,13 +4963,14 @@ function Save-GuiSnapshot([string]$Name) {
     } catch { Add-GuiError "snapshot: $($_.Exception.Message)" }
 }
 function Invoke-GuiTestHooks {
-    # only with the test variables set: W11T_GUI_AUTOSTART (1 = as it is, some = a few apps taken off) presses Start, W11T_GUI_STOP=apps
+    # only with the test variables set: W11T_GUI_AUTOSTART (1 = as it is, some = a few apps taken off; W11T_GUI_LOWEND = the Low-end box) presses Start, W11T_GUI_STOP=apps
     # stops the run in its Apps phase, W11T_GUI_SNAP saves the screens as PNGs, W11T_GUI_AUTOCLOSE closes the window at the end
     $m = $script:GuiM; $h = $script:GuiHooks; $now = Get-GuiNow
     if ($env:W11T_GUI_AUTOSTART -and $m.Screen -eq 'setup' -and -not $h.Started) {
         if (-not $h.SetupAt) { $h.SetupAt = $now }
         elseif ($now - $h.SetupAt -gt 1.5) {
             if ($env:W11T_GUI_AUTOSTART -eq 'some') { foreach ($a in @($m.Setup.Apps | Select-Object -First 3)) { if ($a) { $m.Choice.Off[[string]$a.Key] = $true } }; Invoke-GuiRender }
+            if ($env:W11T_GUI_LOWEND) { $m.Choice.LowEnd = $true; Invoke-GuiRender }   # the Low-end PC box picked
             Save-GuiSnapshot 'setup'; $h.Started = $true; Invoke-GuiAction 'act:start'
         }
     }

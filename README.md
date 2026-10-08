@@ -251,7 +251,7 @@ With `-Console` (and wherever there is no window): a rail down the left, from th
 the result:
 
 ```
-  ┌  MSUHost  win11-tweaks 1.8.1
+  ┌  MSUHost  win11-tweaks 1.9.0
   ?  Continue? (Y/n) › y
   ├─ WIN11-TEST · Windows 11 Pro 25H2 (26200) · PC · all 27 apps
   ├─ Tweaks

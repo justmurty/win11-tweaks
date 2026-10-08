@@ -1163,10 +1163,10 @@ function Stop-ProcessTree {
     foreach ($x in $ids) { if ($x -ne $PID) { Stop-Process -Id $x -Force -ErrorAction SilentlyContinue } }
 }
 
-function New-InstallerJob {
-    # A Windows job object around an installer: every process it starts lands in it too (what Start-Process -Wait waits
-    # on). $null when Windows refuses - the wait is then for the installer alone.
-    param($Process)
+function Initialize-InstallerJob {
+    # The job-object code, compiled ONCE before the first installer starts (Invoke-InstallPhase): compiling takes seconds,
+    # and a setup that hands over to a child process in that time would leave the job empty - the wait would end early.
+    # Fails quietly: the waits are then for the installer alone.
     try {
         if (-not ('W11TJ.Job' -as [type])) {
             Add-Type -ErrorAction Stop -TypeDefinition @'
@@ -1174,7 +1174,7 @@ using System;
 using System.Runtime.InteropServices;
 namespace W11TJ {
     public static class Job {
-        [StructLayout(LayoutKind.Sequential)] struct Acct { public long U, K, PU, PK; public uint Faults, Total, Active, Ended; }
+        [StructLayout(LayoutKind.Sequential)] struct Acct { public long U, K, PU, PK; public uint Faults, Total, Active, Ended; }   // JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr CreateJobObject(IntPtr a, string n);
         [DllImport("kernel32.dll")] static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p);
         [DllImport("kernel32.dll")] static extern bool QueryInformationJobObject(IntPtr j, int c, out Acct i, int l, IntPtr r);
@@ -1193,9 +1193,17 @@ namespace W11TJ {
 }
 '@
         }
-        $j = [W11TJ.Job]::Open($Process.Handle)
-        if ($j -ne [IntPtr]::Zero) { return $j }
-    } catch { Write-Log DEBUG "no job object for the installer ($($_.Exception.Message)) - waiting for it alone" }
+    } catch { Write-Log DEBUG "no job objects ($($_.Exception.Message)) - an installer's wait is for it alone" }
+}
+
+function New-InstallerJob {
+    # A Windows job object around an installer: every process it starts lands in it too (what Start-Process -Wait waits
+    # on). $null when Windows refuses - the wait is then for the installer alone.
+    param($Process)
+    Initialize-InstallerJob   # (compiled already - Invoke-InstallPhase)
+    if (-not ('W11TJ.Job' -as [type])) { return $null }
+    try { $j = [W11TJ.Job]::Open($Process.Handle); if ($j -ne [IntPtr]::Zero) { return $j } }
+    catch { Write-Log DEBUG "no job object for the installer ($($_.Exception.Message)) - waiting for it alone" }
     return $null
 }
 
@@ -1523,8 +1531,14 @@ function Install-DirectDownload {
         Write-Log WARN "$failed (installer exit code $code)"; return (Get-DirectFailStatus "installer exit code $code" ([bool]$from))
     } catch {
         $m = $_.Exception.Message
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        if ($m -match '^took too long' -and $DetectName -and -not $from -and (Test-AppInstalled -NamePattern $DetectName)) {
+            # stopped after InstallTimeoutSec, but the app is there - a setup that held on to something it started
+            Write-Log WARN "$Name is installed, but its setup did not end - stopped after $(Format-Span $script:InstallTimeoutSec)"
+            $script:ItemNote = 'installed - its setup was stopped'; return 'OK'
+        }
         Write-Log WARN "$failed : $m"
-        Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return (Get-DirectFailStatus $m ([bool]$from))
+        return (Get-DirectFailStatus $m ([bool]$from))
     }
 }
 
@@ -3383,6 +3397,7 @@ function Get-InstallPlan {
 function Invoke-InstallPhase {
     Write-Log INFO "=========== INSTALLING APPS ==========="
     Write-UiPhase 'Apps'
+    Initialize-InstallerJob   # before the first installer starts (Wait-Installer)
     $hw = Get-Hardware
     if ($script:Gui) { Send-GuiEvent 'plan' @{ Apps = @(Get-InstallPlan -Hardware $hw) } }
 

@@ -727,6 +727,79 @@ function Set-TaskbarLayout {
     else { Write-Log DEBUG 'taskbar layout unchanged - left as it is (what the user changed since stays)' $Id }
 }
 
+function ConvertTo-CursorTheme {
+    # The text of a theme of ours from the Windows (dark) theme's: its own name, and its [Control Panel\Cursors] section
+    # replaced by the cursors in $Cursors (no section - one is added). Everything else (wallpaper, dark mode, sounds) stays.
+    param([string]$Text, $Cursors)
+    $c = $Cursors; $rel = '%SystemRoot%\Cursors\' + $c.Dir + '\'
+    $sec = (@('[Control Panel\Cursors]') + @(@($c.Roles.Keys) | ForEach-Object { '{0}={1}{2}' -f $_, $rel, $c.Roles[$_] }) + @("DefaultValue=$($c.Scheme)", '', '')) -join "`r`n"
+    $t = ([regex]'(?m)^DisplayName=[^\r\n]*').Replace($Text, ('DisplayName=' + $c.Theme).Replace('$', '$$'), 1)
+    $re = [regex]'(?ms)^\[Control Panel\\Cursors\][^\r\n]*\r?\n.*?(?=^\[|\z)'
+    if ($re.IsMatch($t)) { $t = $re.Replace($t, $sec.Replace('$', '$$'), 1) } else { $t = $t.TrimEnd() + "`r`n`r`n" + $sec }
+    return $t
+}
+
+function Update-CursorsNow {
+    # Windows loads this user's pointers from the registry again (SPI_SETCURSORS) - the pointer changes at once
+    if (-not ([System.Management.Automation.PSTypeName]'Native.Wp').Type) {
+        Add-Type -Namespace Native -Name Wp -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)] public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);'
+    }
+    [Native.Wp]::SystemParametersInfo(0x57, 0, $null, 3) | Out-Null
+}
+
+function Set-CursorTheme {
+    # The mouse pointer (superuser, 2026-10-12): Windows 11 Cursors Concept (light) for this user - the files in
+    # %SystemRoot%\Cursors\<Dir>, the scheme (Mouse Properties > Pointers lists it), every pointer - and a theme of ours as
+    # the current theme: the Windows (dark) theme with these cursors in it (%LOCALAPPDATA%\Microsoft\Windows\Themes), so
+    # Settings > Personalization > Themes shows it and picking it again keeps the pointer (picking Windows (dark) itself
+    # would put Windows' own back). The files come from assets\ next to the script (the release ZIP) or from the repo; only
+    # a zip with the SHA-256 in $script:Cursors is used. A re-run: the files are there - nothing downloaded.
+    param([string]$Id = '', [string]$From = $(if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { '' }), [string]$Root = $env:SystemRoot)
+    if (-not $Root -or -not $env:LOCALAPPDATA -or -not $env:TEMP) { throw 'SystemRoot / LOCALAPPDATA / TEMP not set' }
+    $c = $script:Cursors
+    $dir = Join-Path (Join-Path $Root 'Cursors') $c.Dir
+    $files = @($c.Roles.Values)
+    if (@($files | Where-Object { -not (Test-Path -LiteralPath (Join-Path $dir $_)) }).Count) {
+        $local = if ($From) { Join-Path (Join-Path $From 'assets') $c.Zip } else { '' }
+        if ($local -and (Test-Path -LiteralPath $local) -and (Get-FileHash -LiteralPath $local -Algorithm SHA256).Hash -eq $c.Sha256) {
+            $zip = $local; Write-Log DEBUG "cursors from $local" $Id
+        } else {
+            $zip = Join-Path $env:TEMP ('w11t-cursors_{0}.zip' -f (Get-Date -Format 'yyyyMMddHHmmss'))
+            Write-Log DEBUG "downloading the cursors from $($c.Url)" $Id
+            try {
+                Save-Download -Url $c.Url -OutFile $zip
+                $h = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+                if ($h -ne $c.Sha256) { throw "the cursors download is not the expected file (SHA-256 $h)" }
+            } catch { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue; throw }   # no part left in TEMP
+        }
+        try {
+            $null = New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop
+            Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force -ErrorAction Stop
+        } finally { if ($zip -ne $local) { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue } }
+        $miss = @($files | Where-Object { -not (Test-Path -LiteralPath (Join-Path $dir $_)) })
+        if ($miss) { throw "not in the cursors zip: $($miss -join ', ')" }
+    }
+    $rel = '%SystemRoot%\Cursors\' + $c.Dir + '\'
+    $k = 'HKCU:\Control Panel\Cursors'
+    Set-Reg -Id $Id -Path "$k\Schemes" -Name $c.Scheme -Type ExpandString -Value ((@($c.Roles.Keys) | ForEach-Object { $rel + $c.Roles[$_] }) -join ',')
+    foreach ($r in @($c.Roles.Keys)) { Set-Reg -Id $Id -Path $k -Name $r -Type ExpandString -Value ($rel + $c.Roles[$r]) }
+    Set-Reg -Id $Id -Path $k -Name '(default)' -Type String -Value $c.Scheme
+    Set-Reg -Id $Id -Path $k -Name 'Scheme Source' -Type DWord -Value '1'   # 1 = a scheme of this user's
+    Update-CursorsNow
+    $src = Join-Path $Root 'resources\Themes\dark.theme'
+    if (-not (Test-Path -LiteralPath $src)) {   # (CustomSpotlightOff then left the light Bloom - no theme of ours on top)
+        Write-Log DEBUG 'no Windows (dark) theme here - the cursors without a theme of ours' $Id
+        Set-UiNote $Id 'MSUHost Cursors'; return
+    }
+    $tdir = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows\Themes'
+    $null = New-Item -ItemType Directory -Path $tdir -Force -ErrorAction Stop
+    $file = Join-Path $tdir ($c.Theme + '.theme')
+    [IO.File]::WriteAllText($file, (ConvertTo-CursorTheme -Text ([IO.File]::ReadAllText($src)) -Cursors $c), [Text.Encoding]::Unicode)
+    Write-Log DEBUG "theme written: $file" $Id
+    Set-Reg -Id $Id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes' -Name 'CurrentTheme' -Type String -Value $file
+    Set-UiNote $Id ('MSUHost Cursors, theme {0}' -f $c.Theme)
+}
+
 function Initialize-NativeW11T {
     # Screen modes (user32) for the refresh-rate tweak. Compiled once per PowerShell session and KEPT there: when this C#
     # changes, bump the namespace (W11T3 -> W11T4), or a second run in the same window would quietly use the old copy.
@@ -1962,6 +2035,14 @@ $script:Tweaks = @(
       }
   }}
 
+  # The mouse pointer (superuser, 2026-10-12: always, no question, in the theme so it is still there after a restart):
+  # MSUHost Cursors on every PC, inside a theme of ours (the Windows (dark) theme + these cursors) so a
+  # restart, or the theme picked again in Settings, keeps them. After CustomSpotlightOff, whose CurrentTheme it replaces.
+  # See Set-CursorTheme.
+  [pscustomobject]@{ Id='CustomCursors'; Content='Mouse pointer - MSUHost Cursors, in the theme'; Category='Custom'; Apply={
+      Invoke-Step -Id 'CustomCursors' -Description 'mouse pointer: MSUHost Cursors + the MSUHost (dark) theme with them' -Action { Set-CursorTheme -Id 'CustomCursors' }
+  }}
+
   # Ultimate Performance power plan - max performance, then ACTIVATE it. PC only (Machine='PC'): a laptop keeps Windows'
   # own plan (superuser, 2026-09-30 - on battery Ultimate would keep the CPU from idling).
   [pscustomobject]@{ Id='CustomUltimatePerf'; Content='Ultimate Performance - power plan'; Category='Custom'; Machine='PC'; Apply={
@@ -2410,6 +2491,8 @@ $script:TweakGroups = @(
             foreach ($id in 'CustomLowEndProcessors', 'CustomLowEndPower') { if ($script:UiNotes.ContainsKey($id)) { $t += " $($script:G.Dot) " + $script:UiNotes[$id] } }
             $t }
         Ids = @('CustomLowEndVisual', 'CustomLowEndSearch', 'CustomLowEndBackgroundApps', 'CustomLowEndGameDvr', 'CustomLowEndStorageSense', 'CustomLowEndProcessors', 'CustomLowEndDefender', 'CustomLowEndPower') }
+    [pscustomobject]@{ Name = 'Mouse pointer'; Text = { if ($script:UiNotes.ContainsKey('CustomCursors')) { $script:UiNotes['CustomCursors'] } else { 'MSUHost Cursors, in the theme' } }
+        Ids = @('CustomCursors') }   # its own line (superuser, 2026-10-12) - "Input & look" has no room left on the rail
     [pscustomobject]@{ Name = 'Input & look'; Text = 'dark theme, Num Lock, Win+V history, no mouse acceleration'
         Ids = @('WPFToggleDarkMode', 'WPFToggleLoginBlur', 'WPFToggleNumLock', 'CustomMouseAccel', 'CustomStickyKeysOff', 'CustomClipboardHistory') }
     [pscustomobject]@{ Name = 'Sound'; Text = 'no volume drop during calls'; Ids = @('CustomNoCallDucking') }
@@ -2496,6 +2579,22 @@ $script:AppCustom = @{
 # What the script remembers between runs on this PC: the date the promo apps were removed (CustomRemoveMoreApps) and the
 # GUID of the power plan it made (PcPowerPlan; LaptopPowerPlan = 1.6 / 1.7's laptop plan, until it is removed).
 $script:StateKey = 'HKLM:\SOFTWARE\win11-tweaks'
+# The mouse pointer (superuser, 2026-10-12) - CustomCursors / Set-CursorTheme. Windows 11 Cursors Concept, light, by
+# JepriCreations (CC BY-NC-ND 3.0 - the files unchanged, credited in assets\CURSORS.md): assets\<Zip> in this repo, next to
+# the script in the release ZIP, else downloaded from Url; used only when its SHA-256 is this one. Roles in the order of a
+# Windows cursor scheme (Control Panel\Cursors\Schemes - the same as Windows' own "Windows Black").
+$script:Cursors = @{
+    Zip    = 'cursors-windows11-light.zip'
+    Url    = 'https://gitlab.msuhost.com/superuser/win11-tweaks/-/raw/main/assets/cursors-windows11-light.zip'
+    Sha256 = 'D3DE281E8DE4B08273A77FFD940B2AE3FD33BBEC7DEDA3137EC16F11DB6609F5'
+    Dir    = 'Windows_11_light'           # under %SystemRoot%\Cursors
+    Scheme = 'MSUHost Cursors'
+    Theme  = 'MSUHost (dark)'             # the theme's name in Settings > Personalization > Themes
+    Roles  = [ordered]@{ Arrow = 'pointer.cur'; Help = 'help.cur'; AppStarting = 'working.ani'; Wait = 'busy.ani'; Crosshair = 'precision.cur'
+                         IBeam = 'beam.cur'; NWPen = 'handwriting.cur'; No = 'unavailable.cur'; SizeNS = 'vert.cur'; SizeWE = 'horz.cur'
+                         SizeNWSE = 'dgn1.cur'; SizeNESW = 'dgn2.cur'; SizeAll = 'move.cur'; UpArrow = 'alternate.cur'; Hand = 'link.cur'
+                         Pin = 'pin.cur'; Person = 'person.cur' }
+}
 # The empty Start layout Clear-StartPins writes (start2.bin, 972 bytes, sha256 2378a237...81ee65). From Win11Debloat
 # (Assets/Start/start2.bin, MIT License, Copyright (c) 2020 Raphire).
 $script:StartBlankB64 = '4nrhSwH8TRucAIEL3m5RhU5aX0cAW7FJilySr5CE+V6aoBj7A+HZAaADAABc9u55LN8F4borYyXEGl8Q5+RZ+qERszeqUhhZXDvcjTF6rgdprauITLqPgMVMbSZbRsLN/O5uMjSLEr6nWYIwsMJkZMnZyZrhR3PugUhUKOYDqwySCY6/CPkL/Ooz/5j2R2hwWRGqc7ZsJxDFM1DWofjUiGjDUny+Y8UjowknQVaPYao0PC4bygKEbeZqCqRvSgPalSc53OFqCh2FHydzl09fChaos385QvF40EDEgSO8U9/dntAeNULwuuZBi7BkWSIOmWN1l4e+TZbtSJXwn+EINAJhRHyCSNeku21dsw+cMoLorMKnRmhJMLvE+CCdgNKIaPo/Krizva1+bMsI8bSkV/CxaCTLXodb/NuBYCsIHY1sTvbwSBRNMPvccw43RJCUKZRkBLkCVfW24ANbLfHXofHDMLxxFNUpBPSgzGHnueHknECcf6J4HCFBqzvSH1TjQ3S6J8tq2yaQ+jFNkxGRMushdXNNiTNjDFYMJNvgRL2lu63NPE+Cxy+IKC1NdKLweFdOGZr2mvKAw7t/fxmCTieUgLkegDomZbHL6anjy4SkjSCnfTBUNtxc0X3VJiha4wq/ArRrTtVnzcUcX+CI4BNTicx+X2eXugI+EHKjgaQS7fXHqQGEUMUeHMCXlgWUZ5kE3LFTjVifyVIGqYNDuqt7T9l7DWByiuRariySa7tiN1gA2ALKYlRsjsQL7xpxHnT1hi/9b+UuyC46cYQaDUcKDc4BGReJP2gDIyZfudLpgUPc7YfH9doiMcWimSylbKFtsI3Mfo0HONxet5XjzjDoziduYk2dFoFfz19uaRcOHtASKzaGdtk6RC+Tm4BbU/7PlbvHEKJZ720AxOQkzU9U8RWAHHsPUVfWzYoQc2dN8OQ/JlUAqe8+PI05ST4m3LoUpBKB+oU0H84aet5etGpIi4CthvazGencFObWJWNRzxk9BXIX2YoAdXB8b7JFwlxVdhgzZK0zkkrzSSmX9iJcNoi6Tp+RtnljzLTAv6xh8gwytIW5F2e5sVh7aiqo4sji0aE+ToqyNPV7eE9Idi2ZNeEbnJ9LX127uOl5jB280hs0caXLUrYiR15+Y31wtlD8JVeTDxDDac6v+e3C4VX+28mg9bYQ7NGYXZc7yZANC/nWTn+/hkTZUvR0gi+PUz4o/DSdKzbvVCAlqdjArcKkWW4r/WKUSLskoOKRPxdNLPVBl2S6blje4LvBzulpeHWubXWfCW4ILuOI'
@@ -4656,7 +4755,6 @@ function Get-GuiSetupParts($M) {
     $body += New-GuiNode 'ask' (& $q 'Apps') $right $rows -Last
     $foot = @($(if ($apps.Count -and $on -eq $apps.Count) { "all $on apps" } else { "$on apps" }))
     if ($p.TweakCount) { $foot += "$([int]$p.TweakCount + $(if ($ch.LowEnd) { [int]$p.LowEndCount } else { 0 })) tweaks" }
-    if ($ch.LowEnd) { $foot += 'low-end' }
     $kbd = "<Border BorderBrush='$($GuiC.line2)' BorderThickness='1,1,1,2' CornerRadius='5' Padding='7,1' VerticalAlignment='Center'>$(New-GuiText 'Enter' $GuiC.tx2 11)</Border>"
     $hl = (New-GuiText 'Set up this PC' $GuiC.tx 17 'Bold') + (New-GuiText (ConvertTo-GuiXml (Join-GuiText @($p.PcName, $p.Os, $ch.Machine))) $GuiC.tx3 12 'Normal' '0,3,0,0')
     (Get-GuiHeader $hl ($kbd + (New-GuiText 'to start' $GuiC.tx3 12 'Normal' '10,0,0,0'))) +

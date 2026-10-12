@@ -8,8 +8,9 @@ Every detail goes to a log file for later.
 
 ## What it does
 
-- **55 tweaks** — 25 standard (Essential + Advanced + Customize Preferences toggles) + 30
+- **56 tweaks** — 25 standard (Essential + Advanced + Customize Preferences toggles) + 31
   custom (shortcut-arrow off, Spotlight off + the **Windows (dark)** theme with its dark wallpaper,
+  the **MSUHost Cursors** mouse pointer inside a theme of ours, **MSUHost (dark)**,
   **Ultimate Performance** on a PC — a laptop keeps **Windows' own power plan** (the "Ultimate on the
   charger, Balanced on battery" plan of v1.6 / v1.7 is removed); a Ryzen X3D
   with two CCDs (7950X3D, 9950X3D...) keeps **Balanced**: AMD's V-Cache driver needs its core parking,
@@ -59,7 +60,11 @@ Every detail goes to a log file for later.
 
   New in v1.10.0: **Brave** next to Google Chrome — its box in the window is empty; picked, it goes in
   for every user and onto the taskbar. The taskbar now pins **the browsers picked**: Chrome, Brave or
-  both (Chrome too only when it was picked, not just because it is on the PC).
+  both (Chrome too only when it was picked, not just because it is on the PC). **A new mouse pointer**
+  on every PC: **MSUHost Cursors** (Windows 11 Cursors Concept by JepriCreations), inside the theme **MSUHost (dark)**
+  (the Windows (dark) theme with these cursors), so it stays after a restart and when the theme is
+  picked again in Settings (credits: [`assets/CURSORS.md`](assets/CURSORS.md)). The window's footer
+  shows only the counts (no "low-end").
 
   New in v1.9.0: **Low-end PC** — a box in the window, empty by default (see [Low-end PC](#low-end-pc)):
   for a weak PC it turns off animations, transparency, Windows Search and its indexing, background apps,

@@ -57,6 +57,10 @@ Every detail goes to a log file for later.
     GPU driver Windows only offers 60 Hz, and that driver often arrives during the run (if a screen stayed at
     60 Hz, run the script again once the driver is in).
 
+  New in v1.10.0: **Brave** next to Google Chrome — its box in the window is empty; picked, it goes in
+  for every user and onto the taskbar. The taskbar now pins **the browsers picked**: Chrome, Brave or
+  both (Chrome too only when it was picked, not just because it is on the PC).
+
   New in v1.9.0: **Low-end PC** — a box in the window, empty by default (see [Low-end PC](#low-end-pc)):
   for a weak PC it turns off animations, transparency, Windows Search and its indexing, background apps,
   Game DVR and Storage Sense, starts Windows with every processor, makes Defender's scans lighter, puts a
@@ -99,14 +103,14 @@ Every detail goes to a log file for later.
   case = PC, even with a UPS "battery"; otherwise a battery = laptop. `-Machine` overrides it. A laptop
   gets no power plan of ours (Windows' own stays); hibernation and the panel's refresh rate stay as
   they are.
-- The window lists **every app, picked**: click one to leave it out, a row's name (Games, Tools...) for
+- The window lists **every app, picked** — but **Brave** (empty, click it to add it): click one to leave it out, a row's name (Games, Tools...) for
   the whole row, **Deselect all** / **Select all**. **Drivers & hardware** lists only what this PC's
   hardware needs. The run lists only what it installs: the apps taken off, and the ones for hardware
   this PC does not have, are in the log only. Visual C++, DirectX (Microsoft's End-User Runtime - the
   D3DX / XInput / XAudio files older games and MSI Afterburner need) and .NET 3.5 always go in. On the
-  console (no window) everything goes in.
-- Then the **install phase**: **12 Visual C++ redists** + **20 winget apps**
-  (incl. VLC, Lightshot, TurboTop, WinRAR, TreeSize, qBittorrent, MSI Afterburner; **iTunes** and **Apple
+  console (no window) everything goes in but Brave.
+- Then the **install phase**: **12 Visual C++ redists** + **21 winget apps**
+  (incl. **Brave** when it is picked, VLC, Lightshot, TurboTop, WinRAR, TreeSize, qBittorrent, MSI Afterburner; **iTunes** and **Apple
   Devices** from the Microsoft Store, the way Apple offers them for Windows 11; **NZXT CAM** only
   where an NZXT device is found) + **direct downloads** from the vendor (**Google Chrome**, **Bitwarden**,
   **Parsec**, **Google Play Games**, **FL Studio**, **U.GG**, **Rockstar Games Launcher**, **Razer
@@ -127,7 +131,9 @@ Every detail goes to a log file for later.
   the rest for as long as it comes. It also applies the
   **WinRAR license** and enables **.NET 3.5**
   (incl. 2.0/3.0) **and .NET 4** via DISM (like "Turn Windows features on/off").
-- At the end, the **taskbar**: File Explorer, **This PC** and **Google Chrome** pinned; the pins Windows
+- At the end, the **taskbar**: File Explorer, **This PC** and the browsers picked — **Google Chrome**,
+  **Brave** or both — pinned (a browser left out is not pinned even when it is on the PC; one an
+  earlier run pinned stays on a re-run that doesn't pick it); the pins Windows
   comes with (Edge, Store, Microsoft 365 Copilot, Outlook) gone. Through Windows' own taskbar layout
   (this user's *Start Layout* policy → `%LOCALAPPDATA%\win11-tweaks\TaskbarLayout.xml`), so the pins
   stay after a restart; a pin you take off stays off, and a re-run doesn't touch a taskbar you changed.
@@ -188,7 +194,7 @@ The one-liner (and the `.bat`) open a dark window — nothing to install, it is 
 (WPF, built into Windows). Three screens:
 
 - **Set up this PC** — the PC, its Windows and PC / laptop (detected), then the apps: every one
-  picked, in rows (Games, Chat & streaming, Media, Tools, Internet, and Drivers & hardware with only
+  picked but Brave (empty — click it to add it; picked, it is pinned to the taskbar too), in rows (Games, Chat & streaming, Media, Tools, Internet, and Drivers & hardware with only
   what this PC needs); click an app to leave it out, a row's name for the whole row, **Deselect all**
   / **Select all**; what always goes in. When Windows is **not activated**, a **Windows** row on top
   with **Windows 11 Pro** (picked): at Start the run's first step puts in the product key that comes
@@ -313,7 +319,9 @@ Edit the arrays near the top of the install section of the script: `$script:Apps
 for winget apps (add winget IDs, e.g. `'Mozilla.Firefox'`), `$script:DirectApps` for
 direct-download apps, or `$script:VendorApps` for apps that belong on one vendor's hardware
 (`Hardware` is a regex matched against the PC's manufacturer + model). A new app shows up in the
-window's list, picked — in its row if it is in `$script:AppGroups`, else under Other. If everyone
+window's list, picked — in its row if it is in `$script:AppGroups`, else under Other; one whose box
+should start empty (installed only when picked in the window, never from the console) also goes in
+`$script:AppsOffByDefault`, like Brave. If everyone
 must get it without a choice, also add its winget ID to `$script:RuntimeApps`; an app for some
 hardware only goes in `$script:HardwareApps` (with its check).
 

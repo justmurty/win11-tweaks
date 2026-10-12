@@ -685,27 +685,36 @@ function Get-TaskbarLayoutXml {
 }
 
 function Set-TaskbarLayout {
-    # The taskbar (superuser): File Explorer, This PC and Google Chrome pinned, the pins Windows comes with gone - through
-    # Windows' own taskbar layout: this user's Start Layout policy (StartLayoutFile + LockedStartLayout = what the Group
-    # Policy "Start Layout" writes) points at our XML in %LOCALAPPDATA%\win11-tweaks; Explorer applies it when it starts.
+    # The taskbar (superuser): File Explorer, This PC and the browsers picked pinned, the pins Windows comes with gone -
+    # through Windows' own taskbar layout: this user's Start Layout policy (StartLayoutFile + LockedStartLayout = what the
+    # Group Policy "Start Layout" writes) points at our XML in %LOCALAPPDATA%\win11-tweaks; Explorer applies it when it starts.
     # Until 1.8.0 a helper wrote the taskbar's own registry data instead, and Windows threw ALL pins away at the next
     # restart (superuser 2026-10-02; on VM 102 into User Pinned\TaskBar\Tombstones). Verified on VM 102 (25H2): applied at
     # the Explorer restart, kept over a forced restart, a pin the user takes off stays off, "Pin to Start" still there.
-    # An unchanged layout is left alone: a re-run keeps what the user changed since. Chrome only when it is installed (a
-    # later run that installs it changes the layout, so it comes then).
+    # An unchanged layout is left alone: a re-run keeps what the user changed since.
+    # The browsers (superuser, 2026-10-12): Chrome, Brave or both - each only when it was picked in this run (Chrome too, not
+    # just when it is there) AND is installed (its setup may have failed). One this script pinned the last time stays while
+    # it is installed, picked or not: a re-run with the window's defaults must not swap Brave back for Chrome.
     param([string]$Id = '')
     if (-not $env:LOCALAPPDATA -or -not $env:SystemRoot) { throw 'LOCALAPPDATA / SystemRoot not set' }
     $dir = Join-Path $env:LOCALAPPDATA 'win11-tweaks'
     $null = New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop
+    $file = Join-Path $dir 'TaskbarLayout.xml'
+    $old = if (Test-Path -LiteralPath $file) { [IO.File]::ReadAllText($file) } else { '' }
     $pc = Join-Path $dir 'This PC.lnk'
     if (-not (Test-Path -LiteralPath $pc)) { New-ThisPcShortcut -Path $pc }
     $links = @($pc); $names = @('File Explorer', 'This PC')
-    $chrome = if ($env:ProgramData) { Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Google Chrome.lnk' } else { '' }
-    if ($chrome -and (Test-Path -LiteralPath $chrome)) { $links += $chrome; $names += 'Google Chrome' }
+    $programs = if ($env:ProgramData) { Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs' } else { '' }
+    foreach ($b in @(@{ Key = 'Google Chrome'; Name = 'Google Chrome'; Link = 'Google Chrome.lnk' }, @{ Key = 'Brave.Brave'; Name = 'Brave'; Link = 'Brave.lnk' })) {
+        if (-not $programs) { break }
+        $lnk = Join-Path $programs $b.Link
+        if (-not (Test-Path -LiteralPath $lnk)) { continue }   # not installed (or its setup failed)
+        $picked = -not ($script:NotSelected -and $script:NotSelected.ContainsKey($b.Key))
+        $before = $old.Contains('"' + [Security.SecurityElement]::Escape($lnk) + '"')   # in the layout of the last run
+        if ($picked -or $before) { $links += $lnk; $names += $b.Name }
+    }
     $xml = Get-TaskbarLayoutXml -LinkPaths $links -PinGeneration:(Test-PinGenerationSupported)
-    $file = Join-Path $dir 'TaskbarLayout.xml'
     $changed = $false
-    $old = if (Test-Path -LiteralPath $file) { [IO.File]::ReadAllText($file) } else { '' }
     if ($old -ne $xml) { [IO.File]::WriteAllText($file, $xml, (New-Object Text.UTF8Encoding($false))); $changed = $true; Write-Log DEBUG "taskbar layout written: $file ($($names -join ', '))" $Id }
     $pol = Get-TaskbarLayoutPolicy
     if (-not $pol -or "$($pol.StartLayoutFile)" -ne $file -or "$($pol.LockedStartLayout)" -ne '1') {
@@ -2322,11 +2331,12 @@ $script:Tweaks = @(
       Invoke-Step -Id 'CustomLowEndPower' -Description 'Power mode: Best performance when plugged in' -Action { Set-PowerModeBest -Id 'CustomLowEndPower' }
   }}
 
-  # The taskbar (superuser): File Explorer, This PC and Google Chrome pinned; the pins Windows comes with go (Edge, the
-  # Store, Microsoft 365 Copilot, Outlook). LATE: after the installs, so Chrome is there. Windows' own taskbar layout - see
-  # Set-TaskbarLayout (until 1.8.0 a helper wrote the taskbar's registry data and every pin was gone after the next restart).
-  [pscustomobject]@{ Id='CustomTaskbarPins'; Content='Taskbar - File Explorer, This PC and Chrome pinned'; Category='Custom'; Late=$true; Apply={
-      Invoke-Step -Id 'CustomTaskbarPins' -Description "taskbar layout (Windows' own): File Explorer, This PC, Google Chrome" -Action { Set-TaskbarLayout -Id 'CustomTaskbarPins' }
+  # The taskbar (superuser): File Explorer, This PC and the browsers picked (Chrome, Brave or both) pinned; the pins Windows
+  # comes with go (Edge, the Store, Microsoft 365 Copilot, Outlook). LATE: after the installs, so the browsers are there.
+  # Windows' own taskbar layout - see Set-TaskbarLayout (until 1.8.0 a helper wrote the taskbar's registry data and every
+  # pin was gone after the next restart).
+  [pscustomobject]@{ Id='CustomTaskbarPins'; Content='Taskbar - File Explorer, This PC and the browsers picked (Chrome, Brave) pinned'; Category='Custom'; Late=$true; Apply={
+      Invoke-Step -Id 'CustomTaskbarPins' -Description "taskbar layout (Windows' own): File Explorer, This PC, the browsers picked" -Action { Set-TaskbarLayout -Id 'CustomTaskbarPins' }
   }}
 
   # Low-end PC: the launchers don't start with Windows (Steam, Discord, Battle.net...) - switched off the way Task Manager >
@@ -2430,13 +2440,18 @@ $script:AppsToInstall = @(
     'JAMSoftware.TreeSize.Free',         # superuser, 2026-09-30: TreeSize, qBittorrent, MSI Afterburner (with RivaTuner -
     'qBittorrent.qBittorrent',           # its installer always brings it)
     'Guru3D.Afterburner',
+    'Brave.Brave',                       # superuser, 2026-10-12: Brave next to Chrome - its box is empty (AppsOffByDefault)
     '9PB2MZ1ZMB1S',                      # iTunes and Apple Devices (superuser, 2026-09-30) - the Microsoft Store's, the way
     '9NP83LWLPZ9K'                       # Apple offers them for Windows 10 / 11 (see AppSources)
 )
+# The apps whose box in the window is EMPTY (superuser, 2026-10-12): installed only when picked there - never from the
+# console, which has nobody to pick them. Keys as Get-AppChoices gives them.
+$script:AppsOffByDefault = @('Brave.Brave')
 # winget installs these for the whole machine only when asked (the default scope is the user's - TreeSize would land in
 # the admin's profile). Keyed by winget ID.
 $script:AppScopes = @{
     'JAMSoftware.TreeSize.Free' = 'machine'
+    'Brave.Brave'               = 'machine'   # Program Files and a Start Menu shortcut for every user, like Chrome (the taskbar pins it)
 }
 # Apps winget gets from the Microsoft Store, not from its own repository (the Store keeps them up to date too). Keyed by
 # ID (the Store's product ID).
@@ -2754,6 +2769,7 @@ $script:AppNames = @{
     'JAMSoftware.TreeSize.Free'        = 'TreeSize'
     'qBittorrent.qBittorrent'          = 'qBittorrent'
     'Guru3D.Afterburner'               = 'MSI Afterburner'
+    'Brave.Brave'                      = 'Brave'
     '9PB2MZ1ZMB1S'                     = 'iTunes'
     '9NP83LWLPZ9K'                     = 'Apple Devices'
 }
@@ -2765,7 +2781,7 @@ $script:AppGroups = [ordered]@{
     'Chat & streaming' = @('Discord.Discord', 'Vencord', 'OBSProject.OBSStudio', 'Parsec')
     'Media'            = @('VideoLAN.VLC', 'FL Studio', '9PB2MZ1ZMB1S')
     'Tools'            = @('RARLab.WinRAR', 'RevoUninstaller.RevoUninstaller', 'JAMSoftware.TreeSize.Free', 'Skillbrains.Lightshot', 'CPUID.HWMonitor', 'Guru3D.Afterburner', 'SavardSoftware.TurboTop', 'Razer Synapse', '9NP83LWLPZ9K')
-    'Internet'         = @('Google Chrome', 'Bitwarden', 'Nextcloud.NextcloudDesktop', 'qBittorrent.qBittorrent')
+    'Internet'         = @('Google Chrome', 'Brave.Brave', 'Bitwarden', 'Nextcloud.NextcloudDesktop', 'qBittorrent.qBittorrent')
 }
 
 # --------------------------------------------------------------------------------------
@@ -3766,8 +3782,8 @@ function Test-Interactive {
 
 function Show-Intro {
     # The rail head and "Continue?" - then the machine type (detected, or -Machine) and the app list: on the console
-    # everything goes in (taking apps off the list is the window's job). With the window open, the window asks instead
-    # (its Setup screen - Invoke-GuiSetup).
+    # everything goes in but the apps whose box in the window starts empty (Brave) - taking apps off the list is the window's
+    # job. With the window open, the window asks instead (its Setup screen - Invoke-GuiSetup).
     if ($script:Gui) {
         Invoke-GuiSetup
         if ($script:Gui) { return }   # answered - or cancelled - in the window
@@ -3793,7 +3809,9 @@ function Show-Intro {
     if (-not (Get-WindowsActivation).Activated) { Write-Log INFO 'Windows is not activated - activate it in Settings > System > Activation' }
     $hw = @(Get-HardwareApps)
     Write-HardwareLog $hw
-    Set-AppsLabel -Total (@(Get-AppChoices).Count + @($hw | Where-Object { $_.Found }).Count)
+    $off = @(Get-AppChoices | Where-Object { $script:AppsOffByDefault -contains $_.Key })   # Brave: only the window picks it
+    foreach ($c in $off) { $script:NotSelected[$c.Key] = 'only when picked in the window' }
+    Set-AppsLabel -Total (@(Get-AppChoices).Count - $off.Count + @($hw | Where-Object { $_.Found }).Count)
 }
 
 function Get-DetectedMachineType {
@@ -4045,6 +4063,7 @@ function Get-SetupPayload {
         Apps = @($apps); Hardware = @($hw | Where-Object { $_.Found } | ForEach-Object { $_.Name })
         NotOffered = @($hw | Where-Object { -not $_.Found } | ForEach-Object { @{ Name = $_.Name; Why = $_.Why } })   # for the log
         Groups = @($script:AppGroups.Keys) + @($script:HardwareGroup, 'Other'); HardwareGroup = $script:HardwareGroup
+        OffByDefault = @($script:AppsOffByDefault)   # their box starts empty (Brave)
         TweakCount = @($script:Tweaks | Where-Object { -not $_.LowEnd -and (-not $_.Machine -or $_.Machine -eq $mc.Type) }).Count; Log = $script:LogFile
         LowEndCount = @($script:Tweaks | Where-Object { $_.LowEnd -and (-not $_.Machine -or $_.Machine -eq $mc.Type) }).Count   # the box adds these
         LowEnd = [bool]$script:LowEnd   # -LowEnd: the box picked from the start
@@ -4518,7 +4537,8 @@ function Update-GuiModel($M, $Ev) {
         'setup' {
             $p = $Ev.Payload; $M.Setup = $p; $M.Screen = 'setup'; $M.Version = [string]$p.Version; $M.Log = [string]$p.Log
             $M.Choice.Machine = if ($p.Machine) { [string]$p.Machine } else { 'PC' }   # detected (or -Machine) - shown, not a choice
-            $M.Choice.Off = @{}   # everything picked
+            $M.Choice.Off = @{}   # everything picked - but the apps whose box starts empty (Brave, superuser 2026-10-12)
+            foreach ($k in @($p.OffByDefault)) { if ($k) { $M.Choice.Off[[string]$k] = $true } }
             $M.Choice.OpenActivation = $true   # (the Windows row, when there is one: picked)
             $M.Choice.LowEnd = [bool]$p.LowEnd   # the Low-end PC box: empty (superuser, 2026-10-09) - picked only with -LowEnd
         }
@@ -4978,12 +4998,14 @@ function Save-GuiSnapshot([string]$Name) {
     } catch { Add-GuiError "snapshot: $($_.Exception.Message)" }
 }
 function Invoke-GuiTestHooks {
-    # only with the test variables set: W11T_GUI_AUTOSTART (1 = as it is, some = a few apps taken off; W11T_GUI_LOWEND = the Low-end box) presses Start, W11T_GUI_STOP=apps
+    # only with the test variables set: W11T_GUI_AUTOSTART (1 = as it is, some = a few apps taken off, all = Select all - Brave too;
+    # W11T_GUI_LOWEND = the Low-end box) presses Start, W11T_GUI_STOP=apps
     # stops the run in its Apps phase, W11T_GUI_SNAP saves the screens as PNGs, W11T_GUI_AUTOCLOSE closes the window at the end
     $m = $script:GuiM; $h = $script:GuiHooks; $now = Get-GuiNow
     if ($env:W11T_GUI_AUTOSTART -and $m.Screen -eq 'setup' -and -not $h.Started) {
         if (-not $h.SetupAt) { $h.SetupAt = $now }
         elseif ($now - $h.SetupAt -gt 1.5) {
+            if ($env:W11T_GUI_AUTOSTART -eq 'all') { Invoke-GuiAction 'pick:apps:all' }   # every app, the ones whose box starts empty too
             if ($env:W11T_GUI_AUTOSTART -eq 'some') { foreach ($a in @($m.Setup.Apps | Select-Object -First 3)) { if ($a) { $m.Choice.Off[[string]$a.Key] = $true } }; Invoke-GuiRender }
             if ($env:W11T_GUI_LOWEND) { $m.Choice.LowEnd = $true; Invoke-GuiRender }   # the Low-end PC box picked
             Save-GuiSnapshot 'setup'; $h.Started = $true; Invoke-GuiAction 'act:start'
@@ -5090,7 +5112,7 @@ try {
     Start-DotNet35            # fire the slow .NET 3.5 WU download NOW so it overlaps the install phase (parallel)
     Invoke-InstallPhase       # apps + per-app desktop icons
     Enable-DotNetFeatures     # finish .NET 3.5 (usually already done) + .NET 4
-    Invoke-Tweaks -Late       # last: what must wait for the installers (taskbar pins: Chrome; VBScript) and for .NET 3.5 (old components) - DISM is free again here
+    Invoke-Tweaks -Late       # last: what must wait for the installers (taskbar pins: the browsers; VBScript) and for .NET 3.5 (old components) - DISM is free again here
     $script:RunFinished = $true
     Open-DriverHubPage        # an ASUS board: DriverHub's page - "Install all" there puts in the board's drivers
     $script:MainEnded = $true

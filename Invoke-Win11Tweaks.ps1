@@ -51,96 +51,85 @@
 param(
     [switch]$DryRun,
     [switch]$Reboot,
-    [switch]$Detailed,   # full/debug console output (default: concise, human-friendly; the LOG FILE is always full)
+    [switch]$Detailed,   # the full log on the console
     [string]$Machine,   # 'PC' or 'Laptop' (validated in Show-Intro, NOT via [ValidateSet] - that breaks `irm|iex`)
     [string]$LogDir,
-    [switch]$Console,   # the rail in this console instead of the window
-    [switch]$LowEnd,    # the "Low-end PC" box picked from the start (the console: on) - the extra tweaks for a weak PC
-    [switch]$Relaunched # internal: set by the elevation relaunch below - that console is the run's own, it goes with the window
+    [switch]$Console,
+    [switch]$LowEnd,
+    [switch]$Relaunched # internal: set by the elevation relaunch
 )
 
 $ErrorActionPreference = 'Continue'
-# The window's own progress / warning settings - put back at the end: `irm | iex` from an already elevated window runs
-# this in that window's own scope, and it should not stay silenced after the run.
+# Put back at the end: `irm | iex` from an elevated window runs in that window's own scope.
 $script:SavedPrefs = @{ Progress = $ProgressPreference; Warning = $WarningPreference }
-# Silence ALL cmdlet progress banners (Disable-WindowsOptionalFeature, Remove-AppxProvisionedPackage,
-# Get-AppxPackage, Invoke-WebRequest, ...). Those blue "Running [ooooo]" bars sometimes fail to clear and
-# "stick" at the top of the console while the script keeps going underneath. We use our own [OK]/Done!
-# logging, not Write-Progress, so nothing is lost. (The per-call save/restore dances become redundant now.)
+# Cmdlet progress bars can stick at the top of the console.
 $ProgressPreference = 'SilentlyContinue'
 $script:DryRun               = [bool]$DryRun
 $script:Detailed             = [bool]$Detailed
 $script:NeedExplorerRestart  = $false
 $script:NeedIconCacheClear   = $false
-$script:Cancelled            = $false   # set by Show-Intro if the user answers "n" (avoids `exit`, which kills an iex host)
-$script:MachineType          = ''      # 'PC' or 'Laptop' - detected (or -Machine) before the run; a laptop skips the PC-only tweaks/apps
-$script:WarnCount            = 0       # WARN lines logged so far - a tweak that logs one is reported WARN, not OK
-$script:RunStarted           = $false  # past the intro -> Main's finally writes the summary (also after Ctrl+C)
-$script:RunFinished          = $false  # got to the end without being stopped
-$script:DotNet35Proc         = $null   # background DISM process for .NET 3.5 (started early, finished at the end)
-$script:NotSelected          = @{}     # apps taken off the window's list (winget ID / direct-app Name / vendor Id) - the install phase skips them
-$script:PnpIds               = $null   # every device's ID (PCI\VEN_..., USB\VID_...), read once per run - Get-PnpIds
-$script:DetectedWhy          = ''      # why the machine is a PC or a laptop, in words - for the log (Get-DetectedMachineType)
-$script:SettingsPagesHidden  = @()     # Settings pages hidden so far in this run (SettingsPageVisibility is one merged string)
-$script:ConsoleModeSaved     = $null   # console input mode before Set-QuickEdit turned QuickEdit off (put back at the end)
+$script:Cancelled            = $false   # set by Show-Intro on "n" (avoids `exit`, which kills an iex host)
+$script:MachineType          = ''      # 'PC' or 'Laptop'
+$script:WarnCount            = 0       # WARN lines so far - a tweak that logs one is WARN, not OK
+$script:RunStarted           = $false  # past the intro: Main's finally writes the summary
+$script:RunFinished          = $false
+$script:DotNet35Proc         = $null   # background DISM for .NET 3.5
+$script:NotSelected          = @{}     # apps taken off the window's list
+$script:PnpIds               = $null
+$script:DetectedWhy          = ''
+$script:SettingsPagesHidden  = @()     # see Add-SettingsPageHidden
+$script:ConsoleModeSaved     = $null   # before Set-QuickEdit (put back at the end)
 $script:Results              = [System.Collections.Generic.List[object]]::new()
-# The console view ("Rail", superuser's pick from the design page, 2026-09-28) - see Write-Ui
-$script:Version              = '1.9.0' # on the rail head and in the window's title bar - bumped with every release
-$script:Ui                   = -not $script:Detailed   # the console shows the rail; -Detailed puts the full log there instead
-# Cmdlets' own warnings would print straight onto the rail's live line (superuser's run, 2026-09-28: DISM's "WARNING:
-# Restart is suppressed because NoRestart is specified.") - off in the rail view; -Detailed shows the other cmdlet warnings
-# (that DISM one is switched off where it's called - the restart advice comes from the script itself).
+# The console view ("Rail") - see Write-Ui
+$script:Version              = '1.9.0' # bumped with every release
+$script:Ui                   = -not $script:Detailed
+# Cmdlets' own warnings would print onto the rail's live line.
 if ($script:Ui) { $WarningPreference = 'SilentlyContinue' }
 $script:UiLines              = [System.Collections.Generic.List[string]]::new()   # every rail line printed (the tests read it)
-$script:UiLive               = ''      # what the live line shows right now
+$script:UiLive               = ''
 $script:LiveOpen             = $false  # the live line is on the console without its newline yet
-$script:Live                 = $null   # the step running now: Name / What / Clock - Update-LiveTick redraws it with the time
-$script:UiNotes              = @{}     # tweak Id -> what came of it, for its Finishing line ('7 removed')
-$script:UiWarn               = @{}     # tweak Id -> why it is a WARN, in words (instead of "1 step(s) failed")
-$script:UiCount              = @{ Appx = 0; Svc = 0 }   # apps removed / services changed - for the tweak group lines
-$script:UiRemoved            = [System.Collections.Generic.List[string]]::new()   # old components removed (their labels)
-$script:ItemNote             = ''      # what an installer says about the app it just handled ('already installed', a skip reason)
-$script:ItemFail             = ''      # ... or why it failed ('winget exit code 0x8A150011')
-$script:RunClock             = $null   # started when the run starts ("Done in 19m 29s")
-$script:DotNet35Clock        = $null   # started with the .NET 3.5 download
-$script:AppsLabel            = ''      # "all 27 apps" / "24 of 27 apps" - on the machine line (Set-AppsLabel)
-$script:OpenActivation       = $false  # Windows is not activated and the window's box was left on: Settings > Activation opens
-$script:DriverHubReady       = $false  # ASUS DriverHub is on this PC (installed now or before) - its page opens at the end of the run
-$script:DriverHubOpened      = $false  # ... and the page did open (the summary says "open in the browser" only then)
+$script:Live                 = $null   # the step running now: Name / What / Clock
+$script:UiNotes              = @{}     # tweak Id -> what came of it ('7 removed')
+$script:UiWarn               = @{}     # tweak Id -> why it is a WARN
+$script:UiCount              = @{ Appx = 0; Svc = 0 }
+$script:UiRemoved            = [System.Collections.Generic.List[string]]::new()   # old components removed
+$script:ItemNote             = ''      # what an installer says about its app ('already installed')
+$script:ItemFail             = ''      # ... or why it failed
+$script:RunClock             = $null
+$script:DotNet35Clock        = $null
+$script:AppsLabel            = ''      # "all 27 apps" / "24 of 27 apps"
+$script:OpenActivation       = $false  # not activated, the window's box left on: Settings > Activation opens
+$script:DriverHubReady       = $false  # its page opens at the end of the run
+$script:DriverHubOpened      = $false
 $script:ProductKey           = 'YRDNX-JXTHQ-Q4H33-HMDMP-7CFDB'      # 'XXXXX-XXXXX-XXXXX-XXXXX-XXXXX'
-$script:LastPrompt           = ''      # the question on the console right now, as plain text
-# The window (variant A of the design page, superuser's pick 2026-09-28) - see Start-Gui. The run only FEEDS it.
-$script:ConsoleOnly          = [bool]$Console   # -Console: the rail in the console, no window
+$script:LastPrompt           = ''
+# The window - see Start-Gui. The run only FEEDS it.
+$script:ConsoleOnly          = [bool]$Console
 $script:Gui                  = $null   # while the window is open: @{ Shared; PowerShell; Runspace; Handle }
-$script:SetupPayload         = $null   # what the window's setup screen shows - gathered while the window starts (Start-Gui)
-$script:UiRow                = $null   # the row the last rail formatter built, for the window (Write-Ui sends it with its line)
-$script:UiPhase              = ''      # the phase the rail is in (Tweaks / Apps / .NET 3.5 / Finishing) - rows go under it
-$script:SummaryLine          = ''      # "Done in 19m 51s . 95 OK . 7 skipped . 0 failed" - for the console when the window closes
-$script:Relaunched           = [bool]$Relaunched   # this console was opened by the elevation relaunch, only for the run
-$script:ConsoleHidden        = $false  # the console is hidden behind the window (Set-ConsoleWindow)
+$script:SetupPayload         = $null
+$script:UiRow                = $null   # the row the last rail formatter built, for the window
+$script:UiPhase              = ''
+$script:SummaryLine          = ''      # for the console when the window closes
+$script:Relaunched           = [bool]$Relaunched
+$script:ConsoleHidden        = $false
 $script:MainEnded            = $false  # Main got to its end - or was stopped / cancelled; not an error
 $script:ExitWhenDone         = $false  # the run's own console closes at the very end (Exit-Console)
-$script:KeepAwake            = $false  # no sleep, the screen on - from Start until the run is over and its window closed (Set-KeepAwake)
-$script:LowEnd               = [bool]$LowEnd   # the "Low-end PC" box (or -LowEnd): the tweaks marked LowEnd run too
-$script:NeedRestart          = $false  # a change that takes effect only at the next start (numproc, the animations) - the end says "Restart"
-# Console glyphs - made at run time, so this file stays pure ASCII. Only characters Cascadia Mono AND Consolas have: the
-# old console (conhost) has no fallback font, so anything else (rounded corners, check marks, braille spinners) shows as a box.
+$script:KeepAwake            = $false
+$script:LowEnd               = [bool]$LowEnd
+$script:NeedRestart          = $false  # a change that takes effect only at the next start
+# Console glyphs, made at run time so this file stays ASCII. Only characters Cascadia Mono AND Consolas have:
+# conhost has no fallback font.
 $script:G = @{
     Top = [string][char]0x250C; Bar = [string][char]0x2502; Tee = [string][char]0x251C; End = [string][char]0x2514
     Rule = [string][char]0x2500; Ok = [string][char]0x221A; Dot = [string][char]0x00B7; Fail = [string][char]0x00D7
     Run = [string][char]0x25BA; Next = [string][char]0x203A; Full = [string][char]0x2588; Empty = [string][char]0x2591
     More = [string][char]0x2026; Dash = [string][char]0x2013
 }
-# Rail markup "{b:text}" -> console colour. Only the 16 console colours - they follow the terminal's colour scheme.
-# Blue is #3B78FF in Windows Terminal's default scheme - the MSUHost blue.
+# Rail markup "{b:text}" -> console colour. The 16 console colours follow the terminal's colour scheme.
 $script:UiColors = @{ d = 'DarkGray'; w = 'White'; b = 'Blue'; g = 'Green'; y = 'Yellow'; r = 'Red'; c = 'Cyan' }
 
-# --------------------------------------------------------------------------------------
-#  Bootstrap: elevation, HKU: drive, log file + transcript
-# --------------------------------------------------------------------------------------
-# Self-elevate to Administrator (the script edits HKLM + services). Works BOTH when run from a file
-# (.bat / -File) AND via the `irm <url> | iex` one-liner - in the one-liner case there is no local
-# file to re-run, so the script is saved to a file from its known raw URL and THAT file is relaunched.
+# ---- Bootstrap: elevation, HKU: drive, log file ----
+# Self-elevate. Via `irm | iex` there is no file: the script is saved from its raw URL and THAT file is relaunched.
 $SelfUrl = 'https://gitlab.msuhost.com/superuser/win11-tweaks/-/raw/main/Invoke-Win11Tweaks.ps1'
 $isAdmin = ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -151,7 +140,6 @@ if (-not $isAdmin) {
         $psExe = (Get-Process -Id $PID).Path
         if (-not $psExe) { $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" }
         if ($PSCommandPath) {
-            # running from a file -> relaunch the file elevated, forwarding the same parameters
             $scriptFile = $PSCommandPath
             $fwd = foreach ($k in $PSBoundParameters.Keys) {
                 $v = $PSBoundParameters[$k]
@@ -159,35 +147,30 @@ if (-not $isAdmin) {
                 else { "-$k"; ('"{0}"' -f $v) }
             }
         } else {
-            # running via `irm | iex` (no file) -> save the script to a file and relaunch THAT. NOT a new
-            # PowerShell with the download-and-run command on its command line: that's exactly what malware
-            # does, and Microsoft Defender's ML blocks it as a threat (typed at a prompt it's fine - spawned
-            # it isn't). Outside TEMP, which the "Temporary Files" tweak empties (all but its win11-tweaks log folder).
+            # Defender blocks a spawned PowerShell with download-and-run on its command line. Not in TEMP (gets emptied).
             $dir = Join-Path $env:LOCALAPPDATA 'win11-tweaks'
             $null = New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop
             $scriptFile = Join-Path $dir 'Invoke-Win11Tweaks.ps1'
             Invoke-WebRequest -Uri $SelfUrl -OutFile $scriptFile -UseBasicParsing -ErrorAction Stop
-            $fwd = @()   # (the log goes to %TEMP%\win11-tweaks - Get-DefaultLogDir)
+            $fwd = @()
         }
         $argList = @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-NoExit','-File',('"{0}"' -f $scriptFile)) + $fwd + @('-Relaunched')   # -NoLogo: the rail starts at the top
         Start-Process -FilePath $psExe -Verb RunAs -ArgumentList $argList
-        exit   # elevated instance launched -> close THIS original (non-admin) window
+        exit   # close this non-admin window
     } catch {
-        # the real reason: UAC answered "No", or the antivirus blocked it, or the download failed
         Write-Host ("Could not relaunch elevated: {0}" -f $_.Exception.Message) -ForegroundColor Red
         Write-Host "Open PowerShell as Administrator and run it there." -ForegroundColor Red
         return   # keep this window open so the message is visible
     }
 }
 
-# Some tweaks write under HKEY_USERS (e.g. NumLock -> HKU:\.Default); ensure the drive exists.
+# Some tweaks write under HKU:\.Default
 if (-not (Test-Path 'HKU:\')) {
     New-PSDrive -PSProvider Registry -Name HKU -Root HKEY_USERS -Scope Script -ErrorAction SilentlyContinue | Out-Null
 }
 
 function Clear-TempFolder {
-    # Everything in a temp folder goes - but our logs: %TEMP%\win11-tweaks (or win11-tweaks_* right in TEMP with
-    # -LogDir %TEMP%), this run's log among them
+    # all but our logs
     param([string]$Path)
     if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return }
     Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue |
@@ -196,8 +179,7 @@ function Clear-TempFolder {
 }
 
 function Get-DefaultLogDir {
-    # The logs: %TEMP%\win11-tweaks - out of the way, not on the Desktop (superuser, 2026-09-29). The Temporary Files
-    # tweak leaves that folder alone, so this run's log and the earlier ones stay. No TEMP: the Desktop.
+    # the Temporary Files tweak leaves %TEMP%\win11-tweaks alone
     if ($env:TEMP) { return (Join-Path $env:TEMP 'win11-tweaks') }
     return [Environment]::GetFolderPath('Desktop')
 }
@@ -206,15 +188,11 @@ try { New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction Stop | Out-
 catch { $LogDir = [Environment]::GetFolderPath('Desktop') }
 $script:LogFile = Join-Path $LogDir ("win11-tweaks_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 
-# Start the log file (full detail ALWAYS lands here; the console stays concise unless -Detailed).
 try { "win11-tweaks log  -  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" | Out-File -FilePath $script:LogFile -Encoding UTF8 -Force } catch { }
 
-# --------------------------------------------------------------------------------------
-#  Logging + primitive helpers (all DryRun-aware) - the apply engine
-# --------------------------------------------------------------------------------------
+# ---- Logging + primitive helpers (all DryRun-aware) ----
 function Write-Log {
-    # EVERY line goes to the LOG FILE (every level, with the [Id] tag). The console shows the rail instead (Write-Ui) -
-    # unless -Detailed, which puts the log itself on the console, DEBUG lines included (the tag is left out there).
+    # EVERY line goes to the log file; the console shows the rail (Write-Ui), or the log with -Detailed.
     param(
         [ValidateSet('DEBUG','INFO','OK','WARN','ERROR')][string]$Level = 'INFO',
         [Parameter(Mandatory)][string]$Message,
@@ -223,7 +201,7 @@ function Write-Log {
     $ts  = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
     $tag = if ($Id) { "[$Id] " } else { '' }
     try { Add-Content -Path $script:LogFile -Value ("{0} [{1,-5}] {2}{3}" -f $ts, $Level, $tag, $Message) -Encoding UTF8 -ErrorAction SilentlyContinue } catch { }
-    if ($Level -eq 'WARN') { $script:WarnCount++ }   # Invoke-Tweaks compares this before/after each tweak
+    if ($Level -eq 'WARN') { $script:WarnCount++ }
     if (-not $script:Detailed) { return }
     $color = switch ($Level) {
         'OK'    { 'Green' }
@@ -235,26 +213,20 @@ function Write-Log {
     Write-Host ("{0} [{1,-5}] {2}" -f $ts, $Level, $Message) -ForegroundColor $color
 }
 
-# --------------------------------------------------------------------------------------
-#  The console view ("Rail"): a rail down the left from the questions to the result - the tweaks as groups, one line
-#  per app with its time, .NET 3.5, Finishing, "Done in". The step running now is ONE live line, redrawn in place.
-#  Console only: the log file keeps every detail. Markup: "{b:text}" = text in console colour b ($script:UiColors).
-# --------------------------------------------------------------------------------------
+# ---- The console view ("Rail"): the step running now is ONE live line, redrawn in place ----
 function Get-UiWidth {
-    # The width a rail line may use: the window minus one (so it never wraps), at most 94. 94 where there's no window.
+    # the window minus one (so it never wraps), at most 94
     $w = 0; try { $w = [int]$Host.UI.RawUI.WindowSize.Width } catch { }
     if ($w -le 0) { return 94 }
     return [math]::Max(1, [math]::Min($w - 1, 94))
 }
 
 function Get-Visible {
-    # A rail line as it reads on the screen (the markup taken out)
     param([string]$Markup)
     return ($Markup -replace '\{[a-z]+:([^{}]*)\}', '$1')
 }
 
 function Get-Cut {
-    # $Text cut to $Max characters - ending in an ellipsis when it had to be cut
     param([string]$Text, [int]$Max)
     if ($Max -le 0) { return '' }
     if ($Text.Length -le $Max) { return $Text }
@@ -262,7 +234,7 @@ function Get-Cut {
 }
 
 function Format-Span {
-    # 30ms / 4.3s / 31s / 1m 50s - in the invariant culture: a Bulgarian Windows would write 4,3s
+    # 30ms / 4.3s / 1m 50s - invariant culture (a Bulgarian Windows writes 4,3s)
     param([double]$Seconds)
     $inv = [Globalization.CultureInfo]::InvariantCulture
     if ($Seconds -lt 1) { return [string]::Format($inv, '{0}ms', [math]::Max(1, [int][math]::Round($Seconds * 1000))) }
@@ -273,7 +245,6 @@ function Format-Span {
 }
 
 function Write-Markup {
-    # Print rail markup: "{b:text}" in console colour b, everything else in the console's own colour
     param([string]$Markup, [switch]$NoNewline)
     if (Test-ConsoleQuiet) { return }   # the window shows the run
     $pos = 0
@@ -288,13 +259,11 @@ function Write-Markup {
 }
 
 function Test-LiveConsole {
-    # Can a line be redrawn in place here? Not when the output goes to a pipe or a file (SSH, a transcript) - every
-    # redraw would land there as a line of its own.
+    # not into a pipe or a file (SSH) - every redraw would land there as a line
     try { return -not [Console]::IsOutputRedirected } catch { return $false }
 }
 
 function Clear-Live {
-    # Wipe the live line so the next line starts clean
     if (-not $script:LiveOpen) { return }
     $script:LiveOpen = $false
     if (Test-ConsoleQuiet) { return }
@@ -302,8 +271,7 @@ function Clear-Live {
 }
 
 function Write-Ui {
-    # One line of the rail. -Always: with -Detailed too (the rail head and the questions). A row a formatter built with a
-    # status (Format-Row -Status) goes to the window as well - under the phase the rail is in.
+    # -Always: with -Detailed too. A Format-Row -Status row goes to the window as well.
     param([string]$Markup = '', [switch]$Always)
     if (-not ($script:Ui -or $Always)) { return }
     Clear-Live
@@ -317,9 +285,7 @@ function Write-Ui {
 }
 
 function Resume-Console {
-    # The window went by itself (it failed): the console takes over - shown again, with the rail so far, once. From
-    # Write-Ui AND Show-Live (a long step - the .NET 3.5 wait - only redraws its live line), and from Wait-GuiClose when
-    # it went after the run (the rail then ends with the summary).
+    # the window failed: the console comes back with the rail so far, once
     if (-not ($script:Gui -and $script:Gui.Shared.Closed -and -not $script:Gui.Replayed)) { return }
     $script:Gui.Replayed = $true
     Set-ConsoleWindow -Show
@@ -327,8 +293,7 @@ function Resume-Console {
 }
 
 function Show-Live {
-    # The live line: the step running now, redrawn in place on ONE console line (padded, so a shorter text leaves
-    # nothing of the longer one behind)
+    # padded, so a shorter text leaves nothing of the longer one behind
     param([string]$Markup)
     if (-not $script:Ui) { return }
     Resume-Console
@@ -345,8 +310,7 @@ function Show-Live {
 }
 
 function Format-Row {
-    # "  |  <glyph> <Name padded>  <text, cut to fit>  <right, flush with the right edge>" - $Glyph is markup.
-    # -Status (with -Warn): a result row - kept for the window too, whole (not cut to the console), see Write-Ui.
+    # "  |  <glyph> <Name>  <text>  <right>". -Status: a result row, also kept whole for the window (Write-Ui).
     param([string]$Glyph, [string]$Name, [string]$Text = '', [string]$TextColor = 'd', [string]$Right = '',
           [string]$RightColor = 'd', [int]$NameWidth = 18, [string]$Status = '', [switch]$Warn)
     $plain = { param($s) ([string]$s) -replace '\{', '(' -replace '\}', ')' }   # braces would break the markup
@@ -369,7 +333,6 @@ function Format-Row {
 }
 
 function Get-Glyph {
-    # the status glyph, in its colour
     param([string]$Status, [switch]$Warn)
     switch ($Status) {
         'OK'     { if ($Warn) { return '{y:!}' }; return "{g:$($script:G.Ok)}" }
@@ -380,14 +343,12 @@ function Get-Glyph {
 }
 
 function Format-Blocks {
-    # a bar of $Width blocks, $Done of $Total filled (superuser's services bar, on the rail)
     param([int]$Done, [int]$Total, [int]$Width = 20)
     $f = [int][math]::Floor($Width * $Done / [math]::Max($Total, 1))
     return "{b:$($script:G.Full * $f)}{d:$($script:G.Empty * ($Width - $f))}"
 }
 
 function Write-UiPhase {
-    # "  |" then "  |- Name" - the start of a phase on the rail (and in the window)
     param([string]$Name, [string]$Rest = '')
     $script:UiPhase = $Name
     Send-GuiEvent 'phase' @{ Name = $Name }
@@ -396,16 +357,13 @@ function Write-UiPhase {
 }
 
 function Show-LiveText {
-    # a live line that is just a text: "  |  > restarting Explorer"
     param([string]$Text)
     Send-GuiEvent 'live' @{ Name = $Text; What = ''; Clock = $false }
     Show-Live (Format-Row -Glyph "{b:$($script:G.Run)}" -Name $Text -NameWidth 60)
 }
 
 function Start-LiveItem {
-    # The live line for one step: "  |  > Name   what   mm:ss" - its clock ticks while Update-LiveTick is called.
-    # -NoClock while something blocks the script (a download, Start-Process -Wait): a clock stuck at 00:00 looks hung.
-    # (The window keeps its own clock - it is not blocked.)
+    # -NoClock while something blocks the script (a download, Start-Process -Wait): a clock stuck at 00:00 looks hung
     param([string]$Name, [string]$What = '', [switch]$NoClock)
     $script:Live = @{ Name = $Name; What = $What; Clock = [System.Diagnostics.Stopwatch]::StartNew(); ShowClock = -not $NoClock }
     Send-GuiEvent 'live' @{ Name = $Name; What = $What; Clock = $true }
@@ -418,7 +376,6 @@ function Set-LiveWhat {
 }
 
 function Update-LiveTick {
-    # redraw the live step with its clock (about once a second while an installer runs)
     if (-not $script:Live) { return }
     $s = [int][math]::Floor($script:Live.Clock.Elapsed.TotalSeconds)
     $clock = if ($script:Live.ShowClock) { '{0:00}:{1:00}' -f [math]::Floor($s / 60), ($s % 60) } else { '' }
@@ -426,7 +383,7 @@ function Update-LiveTick {
 }
 
 function Stop-LiveItem {
-    # how long the live step took (seconds; -1 if there was none)
+    # seconds the live step took (-1: none)
     $s = if ($script:Live) { $script:Live.Clock.Elapsed.TotalSeconds } else { -1 }
     if ($script:Live) { Send-GuiEvent 'live-end' }
     $script:Live = $null
@@ -440,15 +397,13 @@ function Get-ShortName {
 }
 
 function Set-UiNote {
-    # what came of a tweak, for its line on the rail ('7 removed', '64 Hz, already the highest'). -Warn: why it is
-    # a WARN, in words - it replaces the generic "1 step(s) failed" on the rail and in the summary.
+    # what came of a tweak ('7 removed'); -Warn: why it is a WARN
     param([string]$Id, [string]$Text, [switch]$Warn)
     if ($Warn) { $script:UiWarn[$Id] = $Text } else { $script:UiNotes[$Id] = $Text }
 }
 
 function Read-Answer {
-    # A question on ONE line: the prompt (markup), then the answer typed right after it. Read-Host gets no prompt of its
-    # own, so Windows PowerShell adds no ": ". Returns $null when there's no keyboard (input redirected).
+    # Read-Host gets no prompt, so PowerShell adds no ": ". $null when there's no keyboard.
     param([string]$Prompt)
     Clear-Live
     $script:LastPrompt = Get-Visible $Prompt
@@ -460,9 +415,7 @@ function Read-Answer {
 }
 
 function Set-Reg {
-    # -Guarded: a value Windows may guard (UCPD, the UserChoice Protection Driver, refuses PowerShell some Widgets / Search
-    # values - "Attempted to perform an unauthorized operation" on superuser's Razer, 2026-09-30): refused there = logged,
-    # not a WARN - the tweak has another way to its goal. Any other refusal is still a WARN.
+    # -Guarded: a value UCPD (UserChoice Protection Driver) may refuse - then logged, not a WARN (the tweak has another way).
     param([string]$Path, [string]$Name, [string]$Type, [string]$Value, [string]$Id = '', [switch]$Guarded)
     if ($script:DryRun) {
         if ($Value -eq '<RemoveEntry>') { Write-Log DEBUG "[DRYRUN] would remove $Path\$Name" $Id }
@@ -492,16 +445,16 @@ function Set-Reg {
 }
 
 function ConvertTo-RegBinary {
-    # '90,12,03,80' (hex bytes, the way regedit shows them) -> the bytes a REG_BINARY value takes
+    # '90,12,03,80' (hex, as regedit shows it) -> REG_BINARY bytes
     param([string]$Hex)
-    return , [byte[]]@($Hex -split ',' | Where-Object { $_.Trim() } | ForEach-Object { [Convert]::ToByte($_.Trim(), 16) })   # (one array, not its bytes one by one)
+    return , [byte[]]@($Hex -split ',' | Where-Object { $_.Trim() } | ForEach-Object { [Convert]::ToByte($_.Trim(), 16) })   # one array, not its bytes
 }
 
 function Set-Svc {
     param([string]$Name, [string]$StartupType, [string]$OriginalType, [string]$Id = '')
     if ($StartupType -eq 'Disable') { $StartupType = 'Disabled' }   # the manifest ships "Disable" for lfsvc
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
-    # not a failure: the service doesn't exist on this edition (e.g. CscService on Home) - nothing to change
+    # not on this edition (e.g. CscService on Home): not a failure
     if (-not $svc) { Write-Log DEBUG "service $Name not present on this system; skipping" $Id; return }
     if ($OriginalType -and ($svc.StartType.ToString() -ne $OriginalType)) {
         Write-Log DEBUG "service $Name already customized (is $($svc.StartType), expected $OriginalType); leaving as-is" $Id
@@ -518,8 +471,7 @@ function Set-Svc {
 }
 
 function Remove-Appx {
-    # Remove a Store app for every user + its provisioned copy (so new accounts don't get it). $Name may hold
-    # wildcards. Checked afterwards: a package Windows kept is a WARN, not a silent "removed".
+    # For every user + the provisioned copy (new accounts). A package Windows kept is a WARN, not a silent "removed".
     param([string]$Name, [string]$Id = '')
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would remove appx '$Name' (+ provisioned)" $Id; return }
     try {
@@ -536,13 +488,11 @@ function Remove-Appx {
 }
 
 function Get-RegValue {
-    # One registry value, or $null when the key or value isn't there.
     param([string]$Path, [string]$Name)
     try { return (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop).$Name } catch { return $null }
 }
 
 function Remove-RegKey {
-    # Delete a registry key with everything under it (DryRun-aware; a missing key is fine).
     param([string]$Path, [string]$Id = '')
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would delete $Path" $Id; return }
     if (-not (Test-Path -LiteralPath $Path)) { Write-Log DEBUG "$Path not there - nothing to delete" $Id; return }
@@ -551,9 +501,8 @@ function Remove-RegKey {
 }
 
 function Add-SettingsPageHidden {
-    # Hide one Settings page with the machine policy SettingsPageVisibility. It is ONE string for every page
-    # ("hide:aicomponents;home"), so this merges: the pages already listed + the ones hidden earlier in this run
-    # (in a DryRun nothing is written in between) + this one. A "showonly:" list is someone else's policy - left alone.
+    # SettingsPageVisibility is ONE string ("hide:a;b"): merged with what is there and what this run hid (DryRun writes
+    # nothing). A "showonly:" list is left alone.
     param([string]$Page, [string]$Id = '')
     $path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'
     $cur = [string](Get-RegValue -Path $path -Name 'SettingsPageVisibility')
@@ -570,8 +519,7 @@ function Add-SettingsPageHidden {
 }
 
 function Remove-WinCapability {
-    # Remove an optional Windows capability ("Name~~~~version") if it is installed. They come back from
-    # Settings > System > Optional features. Logged at INFO: each one takes a while and the console must not look stuck.
+    # Logged at INFO: each one takes a while and the console must not look stuck
     param([string]$Name, [string]$Label, [string]$Id = '')
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would remove capability $Name ($Label)" $Id; return }
     try {
@@ -586,7 +534,6 @@ function Remove-WinCapability {
 }
 
 function Disable-WinFeature {
-    # Turn a Windows optional feature off (like "Turn Windows features on or off"), if it is on. No reboot.
     param([string]$Name, [string]$Label, [string]$Id = '')
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would disable feature $Name ($Label)" $Id; return }
     try {
@@ -594,7 +541,7 @@ function Disable-WinFeature {
         if (-not $f -or "$($f.State)" -ne 'Enabled') { Write-Log DEBUG "$Label not enabled - nothing to do" $Id; return }
         Write-Log INFO "removing $Label" $Id
         Set-LiveWhat $Label
-        $null = Disable-WindowsOptionalFeature -Online -FeatureName $Name -NoRestart -ErrorAction Stop -WarningAction SilentlyContinue   # "restart suppressed" - the rail ends with "Restart the PC" anyway
+        $null = Disable-WindowsOptionalFeature -Online -FeatureName $Name -NoRestart -ErrorAction Stop -WarningAction SilentlyContinue   # the run says "Restart" itself
         Write-Log DEBUG "disabled $Label" $Id
         $base = $Label -replace '\s*\(feature\)$', ''   # WMP Legacy is a capability AND a feature - one component
         if (-not $script:UiRemoved.Contains($base)) { $script:UiRemoved.Add($base) }
@@ -602,31 +549,26 @@ function Disable-WinFeature {
 }
 
 function Test-RestartPending {
-    # Windows servicing waits for a restart (a removed component, .NET 3.5 held back, a Windows update): those
-    # changes complete only at a restart - a sign-out is not enough.
+    # servicing waits for a restart - a sign-out is not enough
     Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
 }
 
 function Get-InstalledPrograms {
-    # DisplayName of every desktop program in Add/Remove Programs (machine 64/32-bit + this user).
     $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
             'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
     foreach ($k in $keys) { Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName } | ForEach-Object { [string]$_.DisplayName } }
 }
 
 function Get-DefaultProfilePath {
-    # The profile new accounts are copied from (normally C:\Users\Default).
+    # the profile new accounts are copied from
     $p = Get-RegValue -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -Name 'Default'
     if ($p) { return [Environment]::ExpandEnvironmentVariables([string]$p) }
     return (Join-Path $env:SystemDrive 'Users\Default')
 }
 
 function Clear-StartPins {
-    # A fresh Windows pins ads to Start (Spotify, LinkedIn, games...) that install on click. Replace the Start layout
-    # (start2.bin) with an empty one - for this user and for accounts created later (Default profile) - then restart
-    # Start so it reads the file. ONCE per profile: the old file is saved as start2.bin.win11-tweaks.bak (an empty
-    # .bak if there was none), and a profile that has that file already is left alone - a re-run must not wipe
-    # the pins the user made since.
+    # An empty Start layout (start2.bin) for this user and the Default profile - ONCE: a .bak there means a re-run, which
+    # keeps the user's pins.
     param([string]$Id = '')
     $local = 'Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\LocalState'
     $dirs = @((Join-Path $env:LOCALAPPDATA $local), (Join-Path (Get-DefaultProfilePath) "AppData\Local\$local"))
@@ -642,12 +584,12 @@ function Clear-StartPins {
         Write-Log DEBUG "empty Start layout written to $bin (the old one: $bak)" $Id
         $changed++
     }
-    # killed, not closed: a clean exit could save the old layout from memory over the new file. Windows restarts it.
+    # killed, not closed: a clean exit could save the old layout over the new file
     if ($changed) { Get-Process StartMenuExperienceHost -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
 }
 
 function New-ThisPcShortcut {
-    # "This PC" as a shortcut the taskbar layout can pin (explorer.exe shell:MyComputerFolder, the This PC icon)
+    # a shortcut the taskbar layout can pin
     param([string]$Path)
     $wsh = New-Object -ComObject WScript.Shell; $sc = $wsh.CreateShortcut($Path)
     $sc.TargetPath = Join-Path $env:SystemRoot 'explorer.exe'; $sc.Arguments = 'shell:MyComputerFolder'
@@ -655,13 +597,11 @@ function New-ThisPcShortcut {
 }
 
 function Get-TaskbarLayoutPolicy {
-    # this user's Start Layout policy as it is now (StartLayoutFile / LockedStartLayout), $null if there is none
     Get-ItemProperty -LiteralPath 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' -ErrorAction SilentlyContinue
 }
 
 function Test-PinGenerationSupported {
-    # PinGeneration (a pin the user takes off stays off) came with 24H2 KB5060829 (26100.4484) and 22H2 / 23H2 KB5060826
-    # (2262x.5549); 25H2 has it. Microsoft: a Windows without it does not apply a layout that has it.
+    # PinGeneration came with 26100.4484 / 2262x.5549; a Windows without it does not apply a layout that has it
     $cv = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
     $build = [int]$cv.CurrentBuild; $ubr = [int]$cv.UBR
     if ($build -gt 26100) { return $true }
@@ -671,9 +611,7 @@ function Test-PinGenerationSupported {
 }
 
 function Get-TaskbarLayoutXml {
-    # Windows' own taskbar layout (Microsoft Learn: "Configure the Windows taskbar pinned apps with policy settings").
-    # Replace: the pins Windows comes with go - File Explorer stays because it is in the list. -PinGeneration (24H2 /
-    # 25H2): a pin the user takes off stays off (without it Windows could pin it again when the layout changes).
+    # Replace: Windows' pins go. -PinGeneration: a pin the user takes off stays off (else it could come back).
     param([string[]]$LinkPaths, [switch]$PinGeneration)
     $gen = if ($PinGeneration) { ' PinGeneration="1"' } else { '' }
     $pins = @(('        <taskbar:DesktopApp DesktopApplicationID="Microsoft.Windows.Explorer"{0}/>' -f $gen))
@@ -685,16 +623,8 @@ function Get-TaskbarLayoutXml {
 }
 
 function Set-TaskbarLayout {
-    # The taskbar (superuser): File Explorer, This PC and the browsers picked pinned, the pins Windows comes with gone -
-    # through Windows' own taskbar layout: this user's Start Layout policy (StartLayoutFile + LockedStartLayout = what the
-    # Group Policy "Start Layout" writes) points at our XML in %LOCALAPPDATA%\win11-tweaks; Explorer applies it when it starts.
-    # Until 1.8.0 a helper wrote the taskbar's own registry data instead, and Windows threw ALL pins away at the next
-    # restart (superuser 2026-10-02; on VM 102 into User Pinned\TaskBar\Tombstones). Verified on VM 102 (25H2): applied at
-    # the Explorer restart, kept over a forced restart, a pin the user takes off stays off, "Pin to Start" still there.
-    # An unchanged layout is left alone: a re-run keeps what the user changed since.
-    # The browsers (superuser, 2026-10-12): Chrome, Brave or both - each only when it was picked in this run (Chrome too, not
-    # just when it is there) AND is installed (its setup may have failed). One this script pinned the last time stays while
-    # it is installed, picked or not: a re-run with the window's defaults must not swap Brave back for Chrome.
+    # Via this user's Start Layout policy, not the taskbar's own registry data (Windows drops those pins at the next
+    # restart). A browser: picked AND installed; one pinned last time stays (a re-run must not swap Brave for Chrome).
     param([string]$Id = '')
     if (-not $env:LOCALAPPDATA -or -not $env:SystemRoot) { throw 'LOCALAPPDATA / SystemRoot not set' }
     $dir = Join-Path $env:LOCALAPPDATA 'win11-tweaks'
@@ -708,7 +638,7 @@ function Set-TaskbarLayout {
     foreach ($b in @(@{ Key = 'Google Chrome'; Name = 'Google Chrome'; Link = 'Google Chrome.lnk' }, @{ Key = 'Brave.Brave'; Name = 'Brave'; Link = 'Brave.lnk' })) {
         if (-not $programs) { break }
         $lnk = Join-Path $programs $b.Link
-        if (-not (Test-Path -LiteralPath $lnk)) { continue }   # not installed (or its setup failed)
+        if (-not (Test-Path -LiteralPath $lnk)) { continue }
         $picked = -not ($script:NotSelected -and $script:NotSelected.ContainsKey($b.Key))
         $before = $old.Contains('"' + [Security.SecurityElement]::Escape($lnk) + '"')   # in the layout of the last run
         if ($picked -or $before) { $links += $lnk; $names += $b.Name }
@@ -723,13 +653,12 @@ function Set-TaskbarLayout {
         $changed = $true
     }
     Set-UiNote $Id ($names -join ', ')
-    if ($changed) { Update-Explorer -Action restart }   # Explorer reads the layout when it starts
+    if ($changed) { Update-Explorer -Action restart }   # Explorer reads it when it starts
     else { Write-Log DEBUG 'taskbar layout unchanged - left as it is (what the user changed since stays)' $Id }
 }
 
 function ConvertTo-CursorTheme {
-    # The text of a theme of ours from the Windows (dark) theme's: its own name, and its [Control Panel\Cursors] section
-    # replaced by the cursors in $Cursors (no section - one is added). Everything else (wallpaper, dark mode, sounds) stays.
+    # the Windows (dark) theme's text with our name and [Control Panel\Cursors]
     param([string]$Text, $Cursors)
     $c = $Cursors; $rel = '%SystemRoot%\Cursors\' + $c.Dir + '\'
     $sec = (@('[Control Panel\Cursors]') + @(@($c.Roles.Keys) | ForEach-Object { '{0}={1}{2}' -f $_, $rel, $c.Roles[$_] }) + @("DefaultValue=$($c.Scheme)", '', '')) -join "`r`n"
@@ -740,7 +669,7 @@ function ConvertTo-CursorTheme {
 }
 
 function Update-CursorsNow {
-    # Windows loads this user's pointers from the registry again (SPI_SETCURSORS) - the pointer changes at once
+    # SPI_SETCURSORS: the pointer changes at once
     if (-not ([System.Management.Automation.PSTypeName]'Native.Wp').Type) {
         Add-Type -Namespace Native -Name Wp -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)] public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);'
     }
@@ -748,12 +677,8 @@ function Update-CursorsNow {
 }
 
 function Set-CursorTheme {
-    # The mouse pointer (superuser, 2026-10-12): Windows 11 Cursors Concept (light) for this user - the files in
-    # %SystemRoot%\Cursors\<Dir>, the scheme (Mouse Properties > Pointers lists it), every pointer - and a theme of ours as
-    # the current theme: the Windows (dark) theme with these cursors in it (%LOCALAPPDATA%\Microsoft\Windows\Themes), so
-    # Settings > Personalization > Themes shows it and picking it again keeps the pointer (picking Windows (dark) itself
-    # would put Windows' own back). The files come from assets\ next to the script (the release ZIP) or from the repo; only
-    # a zip with the SHA-256 in $script:Cursors is used. A re-run: the files are there - nothing downloaded.
+    # The cursors, their scheme, and a theme of ours as the current theme (picking it again keeps the pointer).
+    # The zip from assets\ or the repo - only with the SHA-256 in $script:Cursors.
     param([string]$Id = '', [string]$From = $(if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { '' }), [string]$Root = $env:SystemRoot)
     if (-not $Root -or -not $env:LOCALAPPDATA -or -not $env:TEMP) { throw 'SystemRoot / LOCALAPPDATA / TEMP not set' }
     $c = $script:Cursors
@@ -770,7 +695,7 @@ function Set-CursorTheme {
                 Save-Download -Url $c.Url -OutFile $zip
                 $h = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
                 if ($h -ne $c.Sha256) { throw "the cursors download is not the expected file (SHA-256 $h)" }
-            } catch { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue; throw }   # no part left in TEMP
+            } catch { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue; throw }
         }
         try {
             $null = New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop
@@ -787,7 +712,7 @@ function Set-CursorTheme {
     Set-Reg -Id $Id -Path $k -Name 'Scheme Source' -Type DWord -Value '1'   # 1 = a scheme of this user's
     Update-CursorsNow
     $src = Join-Path $Root 'resources\Themes\dark.theme'
-    if (-not (Test-Path -LiteralPath $src)) {   # (CustomSpotlightOff then left the light Bloom - no theme of ours on top)
+    if (-not (Test-Path -LiteralPath $src)) {
         Write-Log DEBUG 'no Windows (dark) theme here - the cursors without a theme of ours' $Id
         Set-UiNote $Id 'MSUHost Cursors'; return
     }
@@ -872,9 +797,7 @@ namespace W11T3 {
 }
 
 function Get-MonitorLinks {
-    # How each monitor is connected, from WMI: monitor instance ("DISPLAY\MSI3CB1\5&2E2A4B5&0&UID4353") -> 'DisplayPort',
-    # 'HDMI', 'DVI', 'VGA', 'internal' or 'other'. (USB-C DisplayPort alt mode counts as DisplayPort; a screen tunnelled
-    # through USB4 / Thunderbolt reports another type and is only logged.)
+    # WMI monitor instance -> how it is connected (USB-C alt mode counts as DisplayPort)
     $map = @{}
     foreach ($c in @(Get-CimInstance -Namespace 'root\wmi' -ClassName 'WmiMonitorConnectionParams' -ErrorAction SilentlyContinue)) {
         $link = switch ([int64]$c.VideoOutputTechnology) { 10 { 'DisplayPort' } 11 { 'DisplayPort' } 5 { 'HDMI' } 4 { 'DVI' } 0 { 'VGA' } 2147483648 { 'internal' } default { 'other' } }
@@ -884,13 +807,11 @@ function Get-MonitorLinks {
 }
 
 function Get-DisplayRates {
-    # Every screen on the desktop: device, monitor name, current Hz, highest Hz Windows offers at the current resolution,
-    # and how it is connected (Link).
     Initialize-NativeW11T
     $links = Get-MonitorLinks
     foreach ($l in [W11T3.Display]::List()) {
         $p = $l -split '\|'
-        # interface path "\\?\DISPLAY#MSI3CB1#5&2e2a4b5&0&UID4353#{e6f07b5f-...}" -> WMI instance "DISPLAY\MSI3CB1\5&2E2A4B5&0&UID4353"
+        # interface path "\\?\DISPLAY#MSI3CB1#5&2e2a...#{guid}" -> WMI instance "DISPLAY\MSI3CB1\5&2E2A..."
         $key = (($p[4] -replace '^\\\\\?\\', '') -replace '#\{[^}]*\}$', '' -replace '#', '\').ToUpperInvariant()
         $link = if ($key -and $links.ContainsKey($key)) { $links[$key] } else { 'unknown' }
         [pscustomobject]@{ Device = $p[0]; Name = $p[1]; Hz = [int]$p[2]; MaxHz = [int]$p[3]; Link = $link }
@@ -898,30 +819,28 @@ function Get-DisplayRates {
 }
 
 function Set-DisplayRate {
-    # One screen to $Hz (tested, then saved); returns Windows' DISP_CHANGE code (0 = done, 1 = after a restart).
+    # DISP_CHANGE code: 0 = done, 1 = after a restart
     param([string]$Device, [int]$Hz)
     Initialize-NativeW11T
     return [W11T3.Display]::SetRate($Device, $Hz)
 }
 
 function Test-ScreenLocked {
-    # The lock screen is up (Win+L) in this session - Windows then refuses display changes from the desktop.
+    # Windows refuses display changes while the lock screen is up
     $me = (Get-Process -Id $PID).SessionId
     return [bool](Get-Process LogonUI -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $me })
 }
 
 function Set-MaxRefreshRate {
-    # A 144 / 165 Hz monitor often comes set to 60 Hz: every screen to the highest refresh rate Windows offers for it at
-    # its current resolution (only modes the monitor reports; each switch is tested before it is saved). DisplayPort
-    # only: over HDMI an older cable, a KVM or an adapter can fail at a rate Windows lists - the screen goes black and
-    # nobody is there to put it back - so an HDMI screen is only logged with what it could do.
+    # DisplayPort only: over HDMI an old cable / KVM / adapter can fail at a listed rate - a black screen with nobody
+    # there to put it back. An HDMI screen is only logged.
     param([string]$Id = '')
     if (Test-ScreenLocked) {
         Write-Log WARN 'Refresh rate not changed: the screen was locked - run the script again at an unlocked screen, or set it in Settings > Display > Advanced display' $Id
         Set-UiNote $Id 'screen was locked, not changed - run again at an unlocked screen' -Warn
         return
     }
-    $notes = [System.Collections.Generic.List[string]]::new()   # one per screen, for the Finishing line
+    $notes = [System.Collections.Generic.List[string]]::new()
     foreach ($d in @(Get-DisplayRates)) {
         $label = if ($d.Name) { $d.Name } else { $d.Device }
         if ($d.MaxHz -le $d.Hz) {
@@ -943,8 +862,7 @@ function Set-MaxRefreshRate {
 }
 
 function Find-PowerPlan {
-    # A plan this script made on an earlier run: the GUID remembered under $script:StateKey (works in every Windows
-    # language, and for a plan powercfg -list doesn't show), else a plan listed with exactly this name.
+    # the GUID remembered under $script:StateKey (any language), else a plan with exactly this name
     param([string]$StateName, [string]$Name)
     $g = [string](Get-RegValue -Path $script:StateKey -Name $StateName)
     if ($g) { $null = powercfg -query $g 2>&1; if ($LASTEXITCODE -eq 0) { return $g } }
@@ -956,7 +874,6 @@ function Find-PowerPlan {
 }
 
 function New-PowerPlanCopy {
-    # powercfg -duplicatescheme: the NEW plan's GUID, or $null when Windows refuses.
     param([string]$From)
     $out = (powercfg -duplicatescheme $From 2>&1 | Out-String)
     if ($LASTEXITCODE -ne 0) { return $null }
@@ -966,15 +883,13 @@ function New-PowerPlanCopy {
 }
 
 function Set-BalancedForX3D {
-    # A dual-CCD Ryzen X3D keeps (or gets back) the Balanced plan - see Test-DualCcdX3D.
+    # see Test-DualCcdX3D
     param([string]$Id = '')
     $null = powercfg -setactive '381b4222-f694-41f0-9685-ff5bb260df2e'
     Write-Log INFO "Ryzen X3D with two CCDs: the Balanced plan stays - AMD's V-Cache driver needs its core parking to keep games on the V-Cache CCD (Ultimate would switch that off)" $Id
 }
 
 function Set-PcPowerPlan {
-    # PC: the Ultimate Performance plan, active. The copy made on an earlier run is reused - remembered by GUID, so it is
-    # found in any Windows language (the English name is the fallback for copies made by older versions).
     param([string]$Id = '')
     if (Test-DualCcdX3D) { Set-BalancedForX3D -Id $Id; return }
     $ultimate = 'e9a42b02-d5df-448d-aa00-03f14749eb61'
@@ -987,13 +902,12 @@ function Set-PcPowerPlan {
 }
 
 function Reset-LaptopPowerPlan {
-    # Laptop (superuser, 2026-09-30): the power plan is Windows' own. 1.6 and 1.7 gave a laptop their plan "Ultimate +
-    # Balanced on battery" (remembered as LaptopPowerPlan): if it is the active one, Balanced is back; the plan is deleted.
+    # Deletes the laptop plan older versions made; if it was active, Balanced is back.
     param([string]$Id = '')
     $balanced = '381b4222-f694-41f0-9685-ff5bb260df2e'
     $guid = Find-PowerPlan -StateName 'LaptopPowerPlan' -Name 'Ultimate + Balanced on battery'
     if (-not $guid) {
-        if ($null -ne (Get-RegValue -Path $script:StateKey -Name 'LaptopPowerPlan')) {   # remembered, but the plan is gone already
+        if ($null -ne (Get-RegValue -Path $script:StateKey -Name 'LaptopPowerPlan')) {   # remembered, the plan gone
             Set-Reg -Id $Id -Path $script:StateKey -Name 'LaptopPowerPlan' -Type String -Value '<RemoveEntry>'
         }
         Write-Log DEBUG 'no power plan from an earlier version - the plan stays as it is' $Id; return
@@ -1009,10 +923,7 @@ function Reset-LaptopPowerPlan {
 }
 
 function Set-BootProcessors {
-    # Low-end PC (superuser, 2026-10-09): msconfig > Boot > Advanced options > "Number of processors" at its highest =
-    # bcdedit's numproc with every logical processor this PC has. (Windows uses them all without it too; a CPU with more
-    # cores later stays at this count until the next run with Low-end or msconfig's box is cleared. BitLocker does not
-    # check numproc - no recovery screen at the next start.)
+    # msconfig's "Number of processors" at its highest. BitLocker does not check numproc - no recovery screen.
     param([string]$Id = '')
     $n = [int](@(Get-CimInstance Win32_ComputerSystem -Property NumberOfLogicalProcessors -ErrorAction Stop)[0].NumberOfLogicalProcessors)
     if ($n -lt 1) { throw 'the number of processors is unknown' }
@@ -1024,8 +935,7 @@ function Set-BootProcessors {
 }
 
 function Set-DefenderLight {
-    # Low-end PC: Microsoft Defender's scheduled scans at low priority and on at most 20% CPU (Windows' default: 50) - the
-    # same protection, a scan just takes longer. Another antivirus in charge (Defender off or passive): nothing to change.
+    # scheduled scans at low priority, at most 20% CPU (default 50); another antivirus in charge: left
     param([string]$Id = '')
     $other = { Write-Log INFO 'Defender is not the antivirus in charge here - its scans left as they are' $Id; Set-UiNote -Id $Id -Text 'another antivirus is in charge - left' }
     if (-not (Get-Command Set-MpPreference -ErrorAction SilentlyContinue)) { & $other; return }
@@ -1040,14 +950,12 @@ function Set-DefenderLight {
 }
 
 function Test-OnAcPower {
-    # on the charger now (a desktop: always)
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
     return "$([System.Windows.Forms.SystemInformation]::PowerStatus.PowerLineStatus)" -ne 'Offline'
 }
 
 function Set-PowerOverlay {
-    # Settings > System > Power > Power mode, through Windows' own call (the registry values behind it are Windows'
-    # alone - refused even to an admin). 0 = done.
+    # Power mode via Windows' own call - the registry values behind it are refused even to an admin. 0 = done.
     param([guid]$Guid)
     if (-not ('W11TP.Power' -as [type])) {
         Add-Type -Namespace W11TP -Name Power -ErrorAction Stop -MemberDefinition '[System.Runtime.InteropServices.DllImport("powrprof.dll")] public static extern uint PowerSetActiveOverlayScheme(System.Guid g);'
@@ -1056,9 +964,7 @@ function Set-PowerOverlay {
 }
 
 function Set-PowerModeBest {
-    # Low-end laptop (superuser, 2026-10-09): Power mode "Best performance" when plugged in - on battery Windows keeps its
-    # own. Windows has one mode for plugged in and one for battery and sets the one for the power it is on: only on the
-    # charger (a run usually is); on battery it is left, and the note says where to set it.
+    # Windows sets the mode of the power it is on - so only on the charger
     param([string]$Id = '')
     if (-not (Test-OnAcPower)) {
         Write-Log INFO 'on battery now - the power mode is left; plugged in: Settings > System > Power > Power mode > Best performance' $Id
@@ -1071,8 +977,7 @@ function Set-PowerModeBest {
 }
 
 function Get-StartupEntries {
-    # What starts with Windows (Task Manager > Startup apps): this user's and the machine's Run entries (and its 32-bit
-    # view), and the shortcuts in both Startup folders - Name, what it runs, and where Windows keeps its on/off switch.
+    # Task Manager's Startup apps: Run entries and Startup-folder shortcuts, each with its StartupApproved key
     $base = 'Software\Microsoft\Windows\CurrentVersion'
     foreach ($r in @(@{ Run = "HKCU:\$base\Run"; Approved = "HKCU:\$base\Explorer\StartupApproved\Run" },
                      @{ Run = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; Approved = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" },
@@ -1093,9 +998,7 @@ function Get-StartupEntries {
 }
 
 function Disable-LauncherStartup {
-    # Low-end PC (superuser, 2026-10-09): the launchers in $script:LauncherStartup don't start with Windows - their switch in
-    # Task Manager > Startup apps turned off (03 + when). Tools that must run to work (Lightshot, TurboTop, Razer Synapse,
-    # NZXT CAM, Nextcloud) stay. Epic and Ubisoft add their entry on their first start - off in their own settings.
+    # Switched off as Task Manager does (03 + when). Epic and Ubisoft add their entry on first start.
     param([string]$Id = '')
     $off = [System.Collections.Generic.List[string]]::new()
     foreach ($e in @(Get-StartupEntries)) {
@@ -1127,9 +1030,7 @@ function Update-Explorer {
         if (-not $script:Live) { Show-LiveText 'restarting Explorer' }
         taskkill.exe /F /IM explorer.exe 2>$null | Out-Null
         if ($script:NeedIconCacheClear) {
-            # Rebuild the icon cache while explorer is stopped - otherwise a changed overlay (our removed
-            # shortcut arrow) renders as a BLACK BOX from the stale cache (a well-known Windows issue).
-            # Delete IMMEDIATELY (Windows auto-restarts the shell within ~1s and re-locks the cache files).
+            # Else the removed shortcut arrow renders as a BLACK BOX. Right away: Windows restarts the shell within ~1s.
             Write-Log DEBUG "clearing icon cache (so the shortcut-arrow removal renders transparent, not a black box)"
             Remove-Item "$env:LocalAppData\IconCache.db" -Force -ErrorAction SilentlyContinue
             Remove-Item "$env:LocalAppData\Microsoft\Windows\Explorer\iconcache_*.db" -Force -ErrorAction SilentlyContinue
@@ -1150,7 +1051,6 @@ public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint M
 }
 
 function Get-ForegroundProcess {
-    # The process whose window is in front (it has the keyboard) - $null when there is none, or no desktop
     try {
         if (-not ([System.Management.Automation.PSTypeName]'Native.Foreground').Type) {
             Add-Type -Namespace Native -Name Foreground -MemberDefinition @'
@@ -1168,10 +1068,7 @@ public static extern uint GetWindowThreadProcessId(System.IntPtr hWnd, out uint 
 }
 
 function Clear-StuckSearch {
-    # Windows' Search window can be stuck in front of everything when a run ends: invisible, yet it takes every click
-    # over the middle of the screen (superuser's run 2026-09-29: the Done screen's "Open log" / "Close" did nothing - the
-    # clicks went to SearchHost; "Restart now", just outside it, worked). Search in front at the end: close it (Windows
-    # starts it again for the next search). Anything else in front is left alone.
+    # Search can be stuck in front at the end: invisible, yet it takes the clicks. Closed (Windows starts it again).
     $p = Get-ForegroundProcess
     Write-Log DEBUG ('the end: in front is {0}' -f $(if ($p) { "$($p.ProcessName) (pid $($p.Id))" } else { 'nothing' }))
     if (-not $p -or $p.ProcessName -ne 'SearchHost') { return }
@@ -1181,11 +1078,8 @@ function Clear-StuckSearch {
 }
 
 function Test-AppInstalled {
-    # Return $true if the package is already installed, so Install-App can skip it.
-    #  - winget list uses a locale-independent EXIT CODE (0 = found) -> catches winget-tracked installs.
-    #  - the Add/Remove Programs DisplayName scan catches installs made OUTSIDE winget
-    #    (e.g. an OEM/vendor app pre-installed on the PC), which 'winget list' won't see.
-    param([string]$Id, [string[]]$NamePattern)   # one or more Add/Remove Programs DisplayName -like patterns
+    # winget list's exit code (locale-independent), or an ARP DisplayName (installs winget doesn't see)
+    param([string]$Id, [string[]]$NamePattern)
     if ($Id) {
         try {
             & winget list --id $Id --exact --accept-source-agreements *>$null
@@ -1206,16 +1100,11 @@ function Test-AppInstalled {
 }
 
 function Invoke-Winget {
-    # Run winget (output redirected to $OutFile) and return its exit code. Waits for winget ONLY - NOT
-    # Start-Process -Wait, which waits for the whole process TREE (it puts the child in a job object): an app
-    # the installer launches when it's done (Battle.net + its browser helpers) would then hold the run until
-    # someone closed it. winget itself waits for its installer, so this behaves like `winget install` by hand.
-    # -TimeoutSec (the updates: an app that is running can make its installer wait on a question nobody sees): after that
-    # long winget and everything it started are stopped, and it throws. 0 = as long as it takes (the installs).
+    # Waits for winget ONLY - Start-Process -Wait waits for the whole tree, so an app the installer launches would hold
+    # the run. -TimeoutSec: then winget and what it started are stopped, and it throws.
     param([string]$ArgumentList, [string]$OutFile, [int]$TimeoutSec = 0)
     $p = Start-Process -FilePath 'winget' -NoNewWindow -PassThru -ArgumentList $ArgumentList -RedirectStandardOutput $OutFile
-    $null = $p.Handle   # open the handle NOW - Windows PowerShell returns the process by PID, and without a handle ExitCode can be empty after exit
-    # a second at a time, so the live line's clock ticks while winget works
+    $null = $p.Handle   # open the handle NOW - without one PS 5.1 can lose ExitCode
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     do {
         Wait-Process -InputObject $p -Timeout 1 -ErrorAction Ignore; Update-LiveTick
@@ -1228,16 +1117,14 @@ function Invoke-Winget {
 }
 
 function Stop-ProcessTree {
-    # A process and everything it started, forced. A child = its parent id is one of these AND it started after that parent:
-    # Windows reuses the ids of processes that are gone, so an older process can carry a parent id that belongs to someone
-    # else now (the elevation relaunch's first PowerShell -> this script). This script itself never.
+    # A child must have started after its parent: Windows reuses process ids. Never this script itself.
     param([int]$Id)
     $all = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, CreationDate -ErrorAction SilentlyContinue)
     $born = @{}; foreach ($p in $all) { $born[[int]$p.ProcessId] = $p.CreationDate }
     $ids = [System.Collections.Generic.List[int]]::new(); $ids.Add($Id)
     for ($i = 0; $i -lt $ids.Count; $i++) {
         $parent = $ids[$i]; $since = $born[$parent]
-        if (-not $since) { continue }   # its start time unknown: its children cannot be told apart - left
+        if (-not $since) { continue }
         foreach ($c in @($all | Where-Object { [int]$_.ParentProcessId -eq $parent -and $_.CreationDate -and $_.CreationDate -ge $since })) {
             if (-not $ids.Contains([int]$c.ProcessId)) { $ids.Add([int]$c.ProcessId) }
         }
@@ -1246,9 +1133,8 @@ function Stop-ProcessTree {
 }
 
 function Initialize-InstallerJob {
-    # The job-object code, compiled ONCE before the first installer starts (Invoke-InstallPhase): compiling takes seconds,
-    # and a setup that hands over to a child process in that time would leave the job empty - the wait would end early.
-    # Fails quietly: the waits are then for the installer alone.
+    # Compiled ONCE before the first installer: compiling takes seconds, and a setup that hands over to a child meanwhile
+    # would leave the job empty (the wait would end early).
     try {
         if (-not ('W11TJ.Job' -as [type])) {
             Add-Type -ErrorAction Stop -TypeDefinition @'
@@ -1279,10 +1165,9 @@ namespace W11TJ {
 }
 
 function New-InstallerJob {
-    # A Windows job object around an installer: every process it starts lands in it too (what Start-Process -Wait waits
-    # on). $null when Windows refuses - the wait is then for the installer alone.
+    # every process the installer starts lands in the job too; $null when Windows refuses
     param($Process)
-    Initialize-InstallerJob   # (compiled already - Invoke-InstallPhase)
+    Initialize-InstallerJob
     if (-not ('W11TJ.Job' -as [type])) { return $null }
     try { $j = [W11TJ.Job]::Open($Process.Handle); if ($j -ne [IntPtr]::Zero) { return $j } }
     catch { Write-Log DEBUG "no job object for the installer ($($_.Exception.Message)) - waiting for it alone" }
@@ -1290,12 +1175,10 @@ function New-InstallerJob {
 }
 
 function Wait-Installer {
-    # Wait for an installer: it and everything it starts, like Start-Process -Wait - or, -MainOnly, the installer alone (an
-    # app the setup leaves running would hold the run). Never longer than -TimeoutSec (superuser, 2026-10-09: a setup that
-    # waits on a question nobody sees held the whole run - no .NET 3.5, no summary): then it and what it started are
-    # stopped, and it throws. The live line's clock ticks meanwhile.
+    # -MainOnly: the installer alone (an app it leaves running would hold the run). After -TimeoutSec (a setup can wait
+    # on a question nobody sees) all of it is stopped and it throws.
     param($Process, [int]$TimeoutSec = 0, [switch]$MainOnly)
-    $null = $Process.Handle   # open it now - Windows PowerShell returns the process by PID, and without a handle ExitCode can be empty
+    $null = $Process.Handle   # see Invoke-Winget
     $job = if ($MainOnly) { $null } else { New-InstallerJob $Process }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
@@ -1315,16 +1198,14 @@ function Wait-Installer {
 }
 
 function Install-App {
-    # Clean console output: just "Installing <name>" then "Done!" (or "Failed"). winget's own chatter
-    # (Found / Downloading / Successfully installed) is redirected to a temp file - shown only in the
-    # log file on failure, never on the console. Returns a STATUS: OK / FAILED / DRYRUN.
+    # winget's output goes to a temp file, logged only on failure. Returns OK / FAILED / DRYRUN.
     param([string]$Id, [string]$Name, [string]$Location, [string]$DetectName, [string]$Source,
-          [int]$AbandonWaitSeconds = 300)   # how long to wait for an installer winget abandoned (see below)
+          [int]$AbandonWaitSeconds = 300)   # for an installer winget abandoned
     $label = if ($Name) { $Name } elseif ($script:AppNames.ContainsKey($Id)) { $script:AppNames[$Id] } else { $Id }
-    $src = if ($Source) { $Source } else { 'winget' }   # 'msstore' for Store-only apps (e.g. Alienware Command Center)
+    $src = if ($Source) { $Source } else { 'winget' }
     $wingetArgs = "install $Id --accept-package-agreements --accept-source-agreements --source $src --silent"
-    if ($Location) { $wingetArgs += " --location `"$Location`"" }   # e.g. Battle.net requires an install location
-    if ($script:AppScopes -and $script:AppScopes[$Id]) { $wingetArgs += " --scope $($script:AppScopes[$Id])" }   # e.g. TreeSize: for the machine
+    if ($Location) { $wingetArgs += " --location `"$Location`"" }
+    if ($script:AppScopes -and $script:AppScopes[$Id]) { $wingetArgs += " --scope $($script:AppScopes[$Id])" }
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $label"; return 'DRYRUN' }
     if (Test-AppInstalled -Id $Id -NamePattern $DetectName) { return (Update-App -Id $Id -Label $label -Source $src -Location $Location) }
     Write-Log INFO "Installing $label"
@@ -1332,11 +1213,8 @@ function Install-App {
     try {
         $code = Invoke-Winget -ArgumentList $wingetArgs -OutFile $wo -TimeoutSec $script:InstallTimeoutSec
         if ($code -eq 0) { Remove-Item $wo -Force -ErrorAction SilentlyContinue; Write-Log OK "Done!"; return 'OK' }
-        # A non-zero exit code is not the last word - trust the system over it (like Install-DirectDownload does):
-        # an installer can return an odd code and still install. E_ABORT (0x80004004) means winget stopped
-        # watching the installer ("Installation abandoned") without killing it - Battle.net's setup does this
-        # and finishes on its own (its ~750 MB download can take minutes) - so give the install time to land
-        # before calling it a failure. A clock, not a count: each check runs 'winget list' (seconds).
+        # A non-zero code is not the last word. E_ABORT: winget stopped watching an installer that goes on (Battle.net) -
+        # it gets time to land. A clock, not a count: each check runs 'winget list'.
         $hex = '0x{0:X8}' -f $code
         $installed = Test-AppInstalled -Id $Id -NamePattern $DetectName
         if (-not $installed -and $code -eq -2147467260) {
@@ -1359,13 +1237,11 @@ function Install-App {
 }
 
 function Update-App {
-    # An app that is already installed goes to the latest (superuser, 2026-09-30: upgrade them all): winget upgrade,
-    # silent and never a question (a prompt would hold the run). The app is there whatever winget says, so this is always
-    # OK - a failed update is a warning and the app's note. winget's "nothing to do" answers leave it as it is.
+    # never a question (a prompt would hold the run). Always OK - a failed update is a warning and a note.
     param([string]$Id, [string]$Label, [string]$Source = 'winget', [string]$Location)
     if (@($script:NoUpdateApps | Where-Object { $Id -like $_ }).Count) { Write-Log OK "Already installed - $Label"; $script:ItemNote = 'already installed'; return 'OK' }
     $a = "upgrade --id $Id --exact --accept-package-agreements --accept-source-agreements --source $Source --silent --disable-interactivity"
-    if ($Location) { $a += " --location `"$Location`"" }   # Battle.net: as when it was installed
+    if ($Location) { $a += " --location `"$Location`"" }
     if ($script:AppScopes -and $script:AppScopes[$Id]) { $a += " --scope $($script:AppScopes[$Id])" }
     $left = @{ '0x8A15002B' = 'no newer version'; '0x8A15004F' = 'the installed one is newer'; '0x8A15010E' = 'a newer one is installed'
                '0x8A150050' = 'winget cannot tell its version'; '0x8A150014' = 'not a winget install'; '0x8A150068' = 'pinned in winget'
@@ -1388,8 +1264,7 @@ function Update-App {
 }
 
 function Get-InstalledVersion {
-    # The newest DisplayVersion Add/Remove Programs shows for a program ('' if none). The newest, as FL Studio keeps each
-    # year's version next to the one before ("FL Studio 2024" 24.2.2.4648, "FL Studio 2025" 25.1.1.4879).
+    # the newest - FL Studio keeps each year's version side by side
     param([string[]]$NamePattern)
     $best = ''
     foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -1403,8 +1278,7 @@ function Get-InstalledVersion {
 }
 
 function Compare-Version {
-    # 1 / 0 / -1: version text A against B, part by part as numbers ("7.01.08.129" = "7.1.8.129"), over the parts both have
-    # (a file name's "25.2.4.4960" = "25.2.4" somewhere else). No version at all is the lowest.
+    # 1 / 0 / -1, part by part as numbers, over the parts both have; no version is the lowest
     param([string]$A, [string]$B)
     $x = [regex]::Match($A, '\d+(\.\d+)*').Value; $y = [regex]::Match($B, '\d+(\.\d+)*').Value
     if (-not $x -or -not $y) { return ([int][bool]$x - [int][bool]$y) }
@@ -1417,8 +1291,7 @@ function Compare-Version {
 }
 
 function Resolve-FinalUrl {
-    # Where a vendor's "latest" link leads - its redirects followed, nothing downloaded (a HEAD request): the file's name
-    # carries the version.
+    # where a "latest" link leads - the file's name carries the version
     param([string]$Url)
     $rq = [System.Net.WebRequest]::Create($Url)
     $rq.Method = 'HEAD'; $rq.UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'; $rq.Timeout = 30000
@@ -1427,16 +1300,14 @@ function Resolve-FinalUrl {
 }
 
 function Get-DirectFailStatus {
-    # A direct app's failure. A failed UPDATE leaves the app as it was - still installed, so OK, and its note says the
-    # update failed (the WARN is in the log); anything else is FAILED, with why.
+    # a failed UPDATE leaves the app installed - OK with a note
     param([string]$Why, [bool]$Updating)
     if ($Updating) { $script:ItemNote = 'update failed, see the log'; return 'OK' }
     $script:ItemFail = $Why; return 'FAILED'
 }
 
 function Get-DownloadLength {
-    # The size the server gives for a download (a HEAD request with the download's own headers, 20 s, a second try - the
-    # servers this is for drop connections); 0 when it gives none or will not answer - the download then goes as before
+    # two tries - these servers drop connections; 0 = no size
     param([string]$Url, [hashtable]$Headers, [string]$UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
     for ($i = 1; $i -le 2; $i++) {
         try {
@@ -1445,16 +1316,15 @@ function Get-DownloadLength {
             $r = Invoke-WebRequest @iwr
             $n = [int64]0
             if ([int64]::TryParse((@($r.Headers['Content-Length']) -join ''), [ref]$n)) { return $n }
-            return [int64]0   # (it answered, without a size)
+            return [int64]0
         } catch { }
     }
     return [int64]0
 }
 
 function Receive-DownloadRest {
-    # The rest of a download that stopped part-way: a Range request from where the file ends, added to it (206). A server
-    # that sends the whole file again (200) writes it over; one with nothing left to send (416) has it all already.
-    # Returns the file's length after it and the whole size the server named (Content-Range; 0 when it named none).
+    # A Range request from where the file ends: 206 appends, 200 writes it over, 416 = whole already.
+    # Returns the file's length and the whole size the server named (0: none).
     param([string]$Url, [string]$OutFile, [hashtable]$Headers, [string]$UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
     $have = if (Test-Path -LiteralPath $OutFile) { [int64](Get-Item -LiteralPath $OutFile).Length } else { [int64]0 }
     $req = [System.Net.HttpWebRequest]::Create($Url)
@@ -1464,7 +1334,7 @@ function Receive-DownloadRest {
     try { $resp = $req.GetResponse() }
     catch {
         $we = $_.Exception; while ($we -and $we -isnot [System.Net.WebException]) { $we = $we.InnerException }
-        if ($we -and $we.Response -and [int]$we.Response.StatusCode -eq 416) {   # nothing left from there: the file is whole
+        if ($we -and $we.Response -and [int]$we.Response.StatusCode -eq 416) {
             $total = $have; if ([string]$we.Response.Headers['Content-Range'] -match '/(\d+)$') { $total = [int64]$Matches[1] }   # (S3 names no size)
             $we.Response.Close()
             return @{ Length = $have; Total = $total }
@@ -1484,21 +1354,16 @@ function Receive-DownloadRest {
 }
 
 function Save-Download {
-    # A download to a file, checked to be whole. Invoke-WebRequest (Windows PowerShell 5.1) can stop part-way WITHOUT an
-    # error: Razer's download server dropped connections at random (VM 102, 2026-10-02: 176 / 12 / 8 MB of its 220 MB
-    # installer, no error - the run then said "not signed"; curl saw "transfer closed" from the Mac too). The size the
-    # server gives (a HEAD request) is checked; short - or broken off with an error - the rest is fetched (a Range
-    # request), 3 s apart, for as long as it comes: it gives up after 4 rests in a row that bring nothing (20 at most). The
-    # server's own size in its answer wins over the HEAD's. A server that gives no size: as before (a signature check
-    # after it still decides what runs). Throws when it stays short.
+    # Invoke-WebRequest (PS 5.1) can stop part-way WITHOUT an error: short of the server's size, the rest is fetched
+    # with Range requests until 4 in a row bring nothing (20 at most). Throws when it stays short.
     param([string]$Url, [string]$OutFile, [hashtable]$Headers, [string]$UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
     $want = Get-DownloadLength -Url $Url -Headers $Headers -UserAgent $UserAgent
     Write-Log DEBUG $(if ($want -gt 0) { 'download: {0:N1} MB, the server says - checked' -f ($want / 1MB) } else { 'download: no size from the server - not checked' })
     $iwr = @{ Uri = $Url; OutFile = $OutFile; UseBasicParsing = $true; UserAgent = $UserAgent; ErrorAction = 'Stop' }
     if ($Headers) { $iwr.Headers = $Headers }
-    $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'   # (5.1's progress bar slows a download to a crawl)
+    $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'   # 5.1's progress bar slows a download to a crawl
     try { Invoke-WebRequest @iwr }
-    catch {   # broken off WITH an error: with a size to reach and a part on disk, the rest is fetched as below
+    catch {   # broken off WITH an error: the rest is fetched below
         if (-not ($want -gt 0 -and (Test-Path -LiteralPath $OutFile))) { throw }
         Write-Log DEBUG "download broke off: $($_.Exception.Message)"
     } finally { $ProgressPreference = $pp }
@@ -1517,32 +1382,31 @@ function Save-Download {
 }
 
 function Install-DirectDownload {
-    # Download a vendor installer straight from a URL (or a scraped URL) and run it silently.
-    # For apps NOT on winget (e.g. NVIDIA App). DryRun-aware. Returns OK/SKIPPED/FAILED/DRYRUN.
+    # An app not on winget: its vendor installer, run silently. Returns OK/SKIPPED/FAILED/DRYRUN.
     param(
         [string]$Name,
-        [string]$Url,                 # direct URL; OR give -UrlScript to compute the current one
+        [string]$Url,                 # or -UrlScript computes it
         [scriptblock]$UrlScript,
-        [string]$SilentArgs = '',     # silent-install args for the downloaded installer
-        [string[]]$DetectName,        # ARP DisplayName -like pattern(s) -> skip if already installed
-        [scriptblock]$Require,        # optional gate; if it returns falsey, skip (e.g. NVIDIA GPU present)
+        [string]$SilentArgs = '',
+        [string[]]$DetectName,        # ARP DisplayName pattern(s)
+        [scriptblock]$Require,
         [string]$RequireMsg = 'requirement not met',
-        [hashtable]$Headers,          # extra request headers for the download (AMD serves its files only with an amd.com Referer)
-        [string]$Signer,              # the download must carry a valid signature from this publisher, or it is not run
-        [string]$Machine,             # 'PC' / 'Laptop' only - checked by the install phase (listed so @splatting works)
-        [switch]$WaitMainOnly,        # wait for the installer process only, not for an app it leaves running (see below)
-        [switch]$UpdateFromUrl        # no updater of its own: installed, but older than the download -> installed over it
+        [hashtable]$Headers,
+        [string]$Signer,              # a valid signature from this publisher, or it is not run
+        [string]$Machine,             # checked by the install phase (listed so @splatting works)
+        [switch]$WaitMainOnly,
+        [switch]$UpdateFromUrl        # no updater of its own: older than the download -> installed over it
     )
     if ($Require) {
         $met = $false; try { $met = [bool](& $Require) } catch { }
         if (-not $met) { Write-Log INFO "${Name}: skipped ($RequireMsg)"; $script:ItemNote = $RequireMsg; return 'SKIPPED' }
     }
-    $from = ''   # the installed version this run updates (UpdateFromUrl); the others are left to update themselves
+    $from = ''   # the installed version this run updates (UpdateFromUrl)
     if ($DetectName -and -not $script:DryRun -and (Test-AppInstalled -NamePattern $DetectName)) {
         if ($UpdateFromUrl) { $from = Get-InstalledVersion -NamePattern $DetectName }
         if (-not $from) { Write-Log OK "Already installed - $Name"; $script:ItemNote = 'already installed'; return 'OK' }
     }
-    try {   # an update needs the file's own name (its version) - where the vendor's "latest" link leads
+    try {   # an update needs the file's name (its version)
         if ($UrlScript) { $Url = & $UrlScript } elseif ($from) { $Url = Resolve-FinalUrl -Url $Url }
     } catch {
         if ($from) { Write-Log OK "Already installed - $Name $from (could not check for a newer one: $($_.Exception.Message))"; $script:ItemNote = 'already installed'; return 'OK' }
@@ -1560,18 +1424,18 @@ function Install-DirectDownload {
         }
     }
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $Name (direct download from $Url)"; return 'DRYRUN' }
-    $failed = if ($from) { "${Name}: installed, but the update failed" } else { "Failed - $Name" }   # the WARN lines below
+    $failed = if ($from) { "${Name}: installed, but the update failed" } else { "Failed - $Name" }
     Write-Log INFO $(if ($from) { "Updating $Name $from -> $to" } else { "Installing $Name" })
-    $ext = if ($Url -match '\.msi(\?|#|$)') { 'msi' } else { 'exe' }   # MSI installers (e.g. Chrome) need msiexec
+    $ext = if ($Url -match '\.msi(\?|#|$)') { 'msi' } else { 'exe' }
     $tmp = Join-Path $env:TEMP ("{0}_{1}.{2}" -f ($Name -replace '\W','_'), (Get-Date -Format 'yyyyMMddHHmmss'), $ext)
     Write-Log DEBUG "downloading $Name from $Url"
     try {
-        Save-Download -Url $Url -OutFile $tmp -Headers $Headers   # checked to be whole - a download can stop part-way without an error
+        Save-Download -Url $Url -OutFile $tmp -Headers $Headers
     } catch {
-        Remove-Item $tmp -Force -ErrorAction SilentlyContinue   # no half file left in TEMP (Adrenalin alone is 1.6 GB)
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         Write-Log WARN "$failed (download failed: $($_.Exception.Message))"; return (Get-DirectFailStatus 'download failed' ([bool]$from))
     }
-    # sanity: make sure we got a real installer (MZ='MZ' = exe, or OLE 'D0 CF 11 E0' = msi), not an HTML page
+    # an installer (exe 'MZ' / msi OLE), not an HTML page
     try {
         $fs = [System.IO.File]::OpenRead($tmp); $sig = New-Object byte[] 4; [void]$fs.Read($sig, 0, 4); $fs.Close()
     } catch { $sig = @(0, 0, 0, 0) }
@@ -1581,7 +1445,7 @@ function Install-DirectDownload {
         Write-Log WARN "$failed (downloaded file is not an exe/msi installer; get it manually from $Url)"
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return (Get-DirectFailStatus 'the download is not an installer' ([bool]$from))
     }
-    if ($Signer) {   # a scraped link must lead to the vendor's own signed file - anything else is never run
+    if ($Signer) {   # a scraped link must lead to the vendor's own signed file
         $sig = Get-AuthenticodeSignature -FilePath $tmp -ErrorAction SilentlyContinue
         $subject = if ($sig -and $sig.SignerCertificate) { [string]$sig.SignerCertificate.Subject } else { '' }
         if (-not $sig -or "$($sig.Status)" -ne 'Valid' -or $subject -notmatch [regex]::Escape($Signer)) {
@@ -1589,23 +1453,19 @@ function Install-DirectDownload {
             Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return (Get-DirectFailStatus "not signed by $Signer - not run" ([bool]$from))
         }
     }
-    Set-LiveWhat $(if ($from) { 'updating' } else { 'installing' })   # Wait-Installer ticks the clock
+    Set-LiveWhat $(if ($from) { 'updating' } else { 'installing' })
     try {
         $sp = if ($isMsi) { @{ FilePath = 'msiexec.exe'; ArgumentList = "/i `"$tmp`" $SilentArgs" } }
               elseif ($SilentArgs) { @{ FilePath = $tmp; ArgumentList = $SilentArgs } }
               else { @{ FilePath = $tmp } }
-        # -WaitMainOnly: the installer alone - an app the setup leaves running (the Radeon app) would hold the run, the same
-        # trap as in Invoke-Winget; the others: it and what it starts. Never longer than InstallTimeoutSec.
         $p = Start-Process @sp -PassThru
         Wait-Installer -Process $p -TimeoutSec $script:InstallTimeoutSec -MainOnly:$WaitMainOnly
         $code = $p.ExitCode
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         Write-Log DEBUG "$Name installer exit code: $code"
-        if ($from) { $script:ItemNote = 'updated to the latest' }   # (a failure below says otherwise)
+        if ($from) { $script:ItemNote = 'updated to the latest' }
         if ($code -in 0, 3010, 1641) { Write-Log OK "Done!"; return 'OK' }
-        # Non-standard exit code - but some installers (e.g. FL Studio's NSIS) return an odd code even on a
-        # clean install. Trust ARP over the exit code: if the app is now actually present (an update: in the new
-        # version), it worked.
+        # some installers (FL Studio's NSIS) return an odd code on a clean install - ARP decides
         if ($DetectName -and $(if ($from) { (Compare-Version (Get-InstalledVersion -NamePattern $DetectName) $to) -ge 0 } else { Test-AppInstalled -NamePattern $DetectName })) {
             Write-Log DEBUG "$Name exit code $code is non-standard, but it IS installed (ARP match) - treating as success"
             Write-Log OK "Done!"; return 'OK'
@@ -1615,7 +1475,6 @@ function Install-DirectDownload {
         $m = $_.Exception.Message
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         if ($m -match '^took too long' -and $DetectName -and -not $from -and (Test-AppInstalled -NamePattern $DetectName)) {
-            # stopped after InstallTimeoutSec, but the app is there - a setup that held on to something it started
             Write-Log WARN "$Name is installed, but its setup did not end - stopped after $(Format-Span $script:InstallTimeoutSec)"
             $script:ItemNote = 'installed - its setup was stopped'; return 'OK'
         }
@@ -1625,12 +1484,7 @@ function Install-DirectDownload {
 }
 
 function Enable-Feature {
-    # Enable a Windows optional feature like "Turn Windows features on/off": DISM /Online /Enable-Feature
-    # downloads any missing payload straight from Windows Update (no /Source, no /LimitAccess). NetFx3's
-    # download is slow (10-15 min seen), so we start DISM and WAIT, checking periodically if it finished,
-    # for up to TimeoutSec (default 30 min). When DISM exits we confirm the feature is Enabled -> OK. If
-    # it is still not done after TimeoutSec we STOP WAITING but do NOT kill DISM (that corrupts CBS) - it
-    # finishes on its own in the background. Runs LAST of everything so nothing waits on it.
+    # DISM, the payload from Windows Update - waited for up to TimeoutSec
     param([string]$Name, [string]$Display, [int]$TimeoutSec = 1800)
     if (-not $Display) { $Display = $Name }
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would enable feature $Display (DISM /Online /Enable-Feature)"; return 'DRYRUN' }
@@ -1643,8 +1497,8 @@ function Enable-Feature {
         -ArgumentList '/Online','/Enable-Feature',"/FeatureName:$Name",'/All','/NoRestart','/Quiet',"/LogPath:$dlog"
     $sw = [System.Diagnostics.Stopwatch]::StartNew(); $lastBeat = 0
     while (-not $p.HasExited -and $sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
-        for ($i = 0; $i -lt 5 -and -not $p.HasExited; $i++) { Start-Sleep -Seconds 1; Update-LiveTick }   # the live clock ticks
-        if (($sw.Elapsed.TotalSeconds - $lastBeat) -ge 60) {   # heartbeat to the LOG FILE only (DEBUG - hidden on the console)
+        for ($i = 0; $i -lt 5 -and -not $p.HasExited; $i++) { Start-Sleep -Seconds 1; Update-LiveTick }
+        if (($sw.Elapsed.TotalSeconds - $lastBeat) -ge 60) {
             $lastBeat = [int]$sw.Elapsed.TotalSeconds
             Write-Log DEBUG ("...still installing $Display ({0} min)" -f [int]($sw.Elapsed.TotalSeconds / 60)) $Display
         }
@@ -1656,28 +1510,21 @@ function Enable-Feature {
         }
         Write-Log WARN "$Display NOT installed (see $dlog)"; return 'FAILED'
     }
-    # Still installing after TimeoutSec. Do NOT kill DISM (that corrupts CBS) - let it finish on its own.
+    # Still installing: do NOT kill DISM (that corrupts CBS) - it finishes on its own.
     Write-Log WARN ("$Display NOT installed yet - still downloading in the background after {0} min (it finishes on its own; do not reboot until then)." -f [int]($TimeoutSec / 60))
     return 'BACKGROUND'
 }
 
-# --------------------------------------------------------------------------------------
-#  The tweaks - 55 total: 25 standard Win11 tweaks (values verbatim, except where a comment
-#  says why) + 30 custom at the end. Toggles apply their ON value only. No restore point
-#  (removed per user request). A tweak with Late=$true runs after the installs (Main).
-# --------------------------------------------------------------------------------------
+# ---- The tweaks: standard ones (values verbatim unless a comment says why) + custom. Late=$true: after the installs ----
 $script:Tweaks = @(
 
-  # Shortcut-arrow overlay - remove it FIRST so every shortcut created later (incl. app icons) has none.
-  # NOTE: use a PROPER transparent multi-size blank.ico. A malformed one (e.g. Bitmap.GetHicon().Save,
-  # which yields a ~766-byte junk icon) corrupts the shared overlay image list and makes OTHER overlays
-  # - notably the UAC admin shield - render oversized. So we build a valid 16/24/32/48 .ico by hand.
+  # Shortcut-arrow overlay - FIRST, so every shortcut created later has none. A malformed blank.ico corrupts the shared
+  # overlay image list (the UAC shield renders oversized) - so a valid .ico is built by hand.
   [pscustomobject]@{ Id='CustomShortcutArrow'; Content='Icons - remove shortcut-arrow overlay'; Category='Custom'; Apply={
       $id='CustomShortcutArrow'
       $blank = Join-Path $env:SystemRoot 'blank.ico'
       Invoke-Step -Id $id -Description 'write a proper transparent blank.ico + point Shell Icons\29 at it' -Action {
-          # 24x24 ONLY (the canonical overlay size). Including larger sizes (32/48) makes Windows size the
-          # shared overlay cell to that size, which renders OTHER overlays (the UAC shield) oversized.
+          # 24x24 ONLY: a larger size makes Windows size the shared overlay cell to it (the UAC shield oversized).
           $sizes = @(24)
           $imgData = @()
           foreach ($w in $sizes) {
@@ -1686,9 +1533,7 @@ $script:Tweaks = @(
               $bw.Write([int32]40); $bw.Write([int32]$w); $bw.Write([int32]($w * 2))          # BITMAPINFOHEADER
               $bw.Write([int16]1); $bw.Write([int16]32); $bw.Write([int32]0)
               $bw.Write([int32]0); $bw.Write([int32]0); $bw.Write([int32]0); $bw.Write([int32]0); $bw.Write([int32]0)
-              # XOR bitmap: black pixels with alpha 1 (of 255) - invisible, but NOT all-zero: Windows treats a
-              # 32bpp image whose alpha is ALL 0 as old-style "0RGB" (no alpha), and Explorer then draws it
-              # OPAQUE at bigger icon sizes / high DPI -> a black square on every shortcut.
+              # XOR bitmap: alpha 1, not 0 - an all-zero alpha is read as "0RGB" (no alpha) and drawn OPAQUE at high DPI.
               $xor = New-Object 'byte[]' ($w * $w * 4); for ($j = 3; $j -lt $xor.Length; $j += 4) { $xor[$j] = 1 }
               $bw.Write($xor)
               $andBytes = New-Object 'byte[]' ($andRow * $w); for ($j = 0; $j -lt $andBytes.Length; $j++) { $andBytes[$j] = 0xFF }
@@ -1710,42 +1555,36 @@ $script:Tweaks = @(
       $script:NeedExplorerRestart = $true; $script:NeedIconCacheClear = $true
   }}
 
-  # (Restore Point - REMOVED per user request; re-add from git history if needed)
-
-  # Activity History --------------------------------------------------------------------
+  # Activity History
   [pscustomobject]@{ Id='WPFTweaksActivity'; Content='Activity History - Disable'; Category='Essential'; Apply={
       $id='WPFTweaksActivity'; $p='HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
-      # EnableActivityFeed stays 1: 0 can break the clipboard history (Win+V) - WinUtil moved to 1 as well (PR #5035).
-      # Publish/Upload = 0 already keep the activity history from being saved or sent.
+      # EnableActivityFeed stays 1: 0 can break the clipboard history (Win+V). Publish/Upload = 0 are enough.
       Set-Reg -Id $id -Path $p -Name 'EnableActivityFeed'    -Type DWord -Value '1'
       Set-Reg -Id $id -Path $p -Name 'PublishUserActivities' -Type DWord -Value '0'
       Set-Reg -Id $id -Path $p -Name 'UploadUserActivities'  -Type DWord -Value '0'
   }}
 
-  # ConsumerFeatures ---------------------------------------------------------------
+  # ConsumerFeatures
   [pscustomobject]@{ Id='WPFTweaksConsumerFeatures'; Content='ConsumerFeatures - Disable'; Category='Essential'; Apply={
       $id='WPFTweaksConsumerFeatures'; $cdm='HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
-      # The policy only works on Enterprise / Education. On Pro and Home the "suggested" apps and games that Windows
-      # installs by itself are stopped by these three (all 1 on a fresh 25H2).
+      # The policy only works on Enterprise / Education; on Pro and Home these three stop the "suggested" app installs.
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableWindowsConsumerFeatures' -Type DWord -Value '1'
       Set-Reg -Id $id -Path $cdm -Name 'SilentInstalledAppsEnabled' -Type DWord -Value '0'
       Set-Reg -Id $id -Path $cdm -Name 'PreInstalledAppsEnabled'    -Type DWord -Value '0'
       Set-Reg -Id $id -Path $cdm -Name 'OemPreInstalledAppsEnabled' -Type DWord -Value '0'
   }}
 
-  # Delivery Optimization ----------------------------------------------------------
+  # Delivery Optimization
   [pscustomobject]@{ Id='WPFTweaksDeliveryOptimization'; Content='Delivery Optimization - Disable'; Category='Essential'; Apply={
       Set-Reg -Id 'WPFTweaksDeliveryOptimization' -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' -Name 'DODownloadMode' -Type DWord -Value '0'
   }}
 
-  # (Disk Cleanup - REMOVED per user request; re-add from git history if needed)
-
-  # End Task With Right Click -----------------------------------------------------------
+  # End Task With Right Click
   [pscustomobject]@{ Id='WPFTweaksEndTaskOnTaskbar'; Content='End Task With Right Click - Enable'; Category='Essential'; Apply={
       Set-Reg -Id 'WPFTweaksEndTaskOnTaskbar' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\TaskbarDeveloperSettings' -Name 'TaskbarEndTask' -Type DWord -Value '1'
   }}
 
-  # File Explorer Automatic Folder Discovery --------------------------------------
+  # File Explorer Automatic Folder Discovery
   [pscustomobject]@{ Id='WPFTweaksDisableExplorerAutoDiscovery'; Content='File Explorer Automatic Folder Discovery - Disable'; Category='Essential'; Apply={
       Invoke-Step -Id 'WPFTweaksDisableExplorerAutoDiscovery' -Description 'reset Explorer folder-type database' -Action {
           $bags   = 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\Bags'
@@ -1758,7 +1597,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # Location Tracking --------------------------------------------------------------
+  # Location Tracking
   [pscustomobject]@{ Id='WPFTweaksLocation'; Content='Location Tracking - Disable'; Category='Essential'; Apply={
       $id='WPFTweaksLocation'
       Set-Svc -Id $id -Name 'lfsvc' -StartupType 'Disable' -OriginalType 'Manual'
@@ -1767,7 +1606,7 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path 'HKLM:\SYSTEM\Maps' -Name 'AutoUpdateEnabled' -Type DWord -Value '0'
   }}
 
-  # Services - Set to Manual -------------------------------------------------------
+  # Services - Set to Manual
   [pscustomobject]@{ Id='WPFTweaksServices'; Content='Services - Set to Manual'; Category='Essential'; Apply={
       $id='WPFTweaksServices'
       Set-Svc -Id $id -Name 'CscService'   -StartupType 'Disabled' -OriginalType 'Manual'
@@ -1781,7 +1620,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # Telemetry ---------------------------------------------------------------------
+  # Telemetry
   [pscustomobject]@{ Id='WPFTweaksTelemetry'; Content='Telemetry - Disable'; Category='Essential'; Apply={
       $id='WPFTweaksTelemetry'
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo' -Name 'Enabled' -Type DWord -Value '0'
@@ -1799,13 +1638,12 @@ $script:Tweaks = @(
       Invoke-Step -Id $id -Description 'disable telemetry services + Defender sample submission' -Action {
           Set-MpPreference -SubmitSamplesConsent 2 -ErrorAction SilentlyContinue
           Set-Service -Name diagtrack -StartupType Disabled -ErrorAction SilentlyContinue
-          # (no "wermgr" line: that is not a service, it did nothing - Windows Error Reporting has its own tweak)
           [Environment]::SetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', '1', 'Machine')
           Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Siuf\Rules' -Name PeriodInNanoSeconds -ErrorAction SilentlyContinue
       }
   }}
 
-  # Temporary Files ---------------------------------------------------------------
+  # Temporary Files
   [pscustomobject]@{ Id='WPFTweaksDeleteTempFiles'; Content='Temporary Files - Remove'; Category='Essential'; Apply={
       Invoke-Step -Id 'WPFTweaksDeleteTempFiles' -Description 'erase TEMP folders (not our log folder, win11-tweaks)' -Action {
           Clear-TempFolder $Env:Temp
@@ -1813,11 +1651,10 @@ $script:Tweaks = @(
       }
   }}
 
-  # Unwanted Pre-Installed Apps ---------------------------------------------------
+  # Unwanted Pre-Installed Apps
   [pscustomobject]@{ Id='WPFTweaksDeBloat'; Content='Unwanted Pre-Installed Apps - Remove'; Category='Essential'; Apply={
       $id='WPFTweaksDeBloat'
-      # (Microsoft.GetHelp is NOT removed: the troubleshooters in Settings > System > Troubleshoot open through it. Paint
-      # and Media Player stay too - superuser, 2026-09-30.)
+      # Microsoft.GetHelp stays: the Settings troubleshooters open through it.
       $apps = @(
           'Microsoft.WindowsFeedbackHub','Microsoft.BingNews','Microsoft.BingSearch',
           'Microsoft.BingWeather','Clipchamp.Clipchamp','Microsoft.Todos','Microsoft.PowerAutomateDesktop',
@@ -1836,12 +1673,12 @@ $script:Tweaks = @(
       }
   }}
 
-  # WPBT --------------------------------------------------------------------------
+  # WPBT
   [pscustomobject]@{ Id='WPFTweaksWPBT'; Content='Windows Platform Binary Table (WPBT) - Disable'; Category='Essential'; Apply={
       Set-Reg -Id 'WPFTweaksWPBT' -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'DisableWpbtExecution' -Type DWord -Value '1'
   }}
 
-  # Microsoft Edge - Debloat ------------------------------------------------------
+  # Microsoft Edge - Debloat
   [pscustomobject]@{ Id='WPFTweaksEdgeDebloat'; Content='Microsoft Edge - Debloat'; Category='Advanced'; Apply={
       $id='WPFTweaksEdgeDebloat'; $e='HKLM:\SOFTWARE\Policies\Microsoft\Edge'
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate' -Name 'CreateDesktopShortcutDefault' -Type DWord -Value '0'
@@ -1861,9 +1698,7 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path $e -Name 'EdgeAssetDeliveryServiceEnabled' -Type DWord -Value '0'
       Set-Reg -Id $id -Path $e -Name 'WalletDonationEnabled' -Type DWord -Value '0'
       Set-Reg -Id $id -Path $e -Name 'DefaultBrowserSettingsCampaignEnabled' -Type DWord -Value '0'
-      # v1.6.0 (Win11Debloat / privacy.sexy): Edge does not preload at sign-in or keep running after it's closed,
-      # downloads no local AI model, and shows no news, promo tabs, "make me default" / sign-in nags, Acrobat
-      # button, Follow, sidebar (not for Microsoft-account profiles), Copilot page access or experiments.
+      # No preload / background running, no local AI model, no news, promo tabs, nags, sidebar, Copilot or experiments.
       Set-Reg -Id $id -Path $e -Name 'StartupBoostEnabled' -Type DWord -Value '0'
       Set-Reg -Id $id -Path $e -Name 'BackgroundModeEnabled' -Type DWord -Value '0'
       Set-Reg -Id $id -Path $e -Name 'GenAILocalFoundationalModelSettings' -Type DWord -Value '1'
@@ -1881,13 +1716,11 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path $e -Name 'ExperimentationAndConfigurationServiceControl' -Type DWord -Value '0'
   }}
 
-  # Microsoft OneDrive - Remove ---------------------------------------------------
+  # Microsoft OneDrive - Remove
   [pscustomobject]@{ Id='WPFTweaksRemoveOneDrive'; Content='Microsoft OneDrive - Remove'; Category='Advanced'; Apply={
       $id='WPFTweaksRemoveOneDrive'
       Invoke-Step -Id $id -Description 'uninstall OneDrive + clean up' -Action {
-          # Only run the (disruptive) removal if OneDrive is actually still present - so a RE-RUN doesn't
-          # redo it. On a re-run OneDrive is already gone and $Env:OneDrive is empty, which made the old
-          # `icacls $Env:OneDrive ...` run with NO path -> icacls dumped its whole usage/help to the console.
+          # Only while OneDrive is still there - a re-run must not redo it (an empty $Env:OneDrive makes icacls dump its help).
           $odInstalled = ($Env:OneDrive -and (Test-Path $Env:OneDrive)) -or (Test-Path "$env:LocalAppData\Microsoft\OneDrive\OneDrive.exe")
           if ($odInstalled) {
               if ($Env:OneDrive) { icacls $Env:OneDrive /deny "Administrators:(D,DC)" 2>&1 | Out-Null }   # guard empty path + silence icacls
@@ -1909,7 +1742,7 @@ $script:Tweaks = @(
       $script:NeedExplorerRestart = $true
   }}
 
-  # Right-Click Menu Previous Layout ----------------------------------------------
+  # Right-Click Menu Previous Layout
   [pscustomobject]@{ Id='WPFTweaksRightClickMenu'; Content='Right-Click Menu Previous Layout - Enable'; Category='Advanced'; Apply={
       Invoke-Step -Id 'WPFTweaksRightClickMenu' -Description 'restore classic context menu' -Action {
           New-Item -Path 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}' -Name 'InprocServer32' -Value '' -Force | Out-Null
@@ -1917,16 +1750,14 @@ $script:Tweaks = @(
       $script:NeedExplorerRestart = $true
   }}
 
-  # Windows AI - Disable And Remove -----------------------------------------------
+  # Windows AI - Disable And Remove
   [pscustomobject]@{ Id='WPFTweaksWindowsAI'; Content='Windows AI - Disable And Remove'; Category='Advanced'; Apply={
       $id='WPFTweaksWindowsAI'
       Add-SettingsPageHidden -Id $id -Page 'aicomponents'   # merged with the Settings Home toggle's "home" - one string
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\WindowsNotepad' -Name 'DisableAIFeatures' -Type DWord -Value '1'
-      # Official Recall GP ("Turn off saving snapshots for Windows") - disables Recall instantly via registry
-      # (fast + idempotent), independent of the slow DISM feature removal below.
+      # Recall GP ("Turn off saving snapshots") - instant, independent of the slow DISM removal below.
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' -Name 'DisableAIDataAnalysis' -Type DWord -Value '1'
-      # Copilot (superuser, 2026-09-30: "remove it" - the WinUtil pipe here did it silently, for the users there were only):
-      # the Copilot app and Microsoft 365 Copilot, for every user AND for new accounts, checked afterwards (Remove-Appx)
+      # Copilot: the app and Microsoft 365 Copilot, for every user and new accounts
       Remove-Appx -Id $id -Name 'Microsoft.Copilot'
       Remove-Appx -Id $id -Name 'Microsoft.MicrosoftOfficeHub'
       Invoke-Step -Id $id -Description 'remove the CoreAI package, disable Recall + WSAIFabricSvc' -Action {
@@ -1937,15 +1768,14 @@ $script:Tweaks = @(
           }
           if ($appx) { Remove-AppxPackage $appx -ErrorAction SilentlyContinue }
           Set-Service -Name WSAIFabricSvc -StartupType Disabled -ErrorAction SilentlyContinue
-          # Only run the (slow) DISM disable if Recall is actually still Enabled - on a re-run it's already
-          # off, and calling Disable-WindowsOptionalFeature again re-does the whole servicing pass for nothing.
+          # DISM only while Recall is Enabled - again would redo the whole servicing pass for nothing.
           if ((Get-WindowsOptionalFeature -Online -FeatureName Recall -ErrorAction SilentlyContinue).State -eq 'Enabled') {
               Disable-WindowsOptionalFeature -FeatureName Recall -Online -NoRestart -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | Out-Null
           }
       }
   }}
 
-  # Dark Theme (toggle ON) --------------------------------------------------------
+  # Dark Theme (toggle ON)
   [pscustomobject]@{ Id='WPFToggleDarkMode'; Content='Dark Theme for Windows'; Category='Toggle'; Apply={
       $id='WPFToggleDarkMode'; $p='HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize'
       Set-Reg -Id $id -Path $p -Name 'AppsUseLightTheme'   -Type DWord -Value '0'
@@ -1953,46 +1783,45 @@ $script:Tweaks = @(
       Update-Explorer -Action refresh
   }}
 
-  # File Explorer File Extensions (toggle ON) -------------------------------------
+  # File Explorer File Extensions (toggle ON)
   [pscustomobject]@{ Id='WPFToggleShowExt'; Content='File Explorer File Extensions'; Category='Toggle'; Apply={
       Set-Reg -Id 'WPFToggleShowExt' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'HideFileExt' -Type DWord -Value '0'
       $script:NeedExplorerRestart = $true
   }}
 
-  # Game Mode (toggle ON) ---------------------------------------------------------
+  # Game Mode (toggle ON)
   [pscustomobject]@{ Id='WPFToggleGameMode'; Content='Game Mode'; Category='Toggle'; Apply={
       $id='WPFToggleGameMode'; $p='HKCU:\Software\Microsoft\GameBar'
       Set-Reg -Id $id -Path $p -Name 'AllowAutoGameMode'   -Type DWord -Value '1'
       Set-Reg -Id $id -Path $p -Name 'AutoGameModeEnabled' -Type DWord -Value '1'
   }}
 
-  # Logon Screen Acrylic Blur (toggle ON) ----------------------------------------
+  # Logon Screen Acrylic Blur (toggle ON)
   [pscustomobject]@{ Id='WPFToggleLoginBlur'; Content='Logon Screen Acrylic Blur'; Category='Toggle'; Apply={
       Set-Reg -Id 'WPFToggleLoginBlur' -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name 'DisableAcrylicBackgroundOnLogon' -Type DWord -Value '0'
   }}
 
-  # Num Lock on Startup (toggle ON) -----------------------------------------------
+  # Num Lock on Startup (toggle ON)
   [pscustomobject]@{ Id='WPFToggleNumLock'; Content='Num Lock on Startup'; Category='Toggle'; Apply={
       $id='WPFToggleNumLock'
       Set-Reg -Id $id -Path 'HKU:\.Default\Control Panel\Keyboard' -Name 'InitialKeyboardIndicators' -Type String -Value '2'
       Set-Reg -Id $id -Path 'HKCU:\Control Panel\Keyboard'         -Name 'InitialKeyboardIndicators' -Type String -Value '2'
   }}
 
-  # S0 Sleep Network Connectivity (toggle ON) ------------------------------------
+  # S0 Sleep Network Connectivity (toggle ON)
   [pscustomobject]@{ Id='WPFToggleStandbyFix'; Content='S0 Sleep Network Connectivity'; Category='Toggle'; Apply={
       Set-Reg -Id 'WPFToggleStandbyFix' -Path 'HKCU:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\f15576e8-98b7-4186-b944-eafa664402d9' -Name 'ACSettingIndex' -Type DWord -Value '1'
   }}
 
-  # Settings Home Page (toggle ON) ------------------------------------------------
+  # Settings Home Page (toggle ON)
   [pscustomobject]@{ Id='WPFToggleHideSettingsHome'; Content='Settings Home Page - Hide'; Category='Toggle'; Apply={
       $id='WPFToggleHideSettingsHome'
-      # Home is the page with the Game Pass / Microsoft 365 / OneDrive cards; Settings then opens on System. This used
-      # to write "show:home" to HKCU - not a valid prefix, it did nothing - so that value is cleaned up.
+      # Home = the Game Pass / Microsoft 365 / OneDrive cards. An old HKCU "show:home" (not a valid prefix) is cleaned up.
       Add-SettingsPageHidden -Id $id -Page 'home'
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name 'SettingsPageVisibility' -Type String -Value '<RemoveEntry>'
   }}
 
-  # Start Menu Recommendations (toggle ON) ---------------------------------------
+  # Start Menu Recommendations (toggle ON)
   [pscustomobject]@{ Id='WPFToggleStartMenuRecommendations'; Content='Start Menu Recommendations'; Category='Toggle'; Apply={
       $id='WPFToggleStartMenuRecommendations'
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Start'     -Name 'HideRecommendedSection'  -Type DWord -Value '0'
@@ -2001,20 +1830,18 @@ $script:Tweaks = @(
       $script:NeedExplorerRestart = $true
   }}
 
-  # System Tray Battery Percentage (toggle ON) -----------------------------------
+  # System Tray Battery Percentage (toggle ON)
   [pscustomobject]@{ Id='WPFToggleBatteryPercentage'; Content='System Tray Battery Percentage'; Category='Toggle'; Apply={
       Set-Reg -Id 'WPFToggleBatteryPercentage' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'IsBatteryPercentageEnabled' -Type DWord -Value '1'
   }}
 
-  # Taskbar Centered Icons (toggle ON) -------------------------------------------
+  # Taskbar Centered Icons (toggle ON)
   [pscustomobject]@{ Id='WPFToggleTaskbarAlignment'; Content='Taskbar Centered Icons'; Category='Toggle'; Apply={
       Set-Reg -Id 'WPFToggleTaskbarAlignment' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'TaskbarAl' -Type DWord -Value '1'
       $script:NeedExplorerRestart = $true
   }}
 
-  # Windows Spotlight - turn off rotating desktop pictures + the "Windows (dark)" theme's wallpaper (superuser, 2026-09-30:
-  # the dark theme with its wallpaper - it was the light Bloom). CurrentTheme = dark.theme: Settings > Personalization >
-  # Themes shows "Windows (dark)" (checked on VM 102), without opening Settings. A Windows without it: the light Bloom.
+  # Spotlight off + the Windows (dark) theme and wallpaper (Settings shows that theme). No dark theme: the light Bloom.
   [pscustomobject]@{ Id='CustomSpotlightOff'; Content='Windows Spotlight - Disable + the Windows (dark) wallpaper'; Category='Custom'; Apply={
       $id='CustomSpotlightOff'
       $wall = Join-Path $env:SystemRoot 'Web\Wallpaper\Windows\img19.jpg'; $theme = Join-Path $env:SystemRoot 'resources\Themes\dark.theme'
@@ -2035,29 +1862,22 @@ $script:Tweaks = @(
       }
   }}
 
-  # The mouse pointer (superuser, 2026-10-12: always, no question, in the theme so it is still there after a restart):
-  # MSUHost Cursors on every PC, inside a theme of ours (the Windows (dark) theme + these cursors) so a
-  # restart, or the theme picked again in Settings, keeps them. After CustomSpotlightOff, whose CurrentTheme it replaces.
-  # See Set-CursorTheme.
+  # See Set-CursorTheme. After CustomSpotlightOff, whose CurrentTheme it replaces.
   [pscustomobject]@{ Id='CustomCursors'; Content='Mouse pointer - MSUHost Cursors, in the theme'; Category='Custom'; Apply={
       Invoke-Step -Id 'CustomCursors' -Description 'mouse pointer: MSUHost Cursors + the MSUHost (dark) theme with them' -Action { Set-CursorTheme -Id 'CustomCursors' }
   }}
 
-  # Ultimate Performance power plan - max performance, then ACTIVATE it. PC only (Machine='PC'): a laptop keeps Windows'
-  # own plan (superuser, 2026-09-30 - on battery Ultimate would keep the CPU from idling).
+  # PC only: on battery Ultimate would keep the CPU from idling
   [pscustomobject]@{ Id='CustomUltimatePerf'; Content='Ultimate Performance - power plan'; Category='Custom'; Machine='PC'; Apply={
       Invoke-Step -Id 'CustomUltimatePerf' -Description 'enable + activate Ultimate Performance power plan' -Action { Set-PcPowerPlan -Id 'CustomUltimatePerf' }
   }}
 
-  # Laptop power (superuser, 2026-09-30): Windows' own plan - the performance tweaks are for a PC. A laptop that ran 1.6 /
-  # 1.7 got their "Ultimate + Balanced on battery" plan: that goes, Balanced is back (Reset-LaptopPowerPlan).
+  # Laptop: Windows' own plan
   [pscustomobject]@{ Id='CustomLaptopPower'; Content='Power plan - Windows'' own (an earlier version''s plan removed)'; Category='Custom'; Machine='Laptop'; Apply={
       Invoke-Step -Id 'CustomLaptopPower' -Description "power plan: Windows' own - an earlier version's laptop plan removed" -Action { Reset-LaptopPowerPlan -Id 'CustomLaptopPower' }
   }}
 
-  # (Core Isolation / Memory Integrity - no longer turned off: superuser 2026-10-02, it stays as Windows has it, on)
-
-  # Mouse - disable "Enhance pointer precision" (mouse acceleration); preferred for gaming/consistency
+  # Mouse - disable "Enhance pointer precision" (mouse acceleration)
   [pscustomobject]@{ Id='CustomMouseAccel'; Content='Mouse - disable Enhance Pointer Precision'; Category='Custom'; Apply={
       $id='CustomMouseAccel'; $m='HKCU:\Control Panel\Mouse'
       Set-Reg -Id $id -Path $m -Name 'MouseSpeed'      -Type String -Value '0'
@@ -2067,9 +1887,9 @@ $script:Tweaks = @(
           if (-not ([System.Management.Automation.PSTypeName]'Native.Mouse').Type) {
               Add-Type -Namespace Native -Name Mouse -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)] public static extern bool SystemParametersInfo(uint uAction, uint uParam, int[] lpvParam, uint fuWinIni);'
           }
-          # SPI_SETMOUSE=0x0004; lpvParam={threshold1,threshold2,acceleration}; {0,0,0}=off; fuWinIni=UPDATEINIFILE|SENDCHANGE
+          # SPI_SETMOUSE, {0,0,0} = off, UPDATEINIFILE|SENDCHANGE
           [Native.Mouse]::SystemParametersInfo(0x0004, 0, (New-Object 'int[]' 3), 3) | Out-Null
-          # also reload per-user params from the registry so it takes effect live (SPI alone can be flaky)
+          # SPI alone can be flaky
           Start-Process rundll32.exe -ArgumentList 'user32.dll,UpdatePerUserSystemParameters' -WindowStyle Hidden -ErrorAction SilentlyContinue
       }
   }}
@@ -2097,19 +1917,14 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' -Name 'SearchboxTaskbarMode' -Type DWord -Value '0'  # Search box -> Hidden
       Set-Reg -Id $id -Path $p -Name 'ShowTaskViewButton' -Type DWord -Value '0'   # Task view button off
       Set-Reg -Id $id -Path $p -Name 'TaskbarMn'          -Type DWord -Value '0'   # Chat button off
-      # Resume ("continue on this PC" from your phone - Settings > Apps > Resume) off; applies at the next sign-in
+      # Resume (continue on this PC from the phone) off; at the next sign-in
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' -Name 'IsResumeAllowed' -Type DWord -Value '0'
-      # Widgets: HKCU 'TaskbarDa' is locked on 25H2 (Set fails "unauthorized"), so kill it via the HKLM policy instead -
-      # which Windows (UCPD) guards too on newer machines (superuser's Razer, 2026-09-30); there the Widgets app itself
-      # goes (CustomRemoveMoreApps), so a refusal is not a warning.
+      # Widgets: HKCU 'TaskbarDa' is locked on 25H2; UCPD may guard the policy too - the app goes anyway (CustomRemoveMoreApps)
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' -Name 'AllowNewsAndInterests' -Type DWord -Value '0' -Guarded
       $script:NeedExplorerRestart = $true
   }}
 
-  # Search - disable web/Bing results in Start (local apps/files/settings still resolve, and faster).
-  # On Win11 24H2/25H2 (build 26200) the reliable switch is the Explorer policy DisableSearchBoxSuggestions=1
-  # (removes web suggestions + the Copilot search button); the Windows Search + Bing keys reinforce it so
-  # web results don't come back via the connected-search path.
+  # On 24H2/25H2 DisableSearchBoxSuggestions=1 is the reliable switch; the others stop connected-search web results.
   [pscustomobject]@{ Id='CustomDisableWebSearch'; Content='Search - no web/Bing, Store, highlights or cloud results'; Category='Custom'; Apply={
       $id='CustomDisableWebSearch'
       Set-Reg -Id $id -Path 'HKCU:\Software\Policies\Microsoft\Windows\Explorer'         -Name 'DisableSearchBoxSuggestions' -Type DWord -Value '1'
@@ -2117,16 +1932,15 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'   -Name 'ConnectedSearchUseWeb'       -Type DWord -Value '0'
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search'     -Name 'BingSearchEnabled'           -Type DWord -Value '0'
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search'     -Name 'CortanaConsent'              -Type DWord -Value '0'
-      # no Microsoft Store app suggestions in Start search (Settings > Privacy > Search > Show suggested results > Microsoft Store)
+      # no Microsoft Store app suggestions in Start search
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings' -Name 'IsStoreSuggestionsEnabled' -Type DWord -Value '0'
-      # no "search highlights" (Bing doodles, trending topics) and no results from the Microsoft account's
-      # OneDrive / Outlook - the documented machine policies, not the per-user keys the UCPD driver guards
+      # no search highlights, no OneDrive / Outlook results - machine policies, not the per-user keys UCPD guards
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'   -Name 'EnableDynamicContentInWSB'   -Type DWord -Value '0'
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'   -Name 'AllowCloudSearch'            -Type DWord -Value '0'
       $script:NeedExplorerRestart = $true
   }}
 
-  # Desktop cleanup - remove the Microsoft Edge desktop shortcut (a tweak, so it runs BEFORE the installs)
+  # Desktop: no Edge shortcut
   [pscustomobject]@{ Id='CustomRemoveEdgeShortcut'; Content='Desktop - remove Microsoft Edge shortcut'; Category='Custom'; Apply={
       Invoke-Step -Id 'CustomRemoveEdgeShortcut' -Description 'remove Microsoft Edge desktop shortcut' -Action {
           foreach ($d in @("$env:Public\Desktop", [Environment]::GetFolderPath('Desktop'))) {
@@ -2136,9 +1950,8 @@ $script:Tweaks = @(
       $script:NeedExplorerRestart = $true
   }}
 
-  # ---- v1.6.0: the picks from the 2026-09-27 bloat research (numbers = the pick page) ----------------------
-  # Start: no tips / promoted apps in Recommended (8), no account nags on the profile icon + in Settings (9),
-  # no phone panel next to Start (10). Recommended itself stays - the Start Menu Recommendations toggle shows it.
+  # ---- Bloat and nags ----
+  # Start: no tips / promoted apps in Recommended, no account nags, no phone panel. Recommended itself stays.
   [pscustomobject]@{ Id='CustomStartCleanup'; Content='Start - no tips, ads, account nags or phone panel'; Category='Custom'; Apply={
       $id='CustomStartCleanup'; $adv='HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
       $cdm='HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
@@ -2151,14 +1964,14 @@ $script:Tweaks = @(
       $script:NeedExplorerRestart = $true
   }}
 
-  # Start: the ads pinned to a fresh Start (12) - an empty Start layout, once per profile (see Clear-StartPins)
+  # Start: the ads pinned to a fresh Start - see Clear-StartPins
   [pscustomobject]@{ Id='CustomStartPins'; Content='Start - clear the pinned ads (first run only)'; Category='Custom'; Apply={
       $id='CustomStartPins'
       Invoke-Step -Id $id -Description 'empty Start layout (start2.bin) for this user and for new accounts' -Action { Clear-StartPins -Id $id }
       $script:NeedExplorerRestart = $true
   }}
 
-  # Tips, suggestions and ads all over Windows (14-19, 21, 25) - nothing stops working without them
+  # Tips, suggestions and ads all over Windows
   [pscustomobject]@{ Id='CustomNagsOff'; Content='Windows tips, suggestions and ads - Disable'; Category='Custom'; Apply={
       $id='CustomNagsOff'; $cdm='HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement' -Name 'ScoobeSystemSettingEnabled' -Type DWord -Value '0'   # "Let's finish setting up your device"
@@ -2177,8 +1990,7 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name 'DisableConsumerAccountStateContent' -Type DWord -Value '1'
   }}
 
-  # Lock screen (26-28): no Bing pictures (the desktop Spotlight is off already), no fun facts / tips, no weather-
-  # and-stocks widgets (the policy works on Pro in the EEA; the Widgets app is removed below as well)
+  # Lock screen: no Bing pictures, no fun facts / tips, no widgets
   [pscustomobject]@{ Id='CustomLockScreen'; Content='Lock screen - no Spotlight, tips or widgets'; Category='Custom'; Apply={
       $id='CustomLockScreen'; $cdm='HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
       $ls='HKCU:\Software\Microsoft\Windows\CurrentVersion\Lock Screen'
@@ -2190,8 +2002,7 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path $ls  -Name 'LockScreenWidgetsEnabled' -Type DWord -Value '0'
   }}
 
-  # Copilot leftovers (23-24): the "share with Copilot" button on taskbar window previews; Click to Do (Copilot+
-  # PCs only - the policy does nothing elsewhere)
+  # Copilot leftovers: "share with Copilot" on taskbar previews; Click to Do (Copilot+ PCs only)
   [pscustomobject]@{ Id='CustomCopilotBits'; Content='Copilot - no taskbar sharing, no Click to Do'; Category='Custom'; Apply={
       $id='CustomCopilotBits'
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name 'TaskbarSn' -Type DWord -Value '0'
@@ -2200,8 +2011,7 @@ $script:Tweaks = @(
       $script:NeedExplorerRestart = $true
   }}
 
-  # Windows Error Reporting (53) - crash reports to Microsoft off: policy + service + its queue task. Local crash
-  # dumps keep working. (Replaces the old "wermgr" line, which did nothing.)
+  # Windows Error Reporting off; local crash dumps keep working
   [pscustomobject]@{ Id='CustomWerOff'; Content='Windows Error Reporting - Disable'; Category='Custom'; Apply={
       $id='CustomWerOff'
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting' -Name 'Disabled' -Type DWord -Value '1'
@@ -2212,9 +2022,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # Rarely used services (superuser's list, 2026-09-27): Manual - they still start when something needs them -
-  # and two Disabled. Most are Manual on a fresh 25H2 already (then nothing changes); a service that is Disabled
-  # (Geolocation, by the Location tweak; Routing and Remote Access, by default) is never raised back to Manual.
+  # Rarely used services to Manual (they start when needed); a Disabled one is never raised to Manual
   [pscustomobject]@{ Id='CustomServicesManual'; Content='Services - rarely used ones to Manual'; Category='Custom'; Apply={
       $id='CustomServicesManual'
       $svcs = [ordered]@{
@@ -2224,7 +2032,7 @@ $script:Tweaks = @(
           'dmwappushservice'='Manual'; 'SCardSvr'='Manual'; 'TermService'='Manual'; 'SessionEnv'='Manual'        # WAP Push Message Routing, Smart Card, Remote Desktop (+ Configuration)
           'UmRdpService'='Manual'; 'RemoteAccess'='Disabled'; 'TapiSrv'='Manual'; 'lmhosts'='Manual'             # RDP UserMode Port Redirector, Routing and Remote Access, Telephony, TCP/IP NetBIOS Helper
       }
-      # a loading bar on the rail's live line (superuser's design); -Detailed prints every step instead
+      # a loading bar on the rail's live line; -Detailed prints every step instead
       $i = 0
       foreach ($name in $svcs.Keys) {
           $want = $svcs[$name]
@@ -2241,9 +2049,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # Sticky / Filter / Toggle Keys (65): 5x Shift (or holding right Shift, or Num Lock for 5 s) in a game pops a
-  # dialog that throws you to the desktop. Clear only the "shortcut active" bit (4) - every other accessibility
-  # setting stays; the features themselves stay in Settings > Accessibility. Applies at the next sign-in.
+  # 5x Shift in a game pops a dialog: only the shortcut bit (4) is cleared, the features stay. At the next sign-in.
   [pscustomobject]@{ Id='CustomStickyKeysOff'; Content='Sticky / Filter / Toggle Keys shortcuts - Disable'; Category='Custom'; Apply={
       $id='CustomStickyKeysOff'
       foreach ($k in @(@('StickyKeys', 510), @('Keyboard Response', 126), @('ToggleKeys', 62))) {   # Windows' defaults
@@ -2255,31 +2061,27 @@ $script:Tweaks = @(
       }
   }}
 
-  # Calls (superuser, 2026-09-28): when a call starts (Discord, Teams...) Windows turns every other sound down by 80%,
-  # the game included. 3 = "Do nothing" on the Communications tab of the Sound control panel (no value = the 80%).
+  # Calls: Windows turns every other sound down 80% during a call. 3 = "Do nothing" (Sound > Communications).
   [pscustomobject]@{ Id='CustomNoCallDucking'; Content='Sound - no volume drop during calls'; Category='Custom'; Apply={
       Set-Reg -Id 'CustomNoCallDucking' -Path 'HKCU:\Software\Microsoft\Multimedia\Audio' -Name 'UserDuckingPreference' -Type DWord -Value '3'
   }}
 
-  # Clipboard history (superuser, 2026-09-28): Win+V shows the history from the first press instead of asking to turn
-  # it on. On this PC only - syncing it to other devices (the cloud clipboard) stays off.
+  # Clipboard history: Win+V works from the first press. This PC only - the cloud clipboard stays off.
   [pscustomobject]@{ Id='CustomClipboardHistory'; Content='Clipboard history (Win+V) - Enable'; Category='Custom'; Apply={
       Set-Reg -Id 'CustomClipboardHistory' -Path 'HKCU:\Software\Microsoft\Clipboard' -Name 'EnableClipboardHistory' -Type DWord -Value '1'
   }}
 
-  # Windows Update restarts (73): never on its own while someone is signed in - it asks instead
+  # Windows Update: no restart on its own while someone is signed in
   [pscustomobject]@{ Id='CustomNoAutoReboot'; Content='Windows Update - no auto-restart while signed in'; Category='Custom'; Apply={
       Set-Reg -Id 'CustomNoAutoReboot' -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Name 'NoAutoRebootWithLoggedOnUsers' -Type DWord -Value '1'
   }}
 
-  # Laptop asleep on battery (75): no network in Modern Standby - no heat or drain in the bag; mail and
-  # notifications arrive after it wakes. The machine policy (HKLM); plugged in (AC) is left as it is.
+  # Laptop asleep on battery: no network in Modern Standby (no heat or drain in the bag)
   [pscustomobject]@{ Id='CustomStandbyNoNetBattery'; Content='Sleep on battery - no network'; Category='Custom'; Machine='Laptop'; Apply={
       Set-Reg -Id 'CustomStandbyNoNetBattery' -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\f15576e8-98b7-4186-b944-eafa664402d9' -Name 'DCSettingIndex' -Type DWord -Value '0'
   }}
 
-  # Hibernation (70) - PC only: frees hiberfil.sys (~40% of RAM) and turns Fast Startup off with it. A laptop
-  # keeps it: Modern Standby hibernates on low battery instead of dying.
+  # PC only: a laptop keeps hibernation - Modern Standby hibernates on low battery instead of dying
   [pscustomobject]@{ Id='CustomHibernateOff'; Content='Hibernation - Disable (frees hiberfil.sys)'; Category='Custom'; Machine='PC'; Apply={
       Invoke-Step -Id 'CustomHibernateOff' -Description 'powercfg /hibernate off' -Action {
           $out = & powercfg.exe /hibernate off 2>&1
@@ -2287,10 +2089,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # More pre-installed apps (35-37, 41). Every run: Widgets (the Web Experience Pack + its runtime - the button was
-  # only hidden before), Phone Link + Cross Device, and dead Microsoft apps that OEM / older images still carry.
-  # The Xbox app, Game Bar and the Xbox sign-in parts stay (Game Pass, Minecraft, AMD X3D scheduling).
-  # FIRST run only: promo apps a user may install on purpose later (Spotify, TikTok...) - a re-run leaves them.
+  # Xbox app / Game Bar stay (Game Pass, AMD X3D scheduling). Promo apps: FIRST run only (a user may install them later).
   [pscustomobject]@{ Id='CustomRemoveMoreApps'; Content='More pre-installed apps - Remove (Widgets, Phone Link, promos)'; Category='Custom'; Apply={
       $id='CustomRemoveMoreApps'
       $always = @(
@@ -2312,10 +2111,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # OEM trialware (76), any machine: the Store-app promos makers preinstall - exact names only. Hardware tools stay
-  # (MyASUS, Armoury Crate, Lenovo Vantage, HP System Information / Power Manager, Dell SupportAssist / Power
-  # Manager, Alienware Command Center). Desktop trialware (McAfee, Norton, ExpressVPN) has no silent uninstall -
-  # it's listed WARN in the summary with the vendor's own removal tool, instead of hanging on its dialog.
+  # Store-app promos, exact names only. Desktop trialware has no silent uninstall: a WARN with the vendor's tool.
   [pscustomobject]@{ Id='CustomOemTrialware'; Content='OEM trialware - Remove'; Category='Custom'; Apply={
       $id='CustomOemTrialware'
       $apps = @(
@@ -2338,8 +2134,7 @@ $script:Tweaks = @(
       }
   }}
 
-  # Removed apps coming back (62): Windows Update's OOBE scheduler reinstalls the new Outlook and Dev Home - delete
-  # those entries. Cross Device's too, but only once Cross Device is really gone.
+  # Windows Update's OOBE scheduler reinstalls Outlook / Dev Home (Cross Device: only once it is really gone)
   [pscustomobject]@{ Id='CustomNoReinstall'; Content='Removed apps - stop Windows reinstalling them'; Category='Custom'; Apply={
       $id='CustomNoReinstall'; $base='HKLM:\SOFTWARE\Microsoft\WindowsUpdate\Orchestrator\UScheduler_Oobe'
       $keys = @('OutlookUpdate', 'DevHomeUpdate')
@@ -2347,11 +2142,8 @@ $script:Tweaks = @(
       foreach ($k in $keys) { Remove-RegKey -Id $id -Path "$base\$k" }
   }}
 
-  # ---- Low-end PC (superuser, 2026-10-09): the window's "Low-end PC" box (or -LowEnd) - extra tweaks for a weak PC, only
-  # with the box picked (LowEnd = $true). Here, before the installs; the launchers' startup after them (CustomLowEndStartup).
-  # Performance Options > "Adjust for best performance" - Windows' own mask for it - but the font smoothing and the
-  # thumbnails stay (without them text is jagged and folders show only icons, for no speed); the animations follow at the
-  # next sign-in. Transparency (Settings > Personalization > Colors) off at once.
+  # ---- Low-end PC: only with the window's box (or -LowEnd) ----
+  # "Adjust for best performance", but font smoothing and thumbnails stay (no speed gain). Animations: next sign-in.
   [pscustomobject]@{ Id='CustomLowEndVisual'; Content='Low-end PC - animations and transparency off'; Category='LowEnd'; LowEnd=$true; Apply={
       $id='CustomLowEndVisual'; $d='HKCU:\Control Panel\Desktop'; $adv='HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
       Set-Reg -Id $id -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Name 'VisualFXSetting' -Type DWord -Value '3'   # Custom
@@ -2368,8 +2160,7 @@ $script:Tweaks = @(
       $script:NeedRestart = $true
   }}
 
-  # Windows Search's indexer off for good: nothing indexes files in the background. Start still finds apps and settings
-  # without it (VM 102, 2026-10-09); a search in File Explorer looks through the files themselves (slower).
+  # Start still finds apps and settings without the indexer; File Explorer searches the files (slower)
   [pscustomobject]@{ Id='CustomLowEndSearch'; Content='Low-end PC - Windows Search and indexing off'; Category='LowEnd'; LowEnd=$true; Apply={
       $id='CustomLowEndSearch'
       Set-Svc -Id $id -Name 'WSearch' -StartupType 'Disabled'
@@ -2378,13 +2169,12 @@ $script:Tweaks = @(
       }
   }}
 
-  # Store apps don't run in the background (Settings > Apps: background permissions, for every app). Desktop apps - Steam,
-  # Discord... - are not Store apps: not affected.
+  # Store apps don't run in the background (desktop apps are not affected).
   [pscustomobject]@{ Id='CustomLowEndBackgroundApps'; Content='Low-end PC - background apps off'; Category='LowEnd'; LowEnd=$true; Apply={
       Set-Reg -Id 'CustomLowEndBackgroundApps' -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' -Name 'LetAppsRunInBackground' -Type DWord -Value '2'   # Force Deny
   }}
 
-  # Game DVR: Game Bar's recording (Win+Alt+R, record what happened) off - OBS records. Game Bar itself stays.
+  # Game Bar's recording off (OBS records); Game Bar stays
   [pscustomobject]@{ Id='CustomLowEndGameDvr'; Content='Low-end PC - Game DVR off'; Category='LowEnd'; LowEnd=$true; Apply={
       $id='CustomLowEndGameDvr'
       Set-Reg -Id $id -Path 'HKCU:\System\GameConfigStore' -Name 'GameDVR_Enabled' -Type DWord -Value '0'
@@ -2392,44 +2182,37 @@ $script:Tweaks = @(
       Set-Reg -Id $id -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR' -Name 'AllowGameDVR' -Type DWord -Value '0'
   }}
 
-  # Storage Sense (Settings > System > Storage) off - it cleans temp files and the Recycle Bin in the background.
+  # Storage Sense off (background cleanup)
   [pscustomobject]@{ Id='CustomLowEndStorageSense'; Content='Low-end PC - Storage Sense off'; Category='LowEnd'; LowEnd=$true; Apply={
       Set-Reg -Id 'CustomLowEndStorageSense' -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' -Name '01' -Type DWord -Value '0'
   }}
 
-  # msconfig > Boot > Advanced options > "Number of processors" at its highest (superuser's ask) - see Set-BootProcessors.
+  # see Set-BootProcessors
   [pscustomobject]@{ Id='CustomLowEndProcessors'; Content='Low-end PC - every processor at boot (msconfig)'; Category='LowEnd'; LowEnd=$true; Apply={
       Invoke-Step -Id 'CustomLowEndProcessors' -Description 'msconfig > Boot > Advanced: Number of processors = all' -Action { Set-BootProcessors -Id 'CustomLowEndProcessors' }
   }}
 
-  # Defender's scheduled scans at low priority, on at most 20% CPU - see Set-DefenderLight.
+  # see Set-DefenderLight
   [pscustomobject]@{ Id='CustomLowEndDefender'; Content='Low-end PC - Defender scans lighter'; Category='LowEnd'; LowEnd=$true; Apply={
       Invoke-Step -Id 'CustomLowEndDefender' -Description 'Defender: scheduled scans at low priority, at most 20% CPU' -Action { Set-DefenderLight -Id 'CustomLowEndDefender' }
   }}
 
-  # A laptop: Power mode "Best performance" when plugged in (a PC has Ultimate Performance already) - see Set-PowerModeBest.
+  # A laptop only (a PC has Ultimate Performance) - see Set-PowerModeBest
   [pscustomobject]@{ Id='CustomLowEndPower'; Content='Power mode - Best performance plugged in (low-end)'; Category='LowEnd'; LowEnd=$true; Machine='Laptop'; Apply={
       Invoke-Step -Id 'CustomLowEndPower' -Description 'Power mode: Best performance when plugged in' -Action { Set-PowerModeBest -Id 'CustomLowEndPower' }
   }}
 
-  # The taskbar (superuser): File Explorer, This PC and the browsers picked (Chrome, Brave or both) pinned; the pins Windows
-  # comes with go (Edge, the Store, Microsoft 365 Copilot, Outlook). LATE: after the installs, so the browsers are there.
-  # Windows' own taskbar layout - see Set-TaskbarLayout (until 1.8.0 a helper wrote the taskbar's registry data and every
-  # pin was gone after the next restart).
+  # Taskbar pins - see Set-TaskbarLayout. LATE: after the installs, so the browsers are there.
   [pscustomobject]@{ Id='CustomTaskbarPins'; Content='Taskbar - File Explorer, This PC and the browsers picked (Chrome, Brave) pinned'; Category='Custom'; Late=$true; Apply={
       Invoke-Step -Id 'CustomTaskbarPins' -Description "taskbar layout (Windows' own): File Explorer, This PC, the browsers picked" -Action { Set-TaskbarLayout -Id 'CustomTaskbarPins' }
   }}
 
-  # Low-end PC: the launchers don't start with Windows (Steam, Discord, Battle.net...) - switched off the way Task Manager >
-  # Startup apps does; they run as usual when opened. LATE: their startup entries come with their installs.
+  # LATE: the launchers' startup entries come with their installs
   [pscustomobject]@{ Id='CustomLowEndStartup'; Content='Startup - launchers don''t start with Windows (low-end)'; Category='LowEnd'; LowEnd=$true; Late=$true; Apply={
       Invoke-Step -Id 'CustomLowEndStartup' -Description "the launchers' startup off (Task Manager > Startup apps)" -Action { Disable-LauncherStartup -Id 'CustomLowEndStartup' }
   }}
 
-  # Old Windows components nobody uses at home (42-47, 50) - they come back from Settings > System > Optional
-  # features. (Windows Media Player Legacy can go: the new Media Player is never removed.)
-  # LATE, after .NET 3.5: removing IE mode / Work Folders leaves Windows waiting for a restart, and while it waits
-  # it holds every new feature back until the restart too - .NET 3.5 included (superuser's VM run, 2026-09-27).
+  # LATE, after .NET 3.5: removing IE mode / Work Folders leaves a pending restart that holds new features back
   [pscustomobject]@{ Id='CustomRemoveComponents'; Content='Old Windows components - Remove (Steps Recorder, IE mode...)'; Category='Custom'; Late=$true; Apply={
       $id='CustomRemoveComponents'
       Remove-WinCapability -Id $id -Name 'App.StepsRecorder' -Label 'Steps Recorder'
@@ -2441,22 +2224,16 @@ $script:Tweaks = @(
       Remove-WinCapability -Id $id -Name 'Media.WindowsMediaPlayer' -Label 'Windows Media Player Legacy'
       Disable-WinFeature   -Id $id -Name 'WindowsMediaPlayer' -Label 'Windows Media Player Legacy (feature)'
       $n = $script:UiRemoved.Count
-      $note = if ($n) { '{0} removed' -f $n } else { 'nothing left to remove' }   # which ones: the log (superuser: no list on the line)
+      $note = if ($n) { '{0} removed' -f $n } else { 'nothing left to remove' }   # which ones: the log
       if (-not $script:DryRun) { Set-UiNote $id $note }
   }}
 
-  # Monitors (superuser, 2026-09-27): a 144 / 165 Hz monitor often comes set to 60 Hz - every screen to its highest
-  # refresh rate (see Set-MaxRefreshRate). PC only: a laptop's own panel stays as its maker set it (more Hz = less
-  # battery). LATE: without the real GPU driver Windows offers 60 Hz only, and that driver often arrives from Windows
-  # Update while the apps install. (Re-run the script after the driver if a screen stayed at 60 Hz.)
+  # PC only (battery). LATE: until the real GPU driver arrives (often via Windows Update) Windows offers 60 Hz only.
   [pscustomobject]@{ Id='CustomMaxRefreshRate'; Content='Monitors - highest refresh rate (e.g. 144 / 165 Hz)'; Category='Custom'; Machine='PC'; Late=$true; Apply={
       Invoke-Step -Id 'CustomMaxRefreshRate' -Description 'every screen to its highest refresh rate at the current resolution' -Action { Set-MaxRefreshRate -Id 'CustomMaxRefreshRate' }
   }}
 
-  # VBScript (51) - deprecated, Microsoft is phasing it out. LATE: removed after the app installs, in case an
-  # installer still runs a .vbs step. Command-line activation (slmgr.vbs, Office's ospp.vbs) needs it - activate
-  # in Settings, or add it back in Settings > System > Optional features.
-  # Kept on an AMD machine: AMD's chipset installer checks the platform with a VBScript - now and for every later update.
+  # LATE: an installer may run a .vbs. Kept on AMD: the chipset installer (and its updates) needs it.
   [pscustomobject]@{ Id='CustomRemoveVBScript'; Content='VBScript - Remove (after the installs)'; Category='Custom'; Late=$true; Apply={
       if ((Get-CpuVendor) -eq 'AuthenticAMD') {
           Write-Log INFO 'Keeping VBScript - the AMD chipset installer needs it (also for its later updates)' 'CustomRemoveVBScript'
@@ -2467,9 +2244,7 @@ $script:Tweaks = @(
   }}
 )
 
-# The tweak phase on the console: ONE rail line per group, in this order, once the phase is over (Write-TweakGroups).
-# Text = what the group does: a string, one per machine type, or a scriptblock (the counts). A tweak in no group
-# would land in "Other" - the tests make sure none does. The Late tweaks have their own lines (Finishing).
+# ONE rail line per group (Write-TweakGroups). A tweak in no group lands in "Other" - the tests check none does.
 $script:TweakGroups = @(
     [pscustomobject]@{ Name = 'Windows activation'; Text = { if (([string]$script:ProductKey).Trim()) { 'key added, Windows activated' } else { 'Settings > Activation opened' } }; Ids = @('WindowsActivation') }   # only when it ran
     [pscustomobject]@{ Name = 'Privacy'; Text = 'telemetry, activity history, location, error reports'
@@ -2486,13 +2261,13 @@ $script:TweakGroups = @(
     [pscustomobject]@{ Name = 'Edge'; Text = 'no startup boost, promos or sidebar'; Ids = @('WPFTweaksEdgeDebloat') }
     [pscustomobject]@{ Name = 'Performance'; Text = @{ PC = 'Ultimate Performance, no hibernation'; Laptop = 'Windows'' own power plan' }
         Ids = @('CustomUltimatePerf', 'CustomLaptopPower', 'WPFToggleGameMode', 'CustomHibernateOff', 'WPFToggleStandbyFix', 'CustomStandbyNoNetBattery') }
-    [pscustomobject]@{ Name = 'Low-end PC'; Text = {   # only with the box - what came of each, from their notes
-            $t = 'animations, search, background apps off'   # (Game DVR, Storage Sense, Defender: the log and the window)
+    [pscustomobject]@{ Name = 'Low-end PC'; Text = {   # only with the box
+            $t = 'animations, search, background apps off'
             foreach ($id in 'CustomLowEndProcessors', 'CustomLowEndPower') { if ($script:UiNotes.ContainsKey($id)) { $t += " $($script:G.Dot) " + $script:UiNotes[$id] } }
             $t }
         Ids = @('CustomLowEndVisual', 'CustomLowEndSearch', 'CustomLowEndBackgroundApps', 'CustomLowEndGameDvr', 'CustomLowEndStorageSense', 'CustomLowEndProcessors', 'CustomLowEndDefender', 'CustomLowEndPower') }
     [pscustomobject]@{ Name = 'Mouse pointer'; Text = { if ($script:UiNotes.ContainsKey('CustomCursors')) { $script:UiNotes['CustomCursors'] } else { 'MSUHost Cursors, in the theme' } }
-        Ids = @('CustomCursors') }   # its own line (superuser, 2026-10-12) - "Input & look" has no room left on the rail
+        Ids = @('CustomCursors') }   # own line: no room left in "Input & look"
     [pscustomobject]@{ Name = 'Input & look'; Text = 'dark theme, Num Lock, Win+V history, no mouse acceleration'
         Ids = @('WPFToggleDarkMode', 'WPFToggleLoginBlur', 'WPFToggleNumLock', 'CustomMouseAccel', 'CustomStickyKeysOff', 'CustomClipboardHistory') }
     [pscustomobject]@{ Name = 'Sound'; Text = 'no volume drop during calls'; Ids = @('CustomNoCallDucking') }
@@ -2501,9 +2276,7 @@ $script:TweakGroups = @(
     [pscustomobject]@{ Name = 'System'; Text = 'Cloudflare DNS, no auto-restart, temp files cleaned'; Ids = @('CustomDnsCloudflare', 'CustomNoAutoReboot', 'WPFTweaksDeleteTempFiles') }
 )
 
-# --------------------------------------------------------------------------------------
-#  Install phase configuration (runs AFTER tweaks). Add more apps here in the future.
-# --------------------------------------------------------------------------------------
+# ---- Install phase configuration (runs AFTER the tweaks) ----
 $script:AppsToInstall = @(
     'Microsoft.DirectX',
     'RevoUninstaller.RevoUninstaller',
@@ -2518,111 +2291,85 @@ $script:AppsToInstall = @(
     'NZXT.CAM',
     'Skillbrains.Lightshot',
     'VideoLAN.VLC',
-    'SavardSoftware.TurboTop',           # always-on-top helper (on winget, not the savardsoftware.com exe)
+    'SavardSoftware.TurboTop',
     'RARLab.WinRAR',
-    'JAMSoftware.TreeSize.Free',         # superuser, 2026-09-30: TreeSize, qBittorrent, MSI Afterburner (with RivaTuner -
-    'qBittorrent.qBittorrent',           # its installer always brings it)
-    'Guru3D.Afterburner',
-    'Brave.Brave',                       # superuser, 2026-10-12: Brave next to Chrome - its box is empty (AppsOffByDefault)
-    '9PB2MZ1ZMB1S',                      # iTunes and Apple Devices (superuser, 2026-09-30) - the Microsoft Store's, the way
-    '9NP83LWLPZ9K'                       # Apple offers them for Windows 10 / 11 (see AppSources)
+    'JAMSoftware.TreeSize.Free',
+    'qBittorrent.qBittorrent',
+    'Guru3D.Afterburner',                # its installer brings RivaTuner too
+    'Brave.Brave',
+    '9PB2MZ1ZMB1S',                      # iTunes and Apple Devices - from the Microsoft Store, as Apple offers them
+    '9NP83LWLPZ9K'
 )
-# The apps whose box in the window is EMPTY (superuser, 2026-10-12): installed only when picked there - never from the
-# console, which has nobody to pick them. Keys as Get-AppChoices gives them.
+# Their box in the window is EMPTY: installed only when picked there, never from the console
 $script:AppsOffByDefault = @('Brave.Brave')
-# winget installs these for the whole machine only when asked (the default scope is the user's - TreeSize would land in
-# the admin's profile). Keyed by winget ID.
+# winget's default scope is the user's - TreeSize would land in the admin's profile
 $script:AppScopes = @{
     'JAMSoftware.TreeSize.Free' = 'machine'
-    'Brave.Brave'               = 'machine'   # Program Files and a Start Menu shortcut for every user, like Chrome (the taskbar pins it)
+    'Brave.Brave'               = 'machine'   # a Start Menu shortcut for every user (the taskbar pins it)
 }
-# Apps winget gets from the Microsoft Store, not from its own repository (the Store keeps them up to date too). Keyed by
-# ID (the Store's product ID).
 $script:AppSources = @{
     '9PB2MZ1ZMB1S' = 'msstore'   # iTunes
-    '9NP83LWLPZ9K' = 'msstore'   # Apple Devices (iPhone / iPad backup, sync and updates)
+    '9NP83LWLPZ9K' = 'msstore'   # Apple Devices
 }
-# Vendor apps: installed (picked, like every app in the window's list) but ONLY on that vendor's hardware, desktop or
-# laptop alike (Hardware is a regex against Win32_ComputerSystem "<Manufacturer> <Model>", or Require a test):
-#   Alienware Command Center -> Alienware / Dell G-series (msstore - the Store only offers it there; if the
-#                               Store install fails, Install-Alienware falls back to Dell's direct installer).
-#                               Older G models have no "Dell " in the model ("Dell Inc. G5 5500"), newer ones
-#                               do ("Dell Inc. Dell G15 5511") - hence "Dell ... G<n> <4 digits>".
-# (AnyDesk and HP Support Assistant removed per user request.)
+# Vendor apps: only on their hardware (Hardware = regex on "<Manufacturer> <Model>", or Require). Older Dell G models
+# have no "Dell " in the model ("Dell Inc. G5 5500") - hence "Dell ... G<n> <4 digits>".
 $script:VendorApps = @(
     @{ Id='9PMHP03NJ9QP'; Name='Alienware Command Center'; Vendor='Alienware/Dell G'; Hardware='Alienware|^Dell\b.*\bG\d{1,2}\s+\d{4}\b'; Source='msstore' }
-    # Armoury Crate (superuser, 2026-09-30) -> ASUS ROG / TUF / PRIME / ProArt boards and ROG / TUF laptops (Install-ArmouryCrate)
     @{ Id='ArmouryCrate'; Name='Armoury Crate'; Vendor='ASUS ROG / TUF'; Require={ Test-ArmouryCrateHardware }; RequireMsg='not ASUS ROG / TUF / PRIME / ProArt' }
-    # ASUS DriverHub (superuser, 2026-10-02) -> any ASUS motherboard in a PC: ASUS's own driver tool for its boards -
-    # Armoury Crate 6 no longer offers drivers and points to it (Install-AsusDriverHub; its page opens at the end of the run)
+    # Armoury Crate 6 no longer offers drivers and points to DriverHub
     @{ Id='ASUS.DriverHub'; Name='ASUS DriverHub'; Vendor='ASUS'; Require={ Test-AsusDriverHubHardware }; RequireMsg='not an ASUS motherboard in a PC' }
 )
-# winget apps that need their hardware (like the direct apps' Require) - SKIPPED with the reason where it isn't there.
-# Keyed by winget ID.
+# winget apps that need their hardware
 $script:AppRequire = @{
-    'NZXT.CAM' = @{ Require = { Test-NzxtHardware }; RequireMsg = 'no NZXT device' }   # NZXT coolers, fans, cases, keyboards
+    'NZXT.CAM' = @{ Require = { Test-NzxtHardware }; RequireMsg = 'no NZXT device' }
 }
-# The apps for the hardware in this machine (superuser, 2026-09-30: detected, not a question). They are in the window's
-# list - picked, in their own row - only where their hardware is found; the install phase checks it again. Keys as the
-# install phase knows them: winget ID / direct-app Name / vendor-app Id.
+# In the window's list only where their hardware is found. Keys: winget ID / direct-app Name / vendor-app Id.
 $script:HardwareApps = @('NZXT.CAM', 'NVIDIA App', 'AMD Chipset Software', 'Intel Chipset Device Software', 'AMD Software Adrenalin',
                          'Intel Driver & Support Assistant', 'Roland Rubix Driver', 'ArmouryCrate', 'ASUS.DriverHub', '9PMHP03NJ9QP')
-$script:HardwareGroup = 'Drivers & hardware'   # their row in the window
-# Runtimes in $script:AppsToInstall: installed for EVERY machine - never in the window's list (games and apps need them;
-# the Visual C++ redists and .NET 3.5 aren't in the app lists at all).
+$script:HardwareGroup = 'Drivers & hardware'
+# installed on EVERY machine, never in the window's list
 $script:RuntimeApps = @('Microsoft.DirectX')
-# Apps of the winget list that have an installer of their own here (in their place in the list). DirectX: winget's
-# Microsoft.DirectX is only the Store apps' DirectX framework - the runtime games need is Microsoft's End-User Runtime.
+# winget's Microsoft.DirectX is only the Store apps' framework - games need the End-User Runtime
 $script:AppCustom = @{
     'Microsoft.DirectX' = { Install-DirectXRuntime }
 }
-# What the script remembers between runs on this PC: the date the promo apps were removed (CustomRemoveMoreApps) and the
-# GUID of the power plan it made (PcPowerPlan; LaptopPowerPlan = 1.6 / 1.7's laptop plan, until it is removed).
+# remembered between runs (PromoAppsRemoved, PcPowerPlan, LaptopPowerPlan)
 $script:StateKey = 'HKLM:\SOFTWARE\win11-tweaks'
-# The mouse pointer (superuser, 2026-10-12) - CustomCursors / Set-CursorTheme. Windows 11 Cursors Concept, light, by
-# JepriCreations (CC BY-NC-ND 3.0 - the files unchanged, credited in assets\CURSORS.md): assets\<Zip> in this repo, next to
-# the script in the release ZIP, else downloaded from Url; used only when its SHA-256 is this one. Roles in the order of a
-# Windows cursor scheme (Control Panel\Cursors\Schemes - the same as Windows' own "Windows Black").
+# Windows 11 Cursors Concept (light) by JepriCreations, CC BY-NC-ND 3.0 (unchanged, credited in assets\CURSORS.md)
 $script:Cursors = @{
     Zip    = 'cursors-windows11-light.zip'
     Url    = 'https://gitlab.msuhost.com/superuser/win11-tweaks/-/raw/main/assets/cursors-windows11-light.zip'
     Sha256 = 'D3DE281E8DE4B08273A77FFD940B2AE3FD33BBEC7DEDA3137EC16F11DB6609F5'
     Dir    = 'Windows_11_light'           # under %SystemRoot%\Cursors
     Scheme = 'MSUHost Cursors'
-    Theme  = 'MSUHost (dark)'             # the theme's name in Settings > Personalization > Themes
+    Theme  = 'MSUHost (dark)'
     Roles  = [ordered]@{ Arrow = 'pointer.cur'; Help = 'help.cur'; AppStarting = 'working.ani'; Wait = 'busy.ani'; Crosshair = 'precision.cur'
                          IBeam = 'beam.cur'; NWPen = 'handwriting.cur'; No = 'unavailable.cur'; SizeNS = 'vert.cur'; SizeWE = 'horz.cur'
                          SizeNWSE = 'dgn1.cur'; SizeNESW = 'dgn2.cur'; SizeAll = 'move.cur'; UpArrow = 'alternate.cur'; Hand = 'link.cur'
                          Pin = 'pin.cur'; Person = 'person.cur' }
 }
-# The empty Start layout Clear-StartPins writes (start2.bin, 972 bytes, sha256 2378a237...81ee65). From Win11Debloat
-# (Assets/Start/start2.bin, MIT License, Copyright (c) 2020 Raphire).
+# empty start2.bin (Clear-StartPins), from Win11Debloat - MIT License, Copyright (c) 2020 Raphire
 $script:StartBlankB64 = '4nrhSwH8TRucAIEL3m5RhU5aX0cAW7FJilySr5CE+V6aoBj7A+HZAaADAABc9u55LN8F4borYyXEGl8Q5+RZ+qERszeqUhhZXDvcjTF6rgdprauITLqPgMVMbSZbRsLN/O5uMjSLEr6nWYIwsMJkZMnZyZrhR3PugUhUKOYDqwySCY6/CPkL/Ooz/5j2R2hwWRGqc7ZsJxDFM1DWofjUiGjDUny+Y8UjowknQVaPYao0PC4bygKEbeZqCqRvSgPalSc53OFqCh2FHydzl09fChaos385QvF40EDEgSO8U9/dntAeNULwuuZBi7BkWSIOmWN1l4e+TZbtSJXwn+EINAJhRHyCSNeku21dsw+cMoLorMKnRmhJMLvE+CCdgNKIaPo/Krizva1+bMsI8bSkV/CxaCTLXodb/NuBYCsIHY1sTvbwSBRNMPvccw43RJCUKZRkBLkCVfW24ANbLfHXofHDMLxxFNUpBPSgzGHnueHknECcf6J4HCFBqzvSH1TjQ3S6J8tq2yaQ+jFNkxGRMushdXNNiTNjDFYMJNvgRL2lu63NPE+Cxy+IKC1NdKLweFdOGZr2mvKAw7t/fxmCTieUgLkegDomZbHL6anjy4SkjSCnfTBUNtxc0X3VJiha4wq/ArRrTtVnzcUcX+CI4BNTicx+X2eXugI+EHKjgaQS7fXHqQGEUMUeHMCXlgWUZ5kE3LFTjVifyVIGqYNDuqt7T9l7DWByiuRariySa7tiN1gA2ALKYlRsjsQL7xpxHnT1hi/9b+UuyC46cYQaDUcKDc4BGReJP2gDIyZfudLpgUPc7YfH9doiMcWimSylbKFtsI3Mfo0HONxet5XjzjDoziduYk2dFoFfz19uaRcOHtASKzaGdtk6RC+Tm4BbU/7PlbvHEKJZ720AxOQkzU9U8RWAHHsPUVfWzYoQc2dN8OQ/JlUAqe8+PI05ST4m3LoUpBKB+oU0H84aet5etGpIi4CthvazGencFObWJWNRzxk9BXIX2YoAdXB8b7JFwlxVdhgzZK0zkkrzSSmX9iJcNoi6Tp+RtnljzLTAv6xh8gwytIW5F2e5sVh7aiqo4sji0aE+ToqyNPV7eE9Idi2ZNeEbnJ9LX127uOl5jB280hs0caXLUrYiR15+Y31wtlD8JVeTDxDDac6v+e3C4VX+28mg9bYQ7NGYXZc7yZANC/nWTn+/hkTZUvR0gi+PUz4o/DSdKzbvVCAlqdjArcKkWW4r/WKUSLskoOKRPxdNLPVBl2S6blje4LvBzulpeHWubXWfCW4ILuOI'
-# Per-app install location for packages whose winget manifest REQUIRES one (otherwise
-# winget prompts "Specify the install root:" and blocks the run). Add IDs here as needed.
+# required by the manifest - else winget prompts and blocks the run
 $script:AppLocations = @{
     'Blizzard.BattleNet' = 'C:\Program Files (x86)\Battle.net'
 }
-# Skip-if-already-installed detection by Add/Remove Programs DisplayName (-like pattern),
-# for apps often present OUTSIDE winget so 'winget list' alone won't see them. Add IDs here as needed.
+# ARP DisplayName patterns for apps often installed outside winget
 $script:AppDetectNames = @{
-    'Blizzard.BattleNet'        = '*Battle.net*'   # its setup finishes outside winget (winget reports "Installation abandoned")
+    'Blizzard.BattleNet'        = '*Battle.net*'   # its setup finishes outside winget
     'JAMSoftware.TreeSize.Free' = 'TreeSize Free*'
     'qBittorrent.qBittorrent'   = 'qBittorrent*'
     'Guru3D.Afterburner'        = 'MSI Afterburner*'
 }
-# Non-winget apps: fetch the vendor installer directly and run it silently (see Install-DirectDownload).
+# Non-winget apps (Install-DirectDownload)
 $script:DirectApps = @(
-    @{  # Google Chrome - winget hash mismatch under admin (0x8A150011): Google rotates the enterprise MSI
-        # but the winget manifest hash lags. Direct-download the stable always-latest enterprise MSI (MSI ->
-        # msiexec /i /qn handled by Install-DirectDownload).
+    @{  # Chrome - winget hash mismatch as admin (0x8A150011): the MSI changes before the manifest
         Name       = 'Google Chrome'
         Url        = 'https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi'
         SilentArgs = '/qn /norestart'
         DetectName = 'Google Chrome*'
     }
-    @{  # NVIDIA App - not on winget (hardware-gated). Scrape the official page for the current
-        # NVIDIA_app_vX.exe and install silently. Only runs when an NVIDIA GPU is present.
+    @{  # NVIDIA App - not on winget; the current exe scraped from the official page.
         Name       = 'NVIDIA App'
         UrlScript  = {
             $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
@@ -2635,45 +2382,33 @@ $script:DirectApps = @(
         Require    = { Test-GpuVendor '10DE' 'NVIDIA' }   # by PCI ID: before its driver is in, the card is a "Microsoft Basic Display Adapter"
         RequireMsg = 'no NVIDIA GPU detected'
     }
-    @{  # Bitwarden - winget install fails as admin (ShellExec 0x8A150006); use the official direct installer.
+    @{  # Bitwarden - winget fails as admin (ShellExec 0x8A150006)
         Name       = 'Bitwarden'
         Url        = 'https://vault.bitwarden.com/download/?app=desktop&platform=windows'
         SilentArgs = '/allusers /S'
         DetectName = 'Bitwarden*'
     }
-    @{  # Parsec - winget installer hash mismatch (0x8A150011, cannot override as admin); official installer.
+    @{  # Parsec - winget hash mismatch as admin (0x8A150011)
         Name       = 'Parsec'
         Url        = 'https://builds.parsec.app/package/parsec-windows.exe'
         SilentArgs = '/silent'
         DetectName = 'Parsec*'
     }
-    @{  # Google Play Games - winget hash mismatch under admin (0x8A150011): Google ships a rolling "beta"
-        # tag bootstrapper (Install-GooglePlayGames.exe) whose hash changes constantly, so winget's fixed
-        # manifest hash never matches and can't be overridden as admin. Fetch the SAME URL with the SAME
-        # --silent switch the Google.PlayGames manifest uses - directly, so there's no hash check to fail.
+    @{  # Google Play Games - winget hash mismatch (the bootstrapper changes constantly): the manifest's URL, directly
         Name       = 'Google Play Games'
         Url        = 'https://dl.google.com/tag/s/appguid={47B07D71-505D-4665-AFD4-4972A30C6530}&appname=GPG&needsadmin=true&ap=beta/play/games/Install-GooglePlayGames.exe'
         SilentArgs = '--silent'
         DetectName = 'Google Play Games*'
     }
-    @{  # FL Studio - REMOVED from winget (manifest folder 404 -> winget "No package found"). Image-Line's
-        # official "latest Windows installer" redirect always resolves to the current flstudio_win64_*.exe
-        # (verified: -> install.image-line.com/flstudio/flstudio_win64_26.1.6.5639.exe). NSIS installer -> /S.
-        # No updater of its own: an older one gets the latest (the file's name vs Add/Remove Programs' DisplayVersion,
-        # both 26.1.6.5639-style; a new year's version installs next to the old one, as Image-Line's does).
+    @{  # FL Studio - not on winget, no updater: an older one gets the latest (a new year's version installs beside it)
         Name       = 'FL Studio'
         Url        = 'https://support.image-line.com/redirect/flstudio_win_installer'
         SilentArgs = '/S'
         DetectName = 'FL Studio*'
         UpdateFromUrl = $true
     }
-    # ---- drivers from the maker's own site, not Windows Update (superuser, 2026-09-27). PC only: a laptop keeps its
-    # maker's tuned drivers (AMD and Intel both say so); never in a virtual machine (emulated chipset). Every file must be
-    # signed by the vendor or it is not run.
-    @{  # AMD Chipset Software - Ryzen chipset, power management and (X3D) V-Cache drivers; one package for every Ryzen
-        # board, read off the AM5 page (the file name changes: AMD_Chipset_Software_* / amd_software_*). amd.com serves
-        # the file only with an amd.com Referer (else an HTML page). Only with AMD chipset devices present - a VM on an
-        # AMD host says AMD CPU but has none, and the installer would refuse there. Its setup runs VBScript (kept on AMD).
+    # ---- drivers from the maker's site: PC only (a laptop keeps its maker's), never in a VM, vendor-signed ----
+    @{  # AMD Chipset - from the AM5 page, needs an amd.com Referer; only with AMD chipset devices (none in a VM)
         Name       = 'AMD Chipset Software'
         UrlScript  = {
             $html = (Invoke-WebRequest 'https://www.amd.com/en/support/downloads/drivers.html/chipsets/am5/x870e.html' -UseBasicParsing -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -ErrorAction Stop).Content
@@ -2683,14 +2418,13 @@ $script:DirectApps = @(
         Headers    = @{ Referer = 'https://www.amd.com/' }
         SilentArgs = '/S'
         DetectName = 'AMD Chipset Software*'
-        UpdateFromUrl = $true              # nothing else updates it: AMD_Chipset_Software_8.08.12.551.exe vs DisplayVersion 8.08.12.551
+        UpdateFromUrl = $true              # nothing else updates it
         Signer     = 'Advanced Micro Devices'
         Machine    = 'PC'
         Require    = { (Get-CpuVendor) -eq 'AuthenticAMD' -and (Test-PciVendor '1022') -and -not (Test-VirtualMachine) }
         RequireMsg = 'no AMD chipset'
     }
-    @{  # Intel Chipset Device Software (the INF update utility - mostly device names). Intel's page answers 403 to
-        # PowerShell, so it is read with Windows' own curl.exe; if that fails, the last known build.
+    @{  # Intel Chipset - Intel's page answers 403 to PowerShell: curl.exe, else the last known build
         Name       = 'Intel Chipset Device Software'
         UrlScript  = {
             $html = ''
@@ -2698,18 +2432,14 @@ $script:DirectApps = @(
             $m = [regex]::Match([string]$html, '(?i)https://downloadmirror\.intel\.com/\d+/SetupChipset\.exe')
             if ($m.Success) { $m.Value } else { 'https://downloadmirror.intel.com/925343/SetupChipset.exe' }   # 10.1.20658.8883
         }
-        SilentArgs = '/exenoui /qn /norestart'   # since 10.1.20378 an Advanced Installer package (the old -s is not silent);
-                                                  # verified on VM 102: silent, exit 0, 28 s
-        DetectName = 'SetupChipset*', 'Intel(R) Chipset Device Software*'   # the new name in Add/Remove Programs, and the old
+        SilentArgs = '/exenoui /qn /norestart'   # an Advanced Installer package since 10.1.20378 (the old -s is not silent)
+        DetectName = 'SetupChipset*', 'Intel(R) Chipset Device Software*'   # new and old name
         Signer     = 'Intel Corporation'
         Machine    = 'PC'
         Require    = { (Get-CpuVendor) -eq 'GenuineIntel' -and (Test-PciVendor '8086') -and -not (Test-VirtualMachine) }
         RequireMsg = 'no Intel chipset'
     }
-    @{  # AMD Software: Adrenalin Edition - the Radeon driver + its app. The combined "-c" package (RX 5000 and newer,
-        # Ryzen 7000+ graphics; ~1.7 GB) linked from the current release notes, which the RX 9070 XT page links to.
-        # -INSTALL is silent (NOT -BOOT: that reboots). Older Vega / Polaris chips aren't in it - the installer refuses
-        # them (FAILED; amd.com has a separate package for those).
+    @{  # Adrenalin "-c" package (RX 5000+) from the release notes. -INSTALL is silent (NOT -BOOT: that reboots).
         Name       = 'AMD Software Adrenalin'
         UrlScript  = {
             $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
@@ -2725,14 +2455,11 @@ $script:DirectApps = @(
         DetectName = 'AMD Software*'
         Signer     = 'Advanced Micro Devices'
         Machine    = 'PC'
-        # not next to an NVIDIA card: Ryzen 7000 / 9000 CPUs have Radeon graphics of their own, often visible to Windows
+        # not with an NVIDIA card: Ryzen 7000 / 9000 Radeon iGPUs show up too
         Require    = { (Test-GpuVendor '1002' 'Radeon') -and -not (Test-GpuVendor '10DE' 'NVIDIA') }
         RequireMsg = 'no AMD Radeon card (or an NVIDIA card is the main one)'
     }
-    @{  # Intel Driver & Support Assistant (superuser, 2026-09-30) - it keeps the Intel drivers current (chipset, Wi-Fi,
-        # Bluetooth, graphics); it only offers them, so the chipset driver above still goes in now. Any Intel device counts
-        # (an Intel Wi-Fi / Ethernet card on an AMD board too); PC only like the chipset drivers; never in a VM. Intel's
-        # own always-latest link (the winget package points at it too, and fails whenever Intel swaps the file).
+    @{  # Intel DSA - only offers drivers. Always-latest link (winget's breaks whenever Intel swaps the file).
         Name       = 'Intel Driver & Support Assistant'
         Url        = 'https://dsadata.intel.com/installer'
         SilentArgs = '/quiet /norestart'   # a WiX (burn) bundle
@@ -2743,10 +2470,7 @@ $script:DirectApps = @(
         Require    = { (Test-PciVendor '8086') -and -not (Test-VirtualMachine) }
         RequireMsg = 'no Intel hardware'
     }
-    @{  # Roland Rubix driver (superuser, 2026-10-02) - only with a Rubix 22 / 24 / 44 audio interface plugged in (Roland's
-        # USB IDs in its INF). Without it Windows' own USB audio driver runs the box, and its firmware-update part shows up
-        # as "Rubix22 DFU" with no driver; ASIO needs Roland's driver too. Any machine (it's not the maker's chipset). Roland's
-        # 2021 package (1.0.7 - the newest there is): a 7-Zip box around Roland's driver setup.
+    @{  # Roland Rubix - only with one plugged in (USB IDs from its INF); needed for ASIO
         Name       = 'Roland Rubix Driver'
         Url        = 'https://static.roland.com/assets/media/exe/rubix_wind_v107.exe'
         SilentArgs = '/S'
@@ -2755,17 +2479,14 @@ $script:DirectApps = @(
         Require    = { (Test-UsbVendor '0582&PID_01DF') -or (Test-UsbVendor '0582&PID_01E0') -or (Test-UsbVendor '0582&PID_01E1') }
         RequireMsg = 'no Roland Rubix plugged in'
     }
-    @{  # U.GG (superuser, 2026-09-30) - League of Legends builds and runes. Its own installer (electron-builder NSIS, not
-        # Overwolf any more), always the latest; installs for the signed-in user (%LOCALAPPDATA%\Programs\U.GG). The
-        # u.gg page itself answers scripts with a Cloudflare challenge - this is where it points.
+    @{  # U.GG - the u.gg page answers scripts with a Cloudflare challenge
         Name       = 'U.GG'
         Url        = 'https://static.bigbrain.gg/monoapp/U.GG%20Setup.exe'
         SilentArgs = '/S'
         DetectName = 'U.GG*'
-        Signer     = 'Enthusiast Gaming'   # a new short-lived certificate for every build - the name, never the thumbprint
+        Signer     = 'Enthusiast Gaming'   # a new certificate every build - the name, never the thumbprint
     }
-    @{  # Rockstar Games Launcher (superuser, 2026-09-30) - winget's package fails as admin on a hash mismatch (Rockstar
-        # replaces the file in place); Rockstar's own always-latest link, its silent switches.
+    @{  # Rockstar - winget hash mismatch (the file is replaced in place)
         Name       = 'Rockstar Games Launcher'
         Url        = 'https://gamedownloads.rockstargames.com/public/installer/Rockstar-Games-Launcher.exe'
         SilentArgs = '/s /f'
@@ -2773,41 +2494,31 @@ $script:DirectApps = @(
         DetectName = 'Rockstar Games Launcher*'
         Signer     = 'Rockstar Games'
     }
-    @{  # Razer Synapse (superuser, 2026-09-30). Its one installer (the Razer hub) has no silent mode - Razer's own parts do
-        # (Install-RazerSynapse).
+    @{
         Name       = 'Razer Synapse'
         Custom     = { Install-RazerSynapse }
         DetectName = 'Razer Synapse*'
     }
-    @{  # Vencord (superuser, 2026-09-30) - the Discord client mod, through its command-line installer. Needs Discord - last
-        # of the direct apps, so Discord (a winget app) is in and has updated itself (Install-Vencord).
+    @{  # Vencord last: Discord is in and has updated itself
         Name       = 'Vencord'
         Custom     = { Install-Vencord }
     }
 )
-# Apps that should get a Desktop icon (most make their own; these do not reliably). Keyed by winget ID
-# (or a direct-download Name). Right after each app installs, New-DesktopShortcut copies its Start Menu
-# shortcut, or builds one from Exe if the app made no Start Menu entry; skipped if a Desktop icon exists.
+# apps that make no Desktop icon reliably (New-DesktopShortcut)
 $script:DesktopShortcutApps = @{
     'SavardSoftware.TurboTop' = @{ Name = 'TurboTop';  Exe = 'C:\Program Files (x86)\TurboTop\TurboTop.exe' }
     'Blizzard.BattleNet'      = @{ Name = 'Battle.net'; Exe = "${env:ProgramFiles(x86)}\Battle.net\Battle.net Launcher.exe" }
     'Bitwarden'               = @{ Name = 'Bitwarden'; Exe = "$env:ProgramFiles\Bitwarden\Bitwarden.exe" }
     'Parsec'                  = @{ Name = 'Parsec';    Exe = "$env:ProgramFiles\Parsec\parsecd.exe" }
-    # superuser, 2026-09-30: these made none either
     'JAMSoftware.TreeSize.Free' = @{ Name = 'TreeSize Free'; Exe = "$env:ProgramFiles\JAM Software\TreeSize Free\TreeSizeFree.exe" }
     'qBittorrent.qBittorrent' = @{ Name = 'qBittorrent'; Exe = "$env:ProgramFiles\qBittorrent\qbittorrent.exe" }
-    'Razer Synapse'           = @{ Name = 'Razer Synapse' }   # its Start Menu shortcut (Razer App Engine starts it)
-    '9PB2MZ1ZMB1S'            = @{ Name = 'iTunes' }          # Store apps: no .lnk anywhere - New-DesktopShortcut goes through
-    '9NP83LWLPZ9K'            = @{ Name = 'Apple Devices' }   # shell:AppsFolder
+    'Razer Synapse'           = @{ Name = 'Razer Synapse' }
+    '9PB2MZ1ZMB1S'            = @{ Name = 'iTunes' }          # Store apps: via shell:AppsFolder
+    '9NP83LWLPZ9K'            = @{ Name = 'Apple Devices' }
 }
-# .NET Framework via Windows features (not winget): only 3.5 and 4.
-#   NetFx3        = .NET 3.5 (inherently bundles 2.0/3.0); off by default, may need WU/source.
-#   NetFx4-AdvSrvs = .NET 4.x; already enabled by default on Win11 (enabling is a no-op).
-# .NET features: NetFx3 (.NET 3.5) is started EARLY in the background (Start-DotNet35) so its slow
-# Windows-Update download overlaps the install phase; NetFx4-AdvSrvs is already enabled on Win11 (instant).
+# .NET 3.5 starts EARLY in the background (Start-DotNet35); .NET 4 is on in Win11 already.
 
-# Visual C++ Redistributables - every version, x86 + x64 (32-bit apps/games need x86 too).
-# "2015+" is the combined 2015/2017/2019/2022 (14.x, backward-compatible).
+# every version, x86 + x64; "2015+" is the combined 2015-2022
 $script:VCRedists = @(
     'Microsoft.VCRedist.2005.x86', 'Microsoft.VCRedist.2005.x64',
     'Microsoft.VCRedist.2008.x86', 'Microsoft.VCRedist.2008.x64',
@@ -2816,17 +2527,14 @@ $script:VCRedists = @(
     'Microsoft.VCRedist.2013.x86', 'Microsoft.VCRedist.2013.x64',
     'Microsoft.VCRedist.2015+.x86', 'Microsoft.VCRedist.2015+.x64'
 )
-# What is already installed goes to the latest (winget upgrade) - except these, out of support (no new builds come):
-# DirectX's June 2010 runtime and Visual C++ 2005-2013 (2015-2022 is updated). winget ID -like patterns.
+# installed apps are upgraded - but these are out of support (no new builds)
 $script:NoUpdateApps = @('Microsoft.DirectX', 'Microsoft.VCRedist.2005.*', 'Microsoft.VCRedist.2008.*', 'Microsoft.VCRedist.2010.*',
                          'Microsoft.VCRedist.2012.*', 'Microsoft.VCRedist.2013.*')
-# How long one update may take: an app that is running (Afterburner, Discord...) can make its installer wait on a question
-# nobody sees - then it is stopped and the app stays as it was ("update failed"). The biggest one (MSI Afterburner) needs ~3 min.
+# a running app can make its installer wait on a hidden question; the biggest update (Afterburner) needs ~3 min
 $script:UpdateTimeoutSec = 900
-# How long one install may take (superuser, 2026-10-09): a setup that waits on a question nobody sees is stopped after this
-# long - FAILED "took too long", the run goes on. The longest real ones (Adrenalin, FL Studio, Battle.net) take ~10 min.
+# then FAILED "took too long"; the longest real installs take ~10 min
 $script:InstallTimeoutSec = 1800
-# Low-end PC: the launchers that don't start with Windows - by what their startup entry runs (Disable-LauncherStartup)
+# matched against what each startup entry runs (Disable-LauncherStartup)
 $script:LauncherStartup = [ordered]@{
     'Steam'                   = '\\steam\.exe'
     'Discord'                 = '--processStart\s+"?Discord\.exe'
@@ -2838,11 +2546,10 @@ $script:LauncherStartup = [ordered]@{
     'EA app'                  = '\\EA(Desktop|Launcher)\.exe'
 }
 
-# WinRAR license embedded as base64 (the only source) - the WinRAR step decodes this and writes
-# rarreg.key into the WinRAR dir(s), so both download-and-run AND the `irm|iex` one-liner license WinRAR.
+# embedded so the `irm|iex` one-liner licenses WinRAR too (rarreg.key)
 $script:RarKeyB64 = 'UkFSIHJlZ2lzdHJhdGlvbiBkYXRhCldpblJBUgpVbmxpbWl0ZWQgQ29tcGFueSBMaWNlbnNlClVJRD00YjkxNGZiNzcyYzgzNzZiZjU3MQo2NDEyMjEyMjUwZjU3MTFhZDA3MmNmMzUxY2ZhMzllMjg1MTE5MmRhZjhhMzYyNjgxYmJiMWQKY2Q0OGRhMWQxNGQ5OTVmMGJiZjk2MGZjZTZjYjVmZmRlNjI4OTAwNzk4NjFiZTU3NjM4NzE3CjcxMzFjZWQ4MzVlZDY1Y2M3NDNkOTc3N2YyZWE3MWE4ZTMyYzdlNTkzY2Y2Njc5NDM0MzU2NQpiNDFiY2Y1NjkyOTQ4NmI4YmNkYWMzM2Q1MGVjZjc3Mzk5NjA1MjU5OGYxZjU1NmRlZmZmYmQKOTgyZmJlNzFlOTNkZjZiNjM0NmMzN2EzODkwZjNjN2VkYzY1ZDdmNTQ1NTQ3MGQxM2QxMTkwCjZlNmZiODI0YmNmMjVmMTU1NTQ3YjVmYzQxOTAxYWQ1OGMwOTkyZjU3MGJlMWNmNTYwOGJhOQphZWY2OWQ0OGM4NjRiY2Q3MmQxNTE2Mzg5Nzc3M2QzMTQxODdmNmE5YWYzNTA4MDg3MTk3OTY='
 
-# Friendly display names for the "Installing X" log line (falls back to the winget ID if not listed).
+# names for the log (else the winget ID)
 $script:AppNames = @{
     'Microsoft.VCRedist.2005.x86'  = 'Visual C++ 2005 (x86)';      'Microsoft.VCRedist.2005.x64'  = 'Visual C++ 2005 (x64)'
     'Microsoft.VCRedist.2008.x86'  = 'Visual C++ 2008 (x86)';      'Microsoft.VCRedist.2008.x64'  = 'Visual C++ 2008 (x64)'
@@ -2872,9 +2579,8 @@ $script:AppNames = @{
     '9PB2MZ1ZMB1S'                     = 'iTunes'
     '9NP83LWLPZ9K'                     = 'Apple Devices'
 }
-# The window's app list shows the apps in these rows, in this order - keys as Get-AppChoices gives them (winget ID /
-# direct-app Name / vendor-app Id). The hardware apps found here get their own row ($script:HardwareGroup); an app in no
-# row lands in "Other".
+# The window's app list rows, in order (keys as Get-AppChoices gives them). Hardware apps get their own row; an app in
+# no row lands in "Other".
 $script:AppGroups = [ordered]@{
     'Games'            = @('Valve.Steam', 'EpicGames.EpicGamesLauncher', 'Blizzard.BattleNet', 'Ubisoft.Connect', 'Rockstar Games Launcher', 'Google Play Games', 'U.GG')
     'Chat & streaming' = @('Discord.Discord', 'Vencord', 'OBSProject.OBSStudio', 'Parsec')
@@ -2883,11 +2589,9 @@ $script:AppGroups = [ordered]@{
     'Internet'         = @('Google Chrome', 'Brave.Brave', 'Bitwarden', 'Nextcloud.NextcloudDesktop', 'qBittorrent.qBittorrent')
 }
 
-# --------------------------------------------------------------------------------------
-#  Runner + install phase + summary
-# --------------------------------------------------------------------------------------
+# ---- Runner + install phase + summary ----
 function Get-OsName {
-    # "Windows 11 Pro 25H2 {d:(26200)}" - the build in rail markup (dim)
+    # "Windows 11 Pro 25H2 {d:(26200)}"
     param($Os = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue))
     $osName = ("$($Os.Caption)" -replace '^\s*Microsoft\s+', '').Trim(); if (-not $osName) { $osName = 'Windows' }
     $ver = Get-RegValue -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name 'DisplayVersion'
@@ -2916,13 +2620,11 @@ function Write-Banner {
 }
 
 function Invoke-Tweaks {
-    # The tweak phase runs every tweak except the Late ones; -Late runs only those (Main, after the installs).
-    # The rail: one live line while the phase runs (the groups are printed after it - Write-TweakGroups); the Late
-    # ones are "Finishing", one line each.
+    # -Late: only the Late ones (after the installs, "Finishing")
     param([switch]$Late)
     $list = @($script:Tweaks | Where-Object { [bool]$_.Late -eq [bool]$Late -and (-not $_.LowEnd -or $script:LowEnd) })   # Low-end: only with its box
     Write-UiPhase $(if ($Late) { 'Finishing' } else { 'Tweaks' })
-    if (-not $Late -and $script:OpenActivation) {   # first of all (superuser, 2026-09-30): Windows not activated, the box left on
+    if (-not $Late -and $script:OpenActivation) {   # first of all: Windows not activated, the box left on
         Test-GuiStop
         Send-GuiEvent 'progress' @{ Name = 'Windows activation'; N = 0; Total = $list.Count }
         Show-Live (Format-Row -Glyph "{b:$($script:G.Run)}" -Name 'Windows activation' -NameWidth 60 -Right "0/$($list.Count)")
@@ -2969,7 +2671,7 @@ function Invoke-Tweaks {
 }
 
 function Format-TweakLine {
-    # A Finishing line: short name, what came of it (the tweak's note - or what went wrong), time
+    # a Finishing line
     param($Rec)
     $note = if ($Rec.Status -in 'FAILED', 'WARN', 'SKIPPED') { $Rec.Detail } elseif ($script:UiNotes.ContainsKey($Rec.Id)) { $script:UiNotes[$Rec.Id] } else { '' }
     $color = switch ($Rec.Status) { 'FAILED' { 'r' } 'WARN' { 'y' } default { 'd' } }
@@ -2978,9 +2680,7 @@ function Format-TweakLine {
 }
 
 function Write-TweakGroups {
-    # The tweak phase on the rail, once it's over: one line per group - done (what it did, its time), or the first thing
-    # that went wrong ("! Edge  Microsoft Edge - Debloat: 1 step(s) failed - see the log") - then the tweaks this
-    # machine type skips, on one line ("Laptop only  Power plan, Sleep on battery").
+    # one line per group (what it did, or the first thing that went wrong), then the skipped ones on one line
     if (-not $script:Ui) { return }
     $late = @{}; foreach ($t in $script:Tweaks) { if ($t.Late) { $late[$t.Id] = $true } }
     $done = @($script:Results | Where-Object { $_.Phase -eq 'Tweak' -and -not $late.ContainsKey($_.Id) })
@@ -3010,7 +2710,6 @@ function Write-TweakGroups {
     foreach ($only in @($done | Where-Object { $_.Status -eq 'SKIPPED' } | Group-Object Detail)) {
         Write-Ui (Format-Row -Glyph (Get-Glyph 'SKIPPED') -Name $only.Name -Text ((@($only.Group | ForEach-Object { Get-ShortName $_.Content })) -join ', ') -Status 'SKIPPED' -NameWidth 20)
     }
-    # the window: the phase is over - how many tweaks were applied and how long they took
     $ran = @($done | Where-Object { $_.Status -ne 'SKIPPED' -and "$($_.Id)" -notlike 'Trialware.*' })
     $all = 0.0; foreach ($r in $ran) { if ($r.PSObject.Properties['Seconds']) { $all += [double]$r.Seconds } }
     Send-GuiEvent 'phase-done' @{ Name = 'Tweaks'; Count = $ran.Count; Time = $(if ($all -gt 0) { Format-Span $all } else { '' }) }
@@ -3022,7 +2721,6 @@ function Get-StartMenuShortcuts {
 }
 
 function New-ShellLink {
-    # A .lnk file (WScript.Shell)
     param([string]$Path, [string]$Target, [string]$Arguments = '', [string]$Icon = '')
     $wsh = New-Object -ComObject WScript.Shell; $sc = $wsh.CreateShortcut($Path)
     $sc.TargetPath = $Target; if ($Arguments) { $sc.Arguments = $Arguments } else { $sc.WorkingDirectory = (Split-Path $Target) }
@@ -3031,8 +2729,7 @@ function New-ShellLink {
 }
 
 function Get-StoreAppLink {
-    # A Store app's way in for a shortcut: its app id (Get-StartApps: "<package family>!<app>") and its own .exe for the
-    # icon (the package's manifest). $null if it is no Store app or not there (yet).
+    # app id ("<package family>!<app>") and its .exe for the icon
     param([string]$Name)
     $app = @(Get-StartApps -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $Name -and "$($_.AppID)" -match '^[^\\{]+![^!]+$' })[0]
     if (-not $app) { return $null }
@@ -3050,10 +2747,7 @@ function Get-StoreAppLink {
 }
 
 function New-DesktopShortcut {
-    # Create a Desktop icon for ONE app, called right after that app installs. Prefer copying the app's
-    # Start Menu shortcut (correct icon+target) - the one of exactly that name first, never an "(Administrator)" or a Help
-    # one; else build one from its .exe; a Store app (no .lnk anywhere): shell:AppsFolder\<its app id>, its own icon. Skip if
-    # a Desktop icon already exists (matched by name). Used only for the apps that don't reliably make their own.
+    # its Start Menu shortcut (never an "(Administrator)" / Help one), else from its .exe, else shell:AppsFolder
     param([string]$Name, [string]$Exe)
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would create a Desktop shortcut for $Name"; return }
     $pub = "$env:Public\Desktop"; $usr = [Environment]::GetFolderPath('Desktop')
@@ -3083,8 +2777,7 @@ function New-DesktopShortcut {
 }
 
 function Set-WinRarLicense {
-    # Write rarreg.key (decoded from the embedded base64) into the WinRAR dir(s). Called right after
-    # WinRAR installs so the console reads "Installing WinRAR / Done! / Creating WinRAR license / Done!".
+    # rarreg.key into the WinRAR dir(s), right after WinRAR installs
     $rkBytes = $null
     if ($script:RarKeyB64) { try { $rkBytes = [System.Convert]::FromBase64String($script:RarKeyB64) } catch { } }
     $rarDirs = @("$env:ProgramFiles\WinRAR", "${env:ProgramFiles(x86)}\WinRAR") | Where-Object { Test-Path $_ }
@@ -3109,10 +2802,7 @@ function Set-WinRarLicense {
 }
 
 function Install-DirectXRuntime {
-    # DirectX End-User Runtime (June 2010): the D3DX 9 / 10 / 11, XInput 1.3 and XAudio 2.7 files older games and MSI
-    # Afterburner need - Windows 11 has DirectX 12, not these. (winget's Microsoft.DirectX is only the Store apps' framework,
-    # so Afterburner's setup fetched them itself, in a window of its own - superuser, 2026-09-30.) Microsoft's full package,
-    # signed by Microsoft: unpacked, then DXSETUP /silent. OK / FAILED / DRYRUN.
+    # June 2010 End-User Runtime (D3DX, XInput 1.3, XAudio 2.7) - older games and Afterburner need it; Win11 has only DX12
     $name = 'DirectX'
     $url = 'https://download.microsoft.com/download/8/4/A/84A35BF1-DAFE-4AE8-82AF-AD2AE20B6B14/directx_Jun2010_redist.exe'
     $files = @((Join-Path $env:SystemRoot 'System32\d3dx9_43.dll'), (Join-Path $env:SystemRoot 'SysWOW64\d3dx9_43.dll'))   # 64- and 32-bit
@@ -3145,10 +2835,7 @@ function Install-DirectXRuntime {
 }
 
 function Install-RazerSynapse {
-    # Razer Synapse 4 (superuser, 2026-09-30). Its one installer (the Razer hub) has no silent mode - Razer's own parts do.
-    # Only Synapse and Razer App Engine, which Synapse 4 runs on (his ask: Synapse, nothing else - no Chroma, Razer Central
-    # or Game Manager; Synapse offers its modules itself). The current parts come from Razer's manifest - the one the hub
-    # reads -, each must be signed by Razer. OK / FAILED / DRYRUN.
+    # The hub installer has no silent mode - Razer's own parts (Synapse + App Engine) do, from the manifest the hub reads.
     $name = 'Razer Synapse'
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $name (Razer's parts, from Razer's manifest)"; return 'DRYRUN' }
     if (Test-AppInstalled -NamePattern 'Razer Synapse*') { Write-Log OK "Already installed - $name"; $script:ItemNote = 'already installed'; return 'OK' }
@@ -3177,7 +2864,7 @@ function Install-RazerSynapse {
 }
 
 function Get-DiscordApp {
-    # The signed-in user's Discord: its newest app-<version> folder (the one Discord runs), or $null
+    # the newest app-<version> folder (the one Discord runs)
     $dir = Join-Path $env:LOCALAPPDATA 'Discord'
     @(Get-ChildItem -LiteralPath $dir -Directory -Filter 'app-*' -ErrorAction SilentlyContinue |
         Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'resources') } |
@@ -3185,10 +2872,7 @@ function Get-DiscordApp {
 }
 
 function Install-Vencord {
-    # Vencord (superuser, 2026-09-30) - the Discord mod, through its command-line installer from the Vencord organisation's
-    # GitHub releases (not code-signed - Vencord says so on its page; the link is theirs, over HTTPS). It patches the
-    # signed-in user's Discord and closes Discord for that - so it needs Discord, and runs after it (the last direct app,
-    # when Discord has updated itself). OK / SKIPPED / FAILED / DRYRUN.
+    # CLI installer from its GitHub releases (not code-signed). It patches and closes this user's Discord.
     $name = 'Vencord'
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $name into Discord"; return 'DRYRUN' }
     $app = Get-DiscordApp
@@ -3226,8 +2910,7 @@ function Install-Vencord {
 }
 
 function Test-ArmouryCrateHardware {
-    # What Armoury Crate is for: an ASUS ROG / TUF / PRIME / ProArt board (a home-built PC shows its maker only on the
-    # board), a ROG / TUF laptop or desktop. Not the ROG Ally - it has Armoury Crate SE.
+    # an ASUS ROG / TUF / PRIME / ProArt board, or a ROG / TUF machine - not the ROG Ally (Armoury Crate SE)
     $cs = Get-Hardware; $board = Get-Board
     if ($cs -match '(?i)\bRC7\d') { return $false }
     if ($cs -match '(?i)^ASUS' -and $cs -match '(?i)\b(ROG|TUF|TX Gaming|TX Air)\b') { return $true }
@@ -3235,9 +2918,7 @@ function Test-ArmouryCrateHardware {
 }
 
 function Install-ArmouryCrate {
-    # Armoury Crate (superuser, 2026-09-30): ASUS's installer (ArmouryCrateInstaller.exe in ASUS's always-latest zip) with
-    # -silent (/S does nothing). It returns within seconds, exit code 0 whatever happens; an ASUS service then downloads
-    # Armoury Crate (~1.2 GB) and installs it in the background, finishing after a restart - so it is BACKGROUND, not OK.
+    # -silent (/S does nothing). It returns at once, exit 0 whatever happens; a service installs after - BACKGROUND, not OK.
     $name = 'Armoury Crate'
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $name (ASUS's installer, -silent)"; return 'DRYRUN' }
     if ((Get-Service -Name 'ArmouryCrateService' -ErrorAction SilentlyContinue) -or (Get-AppxPackage -AllUsers -Name 'B9ECED6F.ArmouryCrate' -ErrorAction SilentlyContinue) -or
@@ -3264,19 +2945,16 @@ function Install-ArmouryCrate {
         return 'BACKGROUND'
     } catch {
         Write-Log WARN "Failed - $name ($($_.Exception.Message))"; $script:ItemFail = $_.Exception.Message; return 'FAILED'
-    } finally { Remove-Item $zip -Force -ErrorAction SilentlyContinue }   # (the unpacked folder stays: ASUS's installer can still run from
-                                                                            # it - the next run's temporary-files cleanup takes it)
+    } finally { Remove-Item $zip -Force -ErrorAction SilentlyContinue }   # (the unpacked folder stays: ASUS's installer may still run from it)
 }
 
 function Test-AsusDriverHubHardware {
-    # What ASUS DriverHub is for: an ASUS motherboard in a PC. Its installer checks the same (ASUS's SMBIOS, product line
-    # "Motherboard") and refuses laptops, other makers and virtual machines; some older ASUS boards it does not support.
+    # An ASUS motherboard in a PC - what its installer checks too (it refuses laptops, other makers and VMs).
     return ($script:MachineType -eq 'PC' -and (Get-Board) -match '(?i)^ASUSTeK' -and -not (Test-VirtualMachine))
 }
 
 function Test-AsusDriverHubInstalled {
-    # its uninstall entry - the GUID its installer writes (in either registry view) - or its name (a DriverHub the board's
-    # BIOS put in may have come another way)
+    # its uninstall GUID, or its name (one the BIOS put in may have come another way)
     foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall') {
         if (Test-Path -LiteralPath "$k\{A8761B4B-A179-4469-99B7-FDFA94E551F9}") { return $true }
     }
@@ -3284,11 +2962,9 @@ function Test-AsusDriverHubInstalled {
 }
 
 function Install-AsusDriverHub {
-    # ASUS DriverHub (superuser, 2026-10-02): the version ASUS's feed names, from THAT version's folder - the plain
-    # .../download/ASUS-DriverHub-Installer.exe is still 1.0.4.8 (2024), the one with the remote-code holes
-    # (CVE-2025-3462 / 3463, fixed in 1.0.6.0). Signed by ASUS or never run; --silent = no licence window. Already there:
-    # it updates itself. The drivers come from its page, at the end of the run (Open-DriverHubPage) - ASUS has no way to
-    # install them without that one click.
+    # The version ASUS's feed names, from THAT version's folder: the plain .../download/ASUS-DriverHub-Installer.exe is
+    # still 1.0.4.8, with the remote-code holes (CVE-2025-3462 / 3463, fixed in 1.0.6.0). Signed by ASUS or never run.
+    # Already there: it updates itself. The drivers come from its page at the end of the run (Open-DriverHubPage).
     $name = 'ASUS DriverHub'
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $name (ASUS's installer, --silent) and open its page at the end"; return 'DRYRUN' }
     if (Test-AsusDriverHubInstalled) {
@@ -3321,9 +2997,7 @@ function Install-AsusDriverHub {
 }
 
 function Open-DriverHubPage {
-    # ASUS DriverHub puts the drivers in only from its page (driverhub.asus.com talks to the DriverHub service on this PC):
-    # one click on "Install all". At the end of the run, when DriverHub is on this PC - the summary says so too (and where
-    # to find it when the page did not open). Not with -Reboot: the PC restarts 15 s later.
+    # DriverHub installs drivers only from its page ("Install all"). Not with -Reboot: the PC restarts 15 s later.
     $script:DriverHubOpened = $false
     if (-not $script:DriverHubReady -or $script:DryRun) { return }
     if ($Reboot) { Write-Log INFO 'ASUS DriverHub''s page not opened - the PC restarts (-Reboot); after it: Start > ASUS DriverHub'; return }
@@ -3332,13 +3006,7 @@ function Open-DriverHubPage {
 }
 
 function Install-Alienware {
-    # Alienware Command Center - only called on Alienware / Dell G hardware (the vendor gate in
-    # Invoke-InstallPhase checks Win32_ComputerSystem, so other boxes show SKIPPED, not a scary "Failed").
-    # Returns a STATUS ('OK'/'FAILED'/'DRYRUN'). Tries the Microsoft Store first (official/latest); if the
-    # Store gating misfires, falls back to Dell's DIRECT Full Installer EXE (bypasses the Store). Only a
-    # genuine install failure -> FAILED.
-    # NOTE: the Dell URL is version-pinned (update when Dell ships newer) + /s is a best-effort silent
-    # switch; can't be tested on the non-Alienware VM.
+    # The Store first; if its gating misfires, Dell's installer - version-pinned (update it when Dell ships newer).
     $id = '9PMHP03NJ9QP'; $label = 'Alienware Command Center'
     $dellUrl = 'https://dl.dell.com/FOLDER12874937M/2/Alienware-Command-Center-6-x-Full-Installer-for_5T498_WIN64_6.7.37.0_A00_01.EXE'
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would install $label"; return 'DRYRUN' }
@@ -3371,27 +3039,23 @@ function Install-Alienware {
 }
 
 function Get-CpuVendor {
-    # 'AuthenticAMD' / 'GenuineIntel' (the CPU's own vendor string - not translated). Only that property: the whole
-    # Win32_Processor samples the CPU load first - a second a call (4 of the 5 s of "Getting ready" on VM 102, 2026-09-29)
+    # 'AuthenticAMD' / 'GenuineIntel'. Only that property: the whole Win32_Processor samples the CPU load first (~1 s a call)
     return [string](Get-CimInstance Win32_Processor -Property Manufacturer -ErrorAction SilentlyContinue | Select-Object -First 1).Manufacturer
 }
 
 function Test-VirtualMachine {
-    # A virtual machine (Proxmox/QEMU, VMware, Hyper-V, VirtualBox, Parallels, Xen): its chipset is emulated - no chipset
-    # driver from AMD or Intel belongs there.
+    # an emulated chipset: no AMD / Intel chipset driver belongs there
     return ((Get-Hardware) -match '(?i)QEMU|VMware|Virtual Machine|VirtualBox|innotek|Parallels|Xen|KVM|Standard PC \(')
 }
 
 function Test-DualCcdX3D {
-    # A Ryzen X3D with two CCDs (7900X3D, 7950X3D, 9900X3D, 9950X3D, 7945HX3D...): AMD's V-Cache driver keeps games on the
-    # CCD with the cache by PARKING the other one - through the Balanced plan's core parking, which Ultimate switches off.
+    # AMD's V-Cache driver keeps games on the cache CCD by PARKING the other - via Balanced's core parking (Ultimate: off)
     $c = Get-CimInstance Win32_Processor -Property Name, NumberOfCores -ErrorAction SilentlyContinue | Select-Object -First 1   # (only these - Get-CpuVendor)
     return ("$($c.Name)" -match 'X3D' -and [int]$c.NumberOfCores -gt 8)
 }
 
 function Get-PnpIds {
-    # Every device's ID (PCI\VEN_..., USB\VID_..., HID\VID_...) - read ONCE per run and kept: the hardware checks ask for
-    # it several times, and the whole Win32_PnPEntity class takes a moment. Only the ID (see Get-CpuVendor).
+    # Every device's ID (PCI\VEN_..., USB\VID_...) - read ONCE per run: the hardware checks ask several times.
     if ($null -eq $script:PnpIds) {
         $script:PnpIds = @(Get-CimInstance Win32_PnPEntity -Property DeviceID -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.DeviceID })
     }
@@ -3399,8 +3063,7 @@ function Get-PnpIds {
 }
 
 function Test-PciVendor {
-    # Is there a PCI device from this vendor ('1022' AMD, '8086' Intel, '10DE' NVIDIA, '1002' AMD graphics)? A VM on an
-    # AMD host reports an AMD CPU but has only emulated devices - AMD's chipset installer would refuse there.
+    # '1022' AMD, '8086' Intel, '10DE' NVIDIA, '1002' AMD graphics. A VM on an AMD host has an AMD CPU but no such device.
     param([string]$Vendor)
     return [bool](@(Get-PnpIds) | Where-Object { $_ -like "PCI\VEN_$Vendor*" } | Select-Object -First 1)
 }
@@ -3412,29 +3075,26 @@ function Test-UsbVendor {
 }
 
 function Get-Board {
-    # "<Manufacturer> <Product>" of the motherboard. A home-built PC says "System manufacturer / System Product Name" in
-    # Win32_ComputerSystem - the board is where its maker shows (ASUS ROG STRIX..., NZXT N7...).
+    # a home-built PC shows its maker only on the board
     $b = Get-CimInstance Win32_BaseBoard -Property Manufacturer, Product -ErrorAction SilentlyContinue | Select-Object -First 1
     return ("{0} {1}" -f $b.Manufacturer, $b.Product).Trim()
 }
 
 function Test-NzxtHardware {
-    # What NZXT CAM is for: a Kraken cooler, a Smart Device / RGB & Fan controller (also inside NZXT cases), an NZXT keyboard
-    # or mouse - all USB vendor 1E71 - or an NZXT board / an NZXT-built PC
+    # an NZXT USB device (1E71: coolers, controllers, keyboards), board or PC
     if (Test-UsbVendor '1E71') { return $true }
     return (((Get-Hardware) -match '(?i)\bNZXT\b') -or ((Get-Board) -match '(?i)\bNZXT\b'))
 }
 
 function Test-Gate {
-    # A hardware requirement (a Require scriptblock): $true only if it answers yes - an error is a no
+    # an error is a no
     param([scriptblock]$Require)
     $met = $false; try { $met = [bool](& $Require) } catch { }
     return $met
 }
 
 function Test-GpuVendor {
-    # A graphics card from this PCI vendor ('10DE' NVIDIA, '1002' AMD) - by its PCI ID, so it's found before its driver is
-    # installed (until then Windows calls it "Microsoft Basic Display Adapter"); the name is a second chance.
+    # by PCI ID: found before its driver is in (a "Microsoft Basic Display Adapter"); the name is a second chance
     param([string]$Vendor, [string]$NamePattern)
     return [bool](Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
         Where-Object { "$($_.PNPDeviceID)" -match "VEN_$Vendor" -or ($NamePattern -and "$($_.Name)" -match $NamePattern) })
@@ -3447,8 +3107,7 @@ function Get-Hardware {
 }
 
 function Skip-NotSelected {
-    # This app was taken off the window's list: the log says so and $true (the caller moves on). Not listed anywhere else -
-    # the run shows only what it installs (superuser, 2026-09-30).
+    # Taken off the window's list: logged, $true (the caller moves on). Not listed elsewhere - the run shows what it installs.
     param([string]$Key, [string]$Content, [string]$Label)
     if (-not ($script:NotSelected -and $script:NotSelected.ContainsKey($Key))) { return $false }
     $why = $script:NotSelected[$Key]; if ($why -isnot [string]) { $why = 'not selected' }
@@ -3457,7 +3116,6 @@ function Skip-NotSelected {
 }
 
 function Format-ItemLine {
-    # An app's rail line: glyph, name, note (what came with it / why not), time
     param([string]$Name, [string]$Status, [string]$Note = '', [double]$Seconds = -1, [switch]$Warn)
     $color = if ($Status -eq 'FAILED') { 'r' } elseif ($Warn) { 'y' } else { 'd' }
     $right = if ($Status -eq 'DRYRUN') { 'dry run' }
@@ -3466,7 +3124,7 @@ function Format-ItemLine {
 }
 
 function Write-AppLine {
-    # An app's line once it - and its desktop icon / license, the records from index $From on - is done
+    # with its desktop icon / license (the records from $From on)
     param([string]$Name, [string]$Status, [int]$From)
     $secs = Stop-LiveItem
     $extras = [System.Collections.Generic.List[string]]::new(); $warn = $script:ItemNote -like 'update failed*'   # still installed - yellow
@@ -3487,8 +3145,7 @@ function Write-AppLine {
 }
 
 function Get-InstallPlan {
-    # The apps this run will go through, in order - the window lists the ones still to come (queued). The apps the
-    # install phase skips outright (taken off the list, other machine type, their hardware not here) are not in it.
+    # The apps this run will go through, in order (the window's queue) - not the ones the install phase skips outright.
     param([string]$Hardware = (Get-Hardware))
     $plan = [System.Collections.Generic.List[string]]::new()
     $take = { param($key) -not ($script:NotSelected -and $script:NotSelected.ContainsKey($key)) }
@@ -3517,7 +3174,7 @@ function Invoke-InstallPhase {
     if ($script:Gui) { Send-GuiEvent 'plan' @{ Apps = @(Get-InstallPlan -Hardware $hw) } }
 
     if (Get-Command winget -ErrorAction SilentlyContinue) {
-        if ($script:VCRedists.Count) {   # Visual C++ Redistributables first (apps/games need them) - ONE rail line for all
+        if ($script:VCRedists.Count) {   # first - ONE rail line for all
             Test-GuiStop
             $vcName = "Visual C++ 2005$($script:G.Dash)2022"; $vc = @(); $k = 0
             Start-LiveItem -Name $vcName -What "0/$($script:VCRedists.Count)"
@@ -3544,7 +3201,7 @@ function Invoke-InstallPhase {
             Test-GuiStop   # Stop in the window: before the next app
             $label = Get-AppLabel $id
             $req = $script:AppRequire[$id]
-            if ($req -and -not (Test-Gate $req.Require)) {   # e.g. NZXT CAM with no NZXT device: the log only (superuser, 2026-09-30)
+            if ($req -and -not (Test-Gate $req.Require)) {   # e.g. NZXT CAM with no NZXT device: the log only
                 Write-Log INFO ("Skipping {0} ({1})" -f $label, $req.RequireMsg)
                 continue
             }
@@ -3556,7 +3213,7 @@ function Invoke-InstallPhase {
                   else { Install-App -Id $id -Location $script:AppLocations[$id] -DetectName $script:AppDetectNames[$id] -Source $script:AppSources[$id] }
             $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$id; Content=$id; Status=$st; Detail=$script:ItemFail })
             if ($st -ne 'FAILED' -and $script:DesktopShortcutApps.ContainsKey($id)) { $sc = $script:DesktopShortcutApps[$id]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
-            if ($id -eq 'RARLab.WinRAR') { Set-WinRarLicense }   # license right after WinRAR installs (clean pairing)
+            if ($id -eq 'RARLab.WinRAR') { Set-WinRarLicense }
             Write-AppLine -Name $label -Status $st -From $from
         }
     } else {
@@ -3565,11 +3222,10 @@ function Invoke-InstallPhase {
         Write-Ui (Format-ItemLine -Name 'winget' -Status 'FAILED' -Note 'not found: install App Installer from the Store, then run again')
     }
 
-    # Non-winget apps (direct vendor download): Chrome, Bitwarden, Parsec... and the drivers (their hardware only)
+    # Non-winget apps and the drivers
     foreach ($d in $script:DirectApps) {
         Test-GuiStop
-        # the apps for hardware this PC does not have are not shown - the log says why (superuser, 2026-09-30: what is not
-        # found is not listed): the drivers on a laptop (PC only), NVIDIA App with no NVIDIA card...
+        # apps for hardware this PC does not have are not shown - the log says why
         if ($d.Machine -and $d.Machine -ne $script:MachineType) {
             Write-Log INFO ("Skipping {0} ({1} only)" -f $d.Name, $d.Machine)
             continue
@@ -3589,10 +3245,7 @@ function Invoke-InstallPhase {
         Write-AppLine -Name $d.Name -Status $st -From $from
     }
 
-    # (WinRAR license is created right after WinRAR installs, in the loop above - see Set-WinRarLicense.)
-
-    # Vendor apps LAST - installed ONLY on that vendor's hardware, desktop or laptop alike:
-    #   Alienware Command Center -> Alienware / Dell G-series; Armoury Crate -> ASUS ROG / TUF / PRIME / ProArt.
+    # Vendor apps LAST - only on that vendor's hardware
     foreach ($a in $script:VendorApps) {
         Test-GuiStop
         $miss = Get-VendorAppMiss $a $hw
@@ -3611,15 +3264,11 @@ function Invoke-InstallPhase {
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$a.Id; Content=$a.Name; Status=$st; Detail=$(if ($st -eq 'FAILED' -and $script:ItemFail) { $script:ItemFail } else { $hw }) })
         Write-AppLine -Name $a.Name -Status $st -From $from
     }
-
-    # (.NET 3.5 was started in the BACKGROUND before this phase (Start-DotNet35) so it downloads in
-    #  parallel; it's finished after this phase (Enable-DotNetFeatures). Desktop icons are per-app above.)
 }
 
 function Start-DotNet35 {
-    # Kick off the SLOW NetFx3 (.NET 3.5) Windows-Update download in the BACKGROUND, BEFORE the install
-    # phase, so it overlaps the ~15 min of app installs instead of adding ~11 min serially at the end.
-    # Finished by Enable-DotNetFeatures. (Runs after the tweaks' Recall DISM, so no DISM-vs-DISM clash.)
+    # The slow .NET 3.5 download starts in the BACKGROUND before the installs, so it overlaps them (Enable-DotNetFeatures
+    # finishes it). After the tweaks' Recall DISM - no DISM-vs-DISM clash.
     if ($script:DryRun) { Write-Log DEBUG "[DRYRUN] would start .NET 3.5 (NetFx3) download in the background"; return }
     $state = "$((Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction SilentlyContinue).State)"
     if ($state -eq 'Enabled') { Write-Log DEBUG ".NET 3.5 already enabled - nothing to start"; return }
@@ -3635,8 +3284,7 @@ function Start-DotNet35 {
 }
 
 function Format-PhaseLine {
-    # "  |- Name   text                                   right" - a phase that is one line (.NET 3.5). -Status: its
-    # result, for the window (see Format-Row).
+    # "  |- Name   text   right" - a phase that is one line (.NET 3.5). -Status: its result, for the window.
     param([string]$Name, [string]$Text, [string]$Right = '', [string]$Status = '')
     $line = "  {d:$($script:G.Tee)$($script:G.Rule)} {w:$Name}   $Text"
     if ($Right) { $line += (' ' * [math]::Max(2, (Get-UiWidth) - (Get-Visible $line).Length - $Right.Length)) + "{d:$Right}" }
@@ -3648,10 +3296,7 @@ function Format-PhaseLine {
 }
 
 function Enable-DotNetFeatures {
-    # Print a clean "Installing .NET 3.5 / Done!" pair HERE at the end. The download already ran in the
-    # background during the install phase (Start-DotNet35), so on a normal machine this is instant; if it's
-    # still going we WAIT until it fully finishes (live heartbeat, no cap). Then .NET 4 (quiet).
-    # The rail: ONE line - ".NET 3.5   ready", "ready at the next restart", or why not.
+    # still downloading: WAIT until it finishes, no cap. Then .NET 4.
     $g = $script:G
     $script:UiPhase = '.NET 3.5'; Send-GuiEvent 'phase' @{ Name = '.NET 3.5' }
     Write-Ui "  {d:$($g.Bar)}"
@@ -3662,18 +3307,13 @@ function Enable-DotNetFeatures {
         return
     }
     Write-Log INFO "Installing .NET 3.5"
-    # Recorded up-front as BACKGROUND and updated below: if the run is stopped (Ctrl+C) during the wait, the
-    # summary - written from Main's finally - still shows that .NET 3.5 is finishing in the background.
+    # Recorded up-front as BACKGROUND: stopped (Ctrl+C) during the wait, the summary still shows it.
     $rec3 = [pscustomobject]@{ Phase='Install'; Id='NetFx3'; Content='.NET 3.5'; Status='BACKGROUND'; Detail='' }
     $script:Results.Add($rec3)
     $st3 = 'OK'; $waited = 0.0
     if ($script:DotNet35Proc -and -not $script:DotNet35Proc.HasExited) {
-        # Still downloading from Windows Update (started before the install phase). WAIT until it fully
-        # finishes - no cap. The background DISM holds the servicing lock, so we do NOT query the feature
-        # state while it runs (that can block ON the lock); we just wait for the DISM PROCESS to exit,
-        # showing a live line so the console never looks frozen. On a normal machine this is seconds; on a
-        # WU-throttled box it can be ~30 min. Ctrl+C stops the run here: the summary is still written and DISM
-        # keeps going on its own (/NoRestart - no surprise reboot). Console only - it never spams the log file.
+        # Wait for the DISM PROCESS - querying the feature state while it holds the servicing lock can block on it.
+        # Ctrl+C here: the summary is still written and DISM keeps going on its own (/NoRestart).
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $clock = if ($script:DotNet35Clock) { $script:DotNet35Clock } else { $sw }
         Send-GuiEvent 'live' @{ Name = '.NET 3.5'; What = 'downloading from Windows Update'; Clock = $true; Since = $clock.Elapsed.TotalSeconds }
@@ -3693,9 +3333,7 @@ function Enable-DotNetFeatures {
         $waited = $sw.Elapsed.TotalSeconds
         Start-Sleep -Milliseconds 500
     }
-    # .NET 3.5 was already enabled, the DISM just finished, or it was never started - safe to query state now.
-    # EnablePending = installed, Windows finishes it at the next restart: while Windows already waits for a restart
-    # (a removed component, a Windows update) it holds a new feature back like that - DISM says "Reboot required".
+    # EnablePending: finished at the next restart (held back while a restart is pending)
     $code = ''
     if ($script:DotNet35Proc) {
         $c = $script:DotNet35Proc.ExitCode
@@ -3720,7 +3358,7 @@ function Enable-DotNetFeatures {
         Write-Ui (Format-PhaseLine '.NET 3.5' "{r:$($g.Fail) not installed (DISM $code), see the log}" $wait -Status 'FAILED')
     }
     $rec3.Status = $st3
-    # .NET 4 is already enabled on Win11 -> record quietly (no console clutter); enable only if somehow off.
+    # .NET 4 is on in Win11 already
     if ((Get-WindowsOptionalFeature -Online -FeatureName 'NetFx4-AdvSrvs' -ErrorAction SilentlyContinue).State -eq 'Enabled') {
         Write-Log DEBUG ".NET 4 already enabled"
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id='NetFx4-AdvSrvs'; Content='.NET 4'; Status='OK'; Detail='already enabled' })
@@ -3745,7 +3383,7 @@ function Write-Summary {
         Write-Log ERROR ("FAILED  [{0}] {1}{2}" -f $r.Phase, $r.Content, $(if ($r.Detail) { " - $($r.Detail)" }))
     }
     Write-Log INFO ("full log: {0}" -f $script:LogFile)
-    # Compact results file next to the log (quick OK/FAILED overview)
+    # results file next to the log
     try {
         $resultsFile = $script:LogFile -replace '\.log$', '_results.txt'
         $lines = @("win11-tweaks results  -  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  -  $(if ($script:DryRun) {'DRYRUN'} else {'APPLY'})", '')
@@ -3763,8 +3401,7 @@ function Write-Summary {
     } else {
         Write-Log WARN "A reboot / sign-out is recommended to fully apply the changes."
     }
-    # The rail: "Done in 19m 29s   93 OK . 7 skipped . 0 failed", every problem again, what to do next, the log
-    # (the window gets the same, as data)
+    # The rail: "Done in 19m 29s   93 OK . 7 skipped . 0 failed", every problem again, what next, the log (the window: data)
     $gl = $script:G
     $count = @{}; foreach ($r in $script:Results) { $count[[string]$r.Status] = 1 + [int]$count[[string]$r.Status] }
     $parts = [System.Collections.Generic.List[string]]::new()
@@ -3806,10 +3443,8 @@ function Write-Summary {
 }
 
 function Set-QuickEdit {
-    # The classic console window PAUSES the whole run when someone clicks into it (QuickEdit "Select" mode)
-    # until Enter/Esc - an unattended run then just sits there. Turn QuickEdit off for the run; -Restore puts
-    # the original mode back (so text can be selected again afterwards). No-op without a real console
-    # (SSH, ISE, redirected input) and in Windows Terminal, where a click never pauses anything.
+    # The classic console PAUSES the run when clicked (QuickEdit "Select" mode) until Enter/Esc - QuickEdit off for the
+    # run; -Restore puts it back. No-op without a real console and in Windows Terminal.
     param([switch]$Restore)
     try {
         if (-not ([System.Management.Automation.PSTypeName]'Native.ConsoleMode').Type) {
@@ -3851,11 +3486,8 @@ public static extern uint SetThreadExecutionState(uint esFlags);
 }
 
 function Set-KeepAwake {
-    # From Start until the run is over and its window closed, Windows neither sleeps nor turns the screen off - what
-    # installers and video players do. A laptop on battery could go to sleep mid-install, and a window broke when the
-    # screen came back on (VM 102, 2026-10-02: off 15 min after Done, back on 4 min later -> "Desktop composition is
-    # disabled" -> it could not draw and went; a 4 GB VM that had run low on memory - an off/on alone did not do it in
-    # a test). -Off: Windows' own timers again (the request also ends with the run's process).
+    # Until the run is over and its window closed: no sleep, the screen on (as installers do) - a laptop could sleep
+    # mid-install, and the window can break when the screen comes back on. -Off: Windows' own timers again.
     # Sleep from the Start menu, the power button or the lid still works.
     param([switch]$Off)
     try {
@@ -3874,15 +3506,12 @@ function Set-KeepAwake {
 }
 
 function Test-Interactive {
-    # Is someone at a console to answer questions? (Not over SSH / a service - there it's $false.) Wrapped so the
-    # tests can say yes on a non-interactive runner.
+    # wrapped so the tests can say yes on a non-interactive runner
     return [Environment]::UserInteractive
 }
 
 function Show-Intro {
-    # The rail head and "Continue?" - then the machine type (detected, or -Machine) and the app list: on the console
-    # everything goes in but the apps whose box in the window starts empty (Brave) - taking apps off the list is the window's
-    # job. With the window open, the window asks instead (its Setup screen - Invoke-GuiSetup).
+    # "Continue?", the machine type, the app list. With the window open, the window asks instead (Invoke-GuiSetup).
     if ($script:Gui) {
         Invoke-GuiSetup
         if ($script:Gui) { return }   # answered - or cancelled - in the window
@@ -3914,9 +3543,7 @@ function Show-Intro {
 }
 
 function Get-DetectedMachineType {
-    # PC or laptop, by what the machine says it is: its case (Laptop, Notebook, Convertible...) or its firmware's power
-    # profile (Mobile). A battery decides only when the case says nothing (Other / Unknown - a VM): a desktop's UPS is a
-    # "battery" to Windows too. Why goes into $script:DetectedWhy (the log).
+    # By case or power profile; a battery only when the case says nothing - a desktop's UPS is a battery to Windows too.
     $portable = @{ 8 = 'Portable'; 9 = 'Laptop'; 10 = 'Notebook'; 11 = 'Hand Held'; 12 = 'Docking Station'; 14 = 'Sub Notebook'; 30 = 'Tablet'; 31 = 'Convertible'; 32 = 'Detachable' }
     $desktop = @{ 3 = 'Desktop'; 4 = 'Low Profile Desktop'; 5 = 'Pizza Box'; 6 = 'Mini Tower'; 7 = 'Tower'; 13 = 'All in One'; 15 = 'Space-saving'; 16 = 'Lunch Box'; 24 = 'Sealed-case PC'; 35 = 'Mini PC'; 36 = 'Stick PC' }
     $cs = Get-CimInstance Win32_ComputerSystem -Property PCSystemType -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -3933,22 +3560,19 @@ function Get-DetectedMachineType {
 }
 
 function Get-MachineChoice {
-    # PC or laptop: -Machine when it was given, else what the machine says it is - and why, for the log
+    # -Machine, else detected - and why
     if ($Machine -eq 'PC' -or $Machine -eq 'Laptop') { return @{ Type = $(if ($Machine -eq 'Laptop') { 'Laptop' } else { 'PC' }); Why = 'set by -Machine' } }
     $t = Get-DetectedMachineType
     return @{ Type = $t; Why = "detected - $($script:DetectedWhy)" }
 }
 
 function Get-AppLabel([string]$Id) {
-    # an app's name as people know it (a winget ID has a friendly name; direct / vendor apps are their name already)
     if ($script:AppNames.ContainsKey($Id)) { return $script:AppNames[$Id] }
     return $Id
 }
 
 function Get-AppChoices {
-    # The apps in the window's list, in install order: the winget apps (not the runtimes) and the direct downloads. The
-    # hardware apps are not here - they join the list where their hardware is found (Get-HardwareApps). Key = what the
-    # install phase looks up in $script:NotSelected.
+    # the window's list, in install order - no runtimes, no hardware apps. Key = the $script:NotSelected key.
     $list = [System.Collections.Generic.List[object]]::new()
     foreach ($id in $script:AppsToInstall) {
         if ($script:RuntimeApps -contains $id -or $script:HardwareApps -contains $id) { continue }
@@ -3962,8 +3586,7 @@ function Get-AppChoices {
 }
 
 function Get-HardwareApps {
-    # The hardware apps, in install order, and whether this machine has what each is for: Key / Name / Found / Why (why
-    # not - for the log and the install phase). A PC-only one on a laptop is "PC only".
+    # The hardware apps, in install order: Key / Name / Found / Why (why not).
     $hw = Get-Hardware
     $list = [System.Collections.Generic.List[object]]::new()
     foreach ($id in $script:AppsToInstall) {
@@ -3993,7 +3616,6 @@ function Get-VendorAppMiss($App, [string]$Hardware) {
 }
 
 function Write-HardwareLog($Hardware) {
-    # what was found for the hardware apps, and why the others are not for this machine
     $found = @($Hardware | Where-Object { $_.Found } | ForEach-Object { $_.Name })
     $miss = @($Hardware | Where-Object { -not $_.Found } | ForEach-Object { '{0} ({1})' -f $_.Name, $_.Why })
     Write-Log INFO ("Hardware apps: {0}" -f $(if ($found) { $found -join ', ' } else { 'none for this machine' }))
@@ -4001,7 +3623,7 @@ function Write-HardwareLog($Hardware) {
 }
 
 function Set-AppsLabel {
-    # "Apps: all 27" / "Apps: 24 of 27 - left out: Steam, Parsec, OBS Studio" in the log, and the machine line's label
+    # "Apps: 24 of 27 - left out: ..." in the log, and the machine line's label
     param([int]$Total, [string[]]$Left = @())
     $Left = @($Left | Where-Object { $_ })
     $n = $Total - $Left.Count
@@ -4014,12 +3636,8 @@ function Set-AppsLabel {
     }
 }
 
-# --------------------------------------------------------------------------------------
-#  The window (variant A of the design page - superuser's pick, 2026-09-28). The run itself does not change: it goes on
-#  here, on the main thread, as always, and only FEEDS the window (Send-GuiEvent -> a queue). The window has its own
-#  thread (an STA runspace with its own WPF dispatcher, $script:GuiCode): it asks the setup questions, shows the run and
-#  can ask the run to stop between two steps (Test-GuiStop). -Console keeps the rail in the console.
-# --------------------------------------------------------------------------------------
+# ---- The window: its own STA runspace + WPF dispatcher ($script:GuiCode) ----
+# The run stays on this thread and only FEEDS it (Send-GuiEvent -> a queue); the window can ask it to stop (Test-GuiStop).
 function Get-SessionId {
     try { return (Get-Process -Id $PID).SessionId } catch { return -1 }
 }
@@ -4029,9 +3647,8 @@ function Test-WpfAvailable {
 }
 
 function Test-GuiMode {
-    # The window is for a person at a desktop: not over SSH or from a service (no keyboard, session 0), not with -Console
-    # (the rail in the console), -Detailed (the log on the console) or -Reboot (an unattended run: the console counts
-    # down to the restart), and only where WPF loads
+    # For a person at a desktop: not over SSH / from a service (session 0), not with -Console, -Detailed or -Reboot
+    # (unattended), and only where WPF loads
     if ($script:ConsoleOnly -or $script:Detailed -or $Reboot) { return $false }
     if (-not (Test-Interactive)) { return $false }
     if ((Get-SessionId) -eq 0) { return $false }
@@ -4049,8 +3666,7 @@ function Send-GuiEvent {
 }
 
 function Write-GuiClicks {
-    # What was pressed in the window, with its time - into the log (the window's thread cannot write it). Picked up
-    # whenever the run sends the window something, and when it lets the window go (Close-Gui).
+    # What was pressed in the window - into the log (the window's thread cannot write it)
     if (-not $script:Gui -or -not $script:Gui.Shared.Clicks) { return }
     $c = $null
     while ($script:Gui.Shared.Clicks.TryDequeue([ref]$c)) { Write-Log INFO "window: $c" }
@@ -4084,10 +3700,8 @@ function Set-ConsoleVisible {
 }
 
 function Set-ConsoleWindow {
-    # The console behind the window: hidden while the window shows the run (superuser: "only the window"), shown again
-    # when it is needed - the window went early, or it is your own console at the end. Only a console that is this
-    # run's alone (not the .bat's, where cmd waits on a `pause` - it must never be left hidden) and only if it was
-    # visible: -Show undoes our own hide, nothing else. (Windows Terminal may keep its window.) No console: nothing.
+    # The console hidden while the window shows the run, shown again when needed. Only a console that is this run's
+    # alone (the .bat's cmd waits on a `pause` - never leave it hidden); -Show undoes our own hide, nothing else.
     param([switch]$Show)
     if ($Show -and -not $script:ConsoleHidden) { return }
     try {
@@ -4118,8 +3732,7 @@ function Get-AppGroup {
 }
 
 function Get-PcSpecs {
-    # What the window's Performance row shows - to see a weak PC at a glance: the RAM put in (GB), cores / threads, and the
-    # system disk (SSD / HDD; a virtual disk says neither - left out)
+    # The window's Performance row: RAM (GB), cores / threads, the system disk (SSD / HDD; a virtual disk: left out)
     $s = @{ RamGB = 0; Cores = 0; Threads = 0; Disk = '' }
     try {
         $ram = (@(Get-CimInstance Win32_PhysicalMemory -Property Capacity -ErrorAction Stop) | Measure-Object -Property Capacity -Sum).Sum
@@ -4140,8 +3753,7 @@ function Get-PcSpecs {
 }
 
 function Get-SetupPayload {
-    # What the window's Setup screen needs: this PC and its type (and why), the app list - row by row, in the rows' order,
-    # the hardware apps found here in their own row -, what always goes in, how many tweaks run on this machine type
+    # What the window's Setup screen needs: this PC and its type, the app list row by row, what always goes in, tweak counts
     $mc = Get-MachineChoice
     $saved = $script:MachineType
     try {
@@ -4203,17 +3815,15 @@ function Get-WindowsActivation {
 }
 
 function Open-ActivationSettings {
-    # superuser, 2026-09-30: Windows is not activated and the Windows row's box was left on - Windows' own Settings > System >
-    # Activation opens (the run goes on); the key goes in there. The script itself activates nothing.
+    # Windows' own Settings > System > Activation opens (the run goes on)
     if ($script:DryRun) { Write-Log DEBUG '[DRYRUN] would open Settings > System > Activation'; return }
     try { Start-Process 'ms-settings:activation' -ErrorAction Stop; Write-Log INFO 'opened Settings > System > Activation' }
     catch { Write-Log INFO "Settings > System > Activation could not be opened: $($_.Exception.Message)" }
 }
 
 function Install-WindowsKey {
-    # superuser, 2026-09-30: the key from $script:ProductKey goes in through Windows' own licensing (what slmgr /ipk + /ato
-    # do, without slmgr.vbs - so it works with VBScript gone too) and Windows is activated online. No key, a bad key, or no
-    # activation: Settings > System > Activation opens, as before. The key never goes to the log - only its last 5 characters.
+    # $script:ProductKey through Windows' own licensing (slmgr /ipk + /ato without slmgr.vbs - works with VBScript gone),
+    # activated online. Else Settings > Activation opens. The key never goes to the log - only its last 5 characters.
     $key = ([string]$script:ProductKey).Trim().ToUpper()
     if (-not $key) { Open-ActivationSettings; return @{ Status = 'OK'; Detail = 'no key in the script - Settings > Activation opened' } }
     $tail = $key.Substring([Math]::Max(0, $key.Length - 5))
@@ -4265,9 +3875,8 @@ function Invoke-GuiSetup {
 }
 
 function Stop-GuiThread {
-    # Let the window's thread go - never blocking the run: on CloseRequest the window closes itself (its timer). Stuck
-    # anyway: ask it to stop WITHOUT waiting and leave it be - PowerShell.Stop() (and Dispose) wait for a .NET call like
-    # ShowDialog to return, which could be never.
+    # Let the window's thread go, never blocking the run. Stuck: ask it to stop WITHOUT waiting - PowerShell.Stop() (and
+    # Dispose) wait for a .NET call like ShowDialog to return, which could be never.
     param($PowerShell, $Runspace, $Handle, [double]$WaitSec = 5)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     while ($Handle -and -not $Handle.IsCompleted -and $sw.Elapsed.TotalSeconds -lt $WaitSec) { Start-Sleep -Milliseconds 100 }
@@ -4292,10 +3901,8 @@ function Find-CascadiaMono {
 }
 
 function Get-GuiTextFont {
-    # The window's text font: Cascadia Mono - from OUR copy. Windows gets it from the Windows Terminal app, and the Store
-    # may update that app mid-run (a new PC's first hour): the old font file goes, and a window still drawing with it
-    # cannot draw text any more (superuser's run, 2026-09-29: black at the next redraw, 78,226 errors). Our copy cannot
-    # go. No Cascadia Mono here: Consolas (a Windows font).
+    # Cascadia Mono from OUR copy: Windows gets it from the Windows Terminal app, which the Store may update mid-run - the
+    # old font file goes and a window drawing with it cannot draw text any more. No Cascadia Mono: Consolas.
     try {
         $src = Find-CascadiaMono
         if (-not $src) { Write-Log DEBUG 'window font: no Cascadia Mono on this PC - Consolas'; return 'Consolas' }
@@ -4334,9 +3941,7 @@ function Start-Gui {
         Stop-GuiThread $ps $rs $null
         return
     }
-    # The window takes a second or more to come up (WPF - more on a new PC's first run). Meanwhile this thread does what
-    # would otherwise follow it under "Getting ready" (5 s of that on VM 102, 2026-09-29): it gathers the setup screen's
-    # facts (the apps for this hardware - WMI queries) and builds the console type that hides the console behind the window
+    # WPF takes a second or more to come up - meanwhile gather the setup screen's facts (WMI) and build the console type
     $t = [System.Diagnostics.Stopwatch]::StartNew()
     try { $script:SetupPayload = Get-SetupPayload; Write-Log DEBUG ('setup screen: gathered in {0:N1} s, while the window started' -f $t.Elapsed.TotalSeconds) }
     catch { $script:SetupPayload = $null; Write-Log DEBUG "setup screen: not gathered ahead ($($_.Exception.Message))" }
@@ -4368,16 +3973,14 @@ function Close-Gui {
 }
 
 function Wait-GuiClose {
-    # The window shows how the run went until it is closed. "Restart now" in it restarts the PC (never in a dry run).
-    # -Quiet: the console was opened only for the run (the elevation relaunch) - when the window saw the run to its end
-    # without errors, the console goes too (Exit-Console at the very end); else it comes back with the summary and log.
+    # The window shows how the run went until it is closed; "Restart now" restarts the PC (never in a dry run).
+    # -Quiet: the console is the run's own - after a clean window it goes too (Exit-Console); else it shows the summary.
     param([switch]$Quiet)
     if (-not $script:Gui) { return }
     $sh = $script:Gui.Shared
     while (-not $sh.Closed -and -not $sh.Action -and -not $script:Gui.Handle.IsCompleted) { Start-Sleep -Milliseconds 200 }
     if (($sh.Broke -or $sh.Error) -and -not $script:Gui.Replayed) {
-        # it went by itself after the run (it could not draw - e.g. when the screen came back on, VM 102 2026-10-02): its
-        # Done screen and "Restart now" went with it - the console shows the run, its summary and what to do next instead
+        # it went by itself after the run (it could not draw): the console shows the run and its summary instead
         Write-Log WARN ('the window went by itself ({0}) - the console shows the run and its summary' -f $(if ($sh.Broke) { $sh.Broke } else { $sh.Error }))
         Resume-Console
     }
@@ -4401,8 +4004,7 @@ function Wait-GuiClose {
 }
 
 # The window's own code - it runs in the window's thread (Start-Gui adds the call to Show-GuiWindow), never here. Functions
-# only, so the tests can load it. ASCII only: every glyph is an XML entity (&#xB7;) or a Segoe Fluent Icons code. The
-# look is variant A of the design page: near-black, one line down the left with a dot per phase, one row per app.
+# only, so the tests can load it. ASCII only: every glyph is an XML entity (&#xB7;) or a Segoe Fluent Icons code.
 $script:GuiCode = @'
 $GuiC = @{ bg = '#07090D'; line = '#1B2432'; line2 = '#263246'; tx = '#E6EDF6'; tx2 = '#9AA7B8'; tx3 = '#66728A'; blue = '#3D7BFF'
     ok = '#35C48A'; warn = '#E0A93A'; err = '#FF6B6B'; blue16 = '#293D7BFF'; blue04 = '#0A3D7BFF'; blue10 = '#1A3D7BFF'
@@ -4424,8 +4026,7 @@ function ConvertTo-GuiXml([string]$Text) {
 }
 
 function Get-GuiNow {
-    # Seconds on a clock that only goes forward. Not DateTime: Windows may set the wall clock mid-run - a VM back from a
-    # snapshot, a new PC's first time sync - and the window then showed 2830:02 elapsed (superuser's run, 2026-09-29)
+    # Seconds on a clock that only goes forward. Not DateTime: Windows may set the wall clock mid-run (first time sync)
     [System.Diagnostics.Stopwatch]::GetTimestamp() / [double][System.Diagnostics.Stopwatch]::Frequency
 }
 
@@ -4565,8 +4166,7 @@ function New-GuiSpinner([double]$Size = 13, [string]$Margin = '0,0,6,0') {
         "<Path Data='M12,4.5 A7.5,7.5 0 1 1 4.5,12' Stroke='$($GuiC.blue)' StrokeThickness='2.4' StrokeStartLineCap='Round' StrokeEndLineCap='Round'/></Canvas></Viewbox>"
 }
 function Get-GuiTitleBar($M) {
-    # min / close like Windows' own: the glyph in the middle of its 46 px box, the box lit under the mouse, the X white on
-    # red (the glyph takes its colour from the box - TextElement.Foreground - so the trigger can change it)
+    # min / close like Windows' own; the glyph takes its colour from the box (TextElement.Foreground) so the trigger can change it
     $cap = { param($glyph, $tag, $hover, $hoverFg)
         "<Border Tag='$tag' Width='46' WindowChrome.IsHitTestVisibleInChrome='True'><Border.Style><Style TargetType='Border'>" +
             "<Setter Property='Background' Value='Transparent'/><Setter Property='TextElement.Foreground' Value='$($GuiC.tx2)'/><Style.Triggers>" +
@@ -4636,10 +4236,10 @@ function Update-GuiModel($M, $Ev) {
         'setup' {
             $p = $Ev.Payload; $M.Setup = $p; $M.Screen = 'setup'; $M.Version = [string]$p.Version; $M.Log = [string]$p.Log
             $M.Choice.Machine = if ($p.Machine) { [string]$p.Machine } else { 'PC' }   # detected (or -Machine) - shown, not a choice
-            $M.Choice.Off = @{}   # everything picked - but the apps whose box starts empty (Brave, superuser 2026-10-12)
+            $M.Choice.Off = @{}   # everything picked - but the apps whose box starts empty
             foreach ($k in @($p.OffByDefault)) { if ($k) { $M.Choice.Off[[string]$k] = $true } }
             $M.Choice.OpenActivation = $true   # (the Windows row, when there is one: picked)
-            $M.Choice.LowEnd = [bool]$p.LowEnd   # the Low-end PC box: empty (superuser, 2026-10-09) - picked only with -LowEnd
+            $M.Choice.LowEnd = [bool]$p.LowEnd   # the Low-end PC box: picked only with -LowEnd
         }
         'banner' {
             foreach ($k in 'Machine', 'Os', 'MachineType', 'User', 'DryRun') { $M.Banner[$k] = $Ev[$k] }
@@ -4694,8 +4294,7 @@ function Get-GuiWaitParts($M) {
     (Get-GuiFooter '' '')
 }
 function Get-GuiSetupParts($M) {
-    # Set up this PC (superuser, 2026-09-30): one app list, everything picked - take off what you don't want. A row's name
-    # takes the whole row off or back on; Deselect all / Select all; the hardware apps found here in their own row.
+    # Set up this PC: one app list, everything picked. A row's name takes the whole row off or back on.
     $p = $M.Setup; $ch = $M.Choice
     $apps = @($p.Apps | Where-Object { $_ })
     $isOn = { param($a) -not $ch.Off.ContainsKey([string]$a.Key) }
@@ -4740,11 +4339,11 @@ function Get-GuiSetupParts($M) {
     $right = (New-GuiText "$on" $GuiC.tx 12 'SemiBold') + (New-GuiRight " of $($apps.Count) selected") + $toggle
     $body = ''
     $act = $p.Activation
-    if ($act -and -not $act.Activated) {   # Windows not activated (superuser, 2026-09-30): a box that opens Settings > Activation at Start
+    if ($act -and -not $act.Activated) {   # Windows not activated: a box that opens Settings > Activation at Start
         $wRight = (New-GuiText 'not activated' $GuiC.warn 12) + (New-GuiRight (' {0} {1}' -f [char]0xB7, [string]$act.Edition))   # (New-GuiRight escapes)
         $body += New-GuiNode 'notice' (New-GuiTitle 'Windows') $wRight (& $row 'Activation' (& $chip 'Windows 11 Pro' ([bool]$ch.OpenActivation) 'pick:activation') '' '')
     }
-    # Performance (superuser, 2026-10-09): the PC's RAM / cores / disk, and the Low-end PC box - empty, a click picks it
+    # Performance: the PC's RAM / cores / disk, and the Low-end PC box
     $sp = $p.Specs; $specs = @()
     if ($sp -and $sp.RamGB) { $specs += "$($sp.RamGB) GB RAM" }
     if ($sp -and $sp.Cores) { $specs += $(if ($sp.Threads -and $sp.Threads -ne $sp.Cores) { "$($sp.Cores) cores / $($sp.Threads) threads" } else { "$($sp.Cores) cores" }) }
@@ -4783,8 +4382,7 @@ function Get-GuiRunParts($M) {
         $twRight = New-GuiRight (Join-GuiText @($(if ($b.DryRun) { "$($tw.Count) would apply" } else { "$($tw.Count) applied" }), $tw.Time))
     }
     $body = New-GuiNode (Get-GuiKind $tw) (New-GuiTitle 'Tweaks') $twRight $twInner
-    # Apps: the last ones done, the one running now, the next ones - and how many more (it has to fit: no scrolling
-    # while it runs)
+    # Apps: the last ones done, the one now, the next ones, how many more (it has to fit: no scrolling while it runs)
     $ap = $M.Apps; $rows = @($ap.Rows); $plan = @($ap.Plan)
     $live = if ($M.Live -and $ap.State -eq 'live') { $M.Live } else { $null }
     $seen = @{}; foreach ($r in $rows) { $seen[[string]$r.Name] = $true }
@@ -5019,9 +4617,8 @@ function Close-GuiBroken([string]$Why) {
 }
 function Set-GuiFallbackFont { $script:GuiWin.FontFamily = New-Object Windows.Media.FontFamily('Consolas') }
 function Register-GuiRenderFailure {
-    # A window that cannot draw fails on every frame (a font file gone from under it, 2026-09-29). 10 failures within
-    # 3 s: its text font goes back to Consolas (a Windows font) and it draws again; still failing: the window goes and
-    # the console shows the run. Never a black window that cannot even be closed.
+    # A window that cannot draw fails on every frame. 10 failures within 3 s: its font goes back to Consolas; still
+    # failing: the window goes and the console shows the run. Never a black window that cannot even be closed.
     $now = Get-GuiNow
     $script:GuiFailTimes = @(@($script:GuiFailTimes) | Where-Object { $now - $_ -lt 3 }) + @($now)
     if ($script:GuiFailTimes.Count -lt 10) { return }
@@ -5096,9 +4693,8 @@ function Save-GuiSnapshot([string]$Name) {
     } catch { Add-GuiError "snapshot: $($_.Exception.Message)" }
 }
 function Invoke-GuiTestHooks {
-    # only with the test variables set: W11T_GUI_AUTOSTART (1 = as it is, some = a few apps taken off, all = Select all - Brave too;
-    # W11T_GUI_LOWEND = the Low-end box) presses Start, W11T_GUI_STOP=apps
-    # stops the run in its Apps phase, W11T_GUI_SNAP saves the screens as PNGs, W11T_GUI_AUTOCLOSE closes the window at the end
+    # test variables only: W11T_GUI_AUTOSTART (1 / some / all) [+ W11T_GUI_LOWEND] presses Start, W11T_GUI_STOP=apps stops
+    # in Apps, W11T_GUI_SNAP saves the screens as PNGs, W11T_GUI_AUTOCLOSE closes the window at the end
     $m = $script:GuiM; $h = $script:GuiHooks; $now = Get-GuiNow
     if ($env:W11T_GUI_AUTOSTART -and $m.Screen -eq 'setup' -and -not $h.Started) {
         if (-not $h.SetupAt) { $h.SetupAt = $now }
@@ -5125,9 +4721,8 @@ function Invoke-GuiTestHooks {
     }
 }
 function Show-GuiWindow {
-    # The window's thread: build the window, take the run's events ten times a second, redraw what changed (at most
-    # every 150 ms). Returns when the window is closed ($Shared.Closed). A window that keeps failing to draw closes
-    # itself - the console shows the run then.
+    # The window's thread: take the run's events ten times a second, redraw what changed (at most every 150 ms).
+    # Returns when the window is closed ($Shared.Closed).
     param($Shared)
     try {
         Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
@@ -5191,28 +4786,26 @@ function Show-GuiWindow {
 }
 '@
 
-# --------------------------------------------------------------------------------------
-#  Main
-# --------------------------------------------------------------------------------------
+# ---- Main ----
 try {
-    Set-QuickEdit                       # a click into the window must not pause the run (restored in finally)
-    if (Test-GuiMode) { Start-Gui }     # the window (no desktop, -Console, -Detailed, or it fails to open: the console rail)
+    Set-QuickEdit                       # a click into the console must not pause the run (restored in finally)
+    if (Test-GuiMode) { Start-Gui }
     Show-Intro
     if ($script:Cancelled) { $script:MainEnded = $true; return }   # user answered "n" to Continue
     $script:RunStarted = $true          # from here on the summary is written - also if the run is stopped (see finally)
-    Set-KeepAwake                       # no sleep, the screen on - until the run is over and its window closed (finally)
+    Set-KeepAwake                       # until the run is over and its window closed (finally)
     $script:RunClock = [System.Diagnostics.Stopwatch]::StartNew()
     Write-Banner
     if ($script:DryRun) { Write-Log WARN "DRY RUN - no changes will be made." }
     Invoke-Tweaks
-    if ($script:NeedExplorerRestart -and -not $script:DryRun) { Update-Explorer -Action restart }   # restart explorer so the taskbar/desktop is already clean (no Widgets/Search) during the installs
+    if ($script:NeedExplorerRestart -and -not $script:DryRun) { Update-Explorer -Action restart }   # the taskbar is clean during the installs
     Write-TweakGroups         # the tweak phase on the rail: one line per group, now that it's over
-    Start-DotNet35            # fire the slow .NET 3.5 WU download NOW so it overlaps the install phase (parallel)
-    Invoke-InstallPhase       # apps + per-app desktop icons
+    Start-DotNet35            # NOW, so the slow .NET 3.5 download overlaps the installs
+    Invoke-InstallPhase
     Enable-DotNetFeatures     # finish .NET 3.5 (usually already done) + .NET 4
-    Invoke-Tweaks -Late       # last: what must wait for the installers (taskbar pins: the browsers; VBScript) and for .NET 3.5 (old components) - DISM is free again here
+    Invoke-Tweaks -Late       # what must wait for the installers and for .NET 3.5 - DISM is free again here
     $script:RunFinished = $true
-    Open-DriverHubPage        # an ASUS board: DriverHub's page - "Install all" there puts in the board's drivers
+    Open-DriverHubPage
     $script:MainEnded = $true
 }
 catch [System.OperationCanceledException] {
@@ -5221,12 +4814,10 @@ catch [System.OperationCanceledException] {
 }
 finally {
     try {
-        # The summary is written HERE so it also lands when the run is stopped early with Ctrl+C - e.g. during
-        # the .NET 3.5 wait, which then simply keeps installing in the background (/NoRestart).
+        # The summary is written HERE so it also lands after Ctrl+C (e.g. in the .NET 3.5 wait - DISM keeps going).
         if ($script:RunStarted) {
             if (-not $script:RunFinished) {
-                if ($script:LiveOpen) { Clear-Live } elseif ($script:Detailed) { Write-Host '' }   # Ctrl+C can land mid-line (the live step / the .NET 3.5 heartbeat)
-                # e.g. Ctrl+C in the .NET 3.5 wait: the last steps (taskbar pins, old components, refresh rate, VBScript) come after it
+                if ($script:LiveOpen) { Clear-Live } elseif ($script:Detailed) { Write-Host '' }   # Ctrl+C can land mid-line
                 Write-Log WARN "Stopped early - this summary only covers what ran. Run the script again to finish the rest."
             }
             Write-Summary
@@ -5236,8 +4827,8 @@ finally {
         Set-QuickEdit -Restore
         try { Stop-Transcript | Out-Null } catch { }
         if ($script:SavedPrefs) { $ProgressPreference = $script:SavedPrefs.Progress; $WarningPreference = $script:SavedPrefs.Warning }   # the window's own settings
-        # the window: it shows the summary until it is closed (Restart now restarts) - or, cancelled at the start, it goes
-        # (the console the relaunch opened goes with it - unless something went wrong: then it shows what)
+        # the window shows the summary until it is closed - or, cancelled at the start, it goes (with the relaunch's
+        # console, unless something went wrong)
         if ($script:Gui) {
             $quiet = $script:Relaunched -and $script:MainEnded
             if ($script:RunStarted) { Wait-GuiClose -Quiet:$quiet }
@@ -5249,14 +4840,12 @@ finally {
             }
         }
     } finally {
-        # whatever happened above (an error in it too - this thread runs the console's next prompt): Windows' own
-        # sleep / screen timers again, after the window (its Done screen kept the screen on too), and never a console
-        # left hidden
+        # whatever happened above (this thread runs the console's next prompt): Windows' own sleep / screen timers
+        # again, and never a console left hidden
         Set-KeepAwake -Off
         if (-not $script:ExitWhenDone) { Set-ConsoleWindow -Show }
     }
-    # HERE, not after the finally: Cancel leaves Main with `return`, and that skips everything after it (no -Reboot
-    # with the window, so nothing is lost)
+    # HERE, not after the finally: Cancel leaves Main with `return`, which skips everything after it
     if ($script:ExitWhenDone) { Exit-Console }
 }
 if ($script:RunFinished -and $Reboot -and -not $script:DryRun) {

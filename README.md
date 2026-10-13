@@ -61,8 +61,8 @@ Every detail goes to a log file for later.
   New in v1.10.0: **Brave** next to Google Chrome, picked like every app; it goes in for every user and
   onto the taskbar, which now pins **the browsers picked**: Chrome, Brave or both (Chrome too only when it
   was picked, not just because it is on the PC). **Language & region** — a box in the window, empty by
-  default (see [Language & region](#language--region)): Bulgaria, English (Europe) with the euro, and the
-  Bulgarian (Phonetic Traditional) keyboard only. **A new mouse pointer** on every PC: **MSUHost Cursors**
+  default (see [Language & region](#language--region)): Bulgaria, English (Europe) with the euro, the
+  Bulgarian (Phonetic Traditional) keyboard only, and the Sofia time zone. **A new mouse pointer** on every PC: **MSUHost Cursors**
   (Windows 11 Cursors Concept by JepriCreations) inside the theme **MSUHost (dark)** (the Windows (dark)
   theme with these cursors), so it stays after a restart and when the theme is picked again in Settings
   (credits: [`assets/CURSORS.md`](assets/CURSORS.md)). The window's footer shows only the counts.
@@ -209,8 +209,8 @@ The one-liner (and the `.bat`) open a dark window — nothing to install, it is 
   System > Activation opens instead. The key never goes to the log — only its last 5 characters.
   Then **Performance**: the PC's RAM, cores / threads and disk (SSD / HDD), and the **Low-end PC**
   box — empty; pick it on a weak PC (see [Low-end PC](#low-end-pc)). Then **Language & region**: this
-  user's country, format and keyboards now, and the **Bulgaria + phonetic keyboard** box — empty; picked,
-  the row shows what they will be (see [Language & region](#language--region)).
+  user's country, format, keyboards and time zone now, and the **Bulgaria + phonetic keyboard** box —
+  empty; picked, the row shows what they will be (see [Language & region](#language--region)).
   **Start** (or Enter) / **Cancel** — Cancel changes nothing.
 - **The run** — the clock, then the phases on one line down the left: Tweaks (n / N, then the
   groups), Apps (the last ones done with their times, the one installing now with its own clock,
@@ -270,9 +270,11 @@ the script:
 - **Bulgarian** added with **one keyboard only: Bulgarian (Phonetic Traditional)** (ЯВЕРТЪ). Every other
   Bulgarian keyboard goes — above all the standard Bulgarian (BDS) one Windows adds with the language. The
   other languages stay as they were; switch with Win+Space or Alt+Shift.
+- **Time zone** — (UTC+02:00) Helsinki, Kyiv, Riga, Sofia, Tallinn, Vilnius, with summer time. It is set,
+  not left to "Set time zone automatically": that needs location, which the Location tweak turns off.
 
-Windows' display language stays as it is (no language pack is downloaded), and so do the time zone, the
-sign-in screen and other accounts. Without the box none of this is touched.
+Windows' display language stays as it is (no language pack is downloaded), and so do the sign-in screen
+and other accounts. The time zone is the whole PC's. Without the box none of this is touched.
 
 ## The console
 

@@ -62,10 +62,11 @@ Every detail goes to a log file for later.
   onto the taskbar, which now pins **the browsers picked**: Chrome, Brave or both (Chrome too only when it
   was picked, not just because it is on the PC). **Language & region** — a box in the window, empty by
   default (see [Language & region](#language--region)): Bulgaria, English (Europe) with the euro, the
-  Bulgarian (Phonetic Traditional) keyboard only, and the Sofia time zone. **A new mouse pointer** on every PC: **MSUHost Cursors**
-  (Windows 11 Cursors Concept by JepriCreations) inside the theme **MSUHost (dark)** (the Windows (dark)
-  theme with these cursors), so it stays after a restart and when the theme is picked again in Settings
-  (credits: [`assets/CURSORS.md`](assets/CURSORS.md)). The window's footer shows only the counts.
+  Bulgarian (Phonetic Traditional) keyboard only, and the Sofia time zone. **A new mouse pointer** on
+  every PC: **MSUHost Cursors** (Windows 11 Cursors Concept by JepriCreations) inside the theme
+  **MSUHost (dark)** (the Windows (dark) theme with these cursors), so it stays after a restart and when
+  the theme is picked again in Settings (credits: [`assets/CURSORS.md`](assets/CURSORS.md)). The
+  window's footer shows only the counts.
 
   New in v1.9.0: **Low-end PC** — a box in the window, empty by default (see [Low-end PC](#low-end-pc)):
   for a weak PC it turns off animations, transparency, Windows Search and its indexing, background apps,
@@ -282,9 +283,9 @@ With `-Console` (and wherever there is no window): a rail down the left, from th
 the result:
 
 ```
-  ┌  MSUHost  win11-tweaks 1.9.0
+  ┌  MSUHost  win11-tweaks 1.10.0
   ?  Continue? (Y/n) › y
-  ├─ WIN11-TEST · Windows 11 Pro 25H2 (26200) · PC · all 27 apps
+  ├─ WIN11-TEST · Windows 11 Pro 25H2 (26200) · PC · all 28 apps
   ├─ Tweaks
   │  √ Privacy           telemetry, activity history, location, error reports        4.3s
   │  ! Edge              Microsoft Edge - Debloat: 1 step(s) failed - see the log     140ms

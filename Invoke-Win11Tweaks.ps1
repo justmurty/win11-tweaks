@@ -87,7 +87,7 @@ $script:SettingsPagesHidden  = @()     # see Add-SettingsPageHidden
 $script:ConsoleModeSaved     = $null   # before Set-QuickEdit (put back at the end)
 $script:Results              = [System.Collections.Generic.List[object]]::new()
 # The console view ("Rail") - see Write-Ui
-$script:Version              = '1.9.0' # bumped with every release
+$script:Version              = '1.10.0' # bumped with every release
 $script:Ui                   = -not $script:Detailed
 # Cmdlets' own warnings would print onto the rail's live line.
 if ($script:Ui) { $WarningPreference = 'SilentlyContinue' }

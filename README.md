@@ -58,13 +58,14 @@ Every detail goes to a log file for later.
     GPU driver Windows only offers 60 Hz, and that driver often arrives during the run (if a screen stayed at
     60 Hz, run the script again once the driver is in).
 
-  New in v1.10.0: **Brave** next to Google Chrome — its box in the window is empty; picked, it goes in
-  for every user and onto the taskbar. The taskbar now pins **the browsers picked**: Chrome, Brave or
-  both (Chrome too only when it was picked, not just because it is on the PC). **A new mouse pointer**
-  on every PC: **MSUHost Cursors** (Windows 11 Cursors Concept by JepriCreations), inside the theme **MSUHost (dark)**
-  (the Windows (dark) theme with these cursors), so it stays after a restart and when the theme is
-  picked again in Settings (credits: [`assets/CURSORS.md`](assets/CURSORS.md)). The window's footer
-  shows only the counts (no "low-end").
+  New in v1.10.0: **Brave** next to Google Chrome, picked like every app; it goes in for every user and
+  onto the taskbar, which now pins **the browsers picked**: Chrome, Brave or both (Chrome too only when it
+  was picked, not just because it is on the PC). **Language & region** — a box in the window, empty by
+  default (see [Language & region](#language--region)): Bulgaria, English (Europe) with the euro, and the
+  Bulgarian (Phonetic Traditional) keyboard only. **A new mouse pointer** on every PC: **MSUHost Cursors**
+  (Windows 11 Cursors Concept by JepriCreations) inside the theme **MSUHost (dark)** (the Windows (dark)
+  theme with these cursors), so it stays after a restart and when the theme is picked again in Settings
+  (credits: [`assets/CURSORS.md`](assets/CURSORS.md)). The window's footer shows only the counts.
 
   New in v1.9.0: **Low-end PC** — a box in the window, empty by default (see [Low-end PC](#low-end-pc)):
   for a weak PC it turns off animations, transparency, Windows Search and its indexing, background apps,
@@ -108,14 +109,14 @@ Every detail goes to a log file for later.
   case = PC, even with a UPS "battery"; otherwise a battery = laptop. `-Machine` overrides it. A laptop
   gets no power plan of ours (Windows' own stays); hibernation and the panel's refresh rate stay as
   they are.
-- The window lists **every app, picked** — but **Brave** (empty, click it to add it): click one to leave it out, a row's name (Games, Tools...) for
+- The window lists **every app, picked**: click one to leave it out, a row's name (Games, Tools...) for
   the whole row, **Deselect all** / **Select all**. **Drivers & hardware** lists only what this PC's
   hardware needs. The run lists only what it installs: the apps taken off, and the ones for hardware
   this PC does not have, are in the log only. Visual C++, DirectX (Microsoft's End-User Runtime - the
   D3DX / XInput / XAudio files older games and MSI Afterburner need) and .NET 3.5 always go in. On the
-  console (no window) everything goes in but Brave.
+  console (no window) everything goes in.
 - Then the **install phase**: **12 Visual C++ redists** + **21 winget apps**
-  (incl. **Brave** when it is picked, VLC, Lightshot, TurboTop, WinRAR, TreeSize, qBittorrent, MSI Afterburner; **iTunes** and **Apple
+  (incl. **Brave**, VLC, Lightshot, TurboTop, WinRAR, TreeSize, qBittorrent, MSI Afterburner; **iTunes** and **Apple
   Devices** from the Microsoft Store, the way Apple offers them for Windows 11; **NZXT CAM** only
   where an NZXT device is found) + **direct downloads** from the vendor (**Google Chrome**, **Bitwarden**,
   **Parsec**, **Google Play Games**, **FL Studio**, **U.GG**, **Rockstar Games Launcher**, **Razer
@@ -199,7 +200,7 @@ The one-liner (and the `.bat`) open a dark window — nothing to install, it is 
 (WPF, built into Windows). Three screens:
 
 - **Set up this PC** — the PC, its Windows and PC / laptop (detected), then the apps: every one
-  picked but Brave (empty — click it to add it; picked, it is pinned to the taskbar too), in rows (Games, Chat & streaming, Media, Tools, Internet, and Drivers & hardware with only
+  picked, in rows (Games, Chat & streaming, Media, Tools, Internet, and Drivers & hardware with only
   what this PC needs); click an app to leave it out, a row's name for the whole row, **Deselect all**
   / **Select all**; what always goes in. When Windows is **not activated**, a **Windows** row on top
   with **Windows 11 Pro** (picked): at Start the run's first step puts in the product key that comes
@@ -207,7 +208,9 @@ The one-liner (and the `.bat`) open a dark window — nothing to install, it is 
   without VBScript too); with no key, a key Windows refuses, or no activation (no internet), Settings >
   System > Activation opens instead. The key never goes to the log — only its last 5 characters.
   Then **Performance**: the PC's RAM, cores / threads and disk (SSD / HDD), and the **Low-end PC**
-  box — empty; pick it on a weak PC (see [Low-end PC](#low-end-pc)).
+  box — empty; pick it on a weak PC (see [Low-end PC](#low-end-pc)). Then **Language & region**: this
+  user's country, format and keyboards now, and the **Bulgaria + phonetic keyboard** box — empty; picked,
+  the row shows what they will be (see [Language & region](#language--region)).
   **Start** (or Enter) / **Cancel** — Cancel changes nothing.
 - **The run** — the clock, then the phases on one line down the left: Tweaks (n / N, then the
   groups), Apps (the last ones done with their times, the one installing now with its own clock,
@@ -255,6 +258,21 @@ The animations and the processor count take effect at the next start: the end sa
 box none of this is touched — nor turned back from an earlier run. "Number of processors" stays at this PC's
 count: after a CPU with more cores, run the script again with the box (or clear the box in msconfig).
 Hardware-accelerated GPU scheduling and Game Mode stay as they are (Game Mode is on anyway).
+
+## Language & region
+
+The **Bulgaria + phonetic keyboard** box (window) or `-Bulgaria` (console / `.bat`), for the user who runs
+the script:
+
+- **Country or region** — Bulgaria.
+- **Regional format** — English (Europe): dates `12/10/2026`, a 24-hour clock, the week from Monday; money
+  in **€** (Windows' own English (Europe) shows XDR).
+- **Bulgarian** added with **one keyboard only: Bulgarian (Phonetic Traditional)** (ЯВЕРТЪ). Every other
+  Bulgarian keyboard goes — above all the standard Bulgarian (BDS) one Windows adds with the language. The
+  other languages stay as they were; switch with Win+Space or Alt+Shift.
+
+Windows' display language stays as it is (no language pack is downloaded), and so do the time zone, the
+sign-in screen and other accounts. Without the box none of this is touched.
 
 ## The console
 
@@ -313,6 +331,7 @@ default Windows 11 shell use; PowerShell 7 has an open bug where Ctrl+C can skip
 | (none) | Actually apply the tweaks + install the apps. |
 | `-Console` | The rail in the console instead of the window. |
 | `-LowEnd` | The **Low-end PC** box picked (the console: on) — see [Low-end PC](#low-end-pc). |
+| `-Bulgaria` | The **Bulgaria + phonetic keyboard** box picked (the console: on) — see [Language & region](#language--region). |
 | `-Detailed` | The full log on the console instead of the rail (the log file is always full). |
 | `-Machine PC\|Laptop` | PC or laptop without detecting it (`Laptop`: Windows' own power plan, keeps hibernation and the panel's refresh rate; `PC`: Ultimate, no battery tweaks). |
 | `-Reboot` | Reboot 15s after finishing (cancel with Ctrl+C). An unattended run: the console, no window. |
@@ -324,9 +343,7 @@ Edit the arrays near the top of the install section of the script: `$script:Apps
 for winget apps (add winget IDs, e.g. `'Mozilla.Firefox'`), `$script:DirectApps` for
 direct-download apps, or `$script:VendorApps` for apps that belong on one vendor's hardware
 (`Hardware` is a regex matched against the PC's manufacturer + model). A new app shows up in the
-window's list, picked — in its row if it is in `$script:AppGroups`, else under Other; one whose box
-should start empty (installed only when picked in the window, never from the console) also goes in
-`$script:AppsOffByDefault`, like Brave. If everyone
+window's list, picked — in its row if it is in `$script:AppGroups`, else under Other. If everyone
 must get it without a choice, also add its winget ID to `$script:RuntimeApps`; an app for some
 hardware only goes in `$script:HardwareApps` (with its check).
 

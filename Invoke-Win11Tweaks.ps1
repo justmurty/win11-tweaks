@@ -37,6 +37,10 @@
     indexing, background apps, Game DVR and Storage Sense off, every processor at boot, lighter Defender scans, Best
     performance when a laptop is plugged in; at the end the launchers (Steam, Discord, Battle.net...) don't start with Windows.
 
+.PARAMETER Bulgaria
+    The window's "Bulgaria + phonetic keyboard" box picked (on the console: on) - Country or region Bulgaria, Regional
+    format English (Europe) with the euro, and Bulgarian with only the Bulgarian (Phonetic Traditional) keyboard.
+
 .PARAMETER Console
     The rail in this console instead of the window. The console is also what you get without a
     desktop (SSH, a service), with -Detailed or -Reboot, or when the window cannot open.
@@ -56,6 +60,7 @@ param(
     [string]$LogDir,
     [switch]$Console,
     [switch]$LowEnd,
+    [switch]$Bulgaria,
     [switch]$Relaunched # internal: set by the elevation relaunch
 )
 
@@ -116,6 +121,7 @@ $script:MainEnded            = $false  # Main got to its end - or was stopped / 
 $script:ExitWhenDone         = $false  # the run's own console closes at the very end (Exit-Console)
 $script:KeepAwake            = $false
 $script:LowEnd               = [bool]$LowEnd
+$script:Bulgaria             = [bool]$Bulgaria
 $script:NeedRestart          = $false  # a change that takes effect only at the next start
 # Console glyphs, made at run time so this file stays ASCII. Only characters Cascadia Mono AND Consolas have:
 # conhost has no fallback font.
@@ -655,6 +661,49 @@ function Set-TaskbarLayout {
     Set-UiNote $Id ($names -join ', ')
     if ($changed) { Update-Explorer -Action restart }   # Explorer reads it when it starts
     else { Write-Log DEBUG 'taskbar layout unchanged - left as it is (what the user changed since stays)' $Id }
+}
+
+function Get-RegionNow {
+    # This user's Country or region, Regional format and keyboard languages (ENG, BUL...) - for the Language & region row
+    $r = @{ Country = ''; Format = ''; Keys = @() }
+    try { $r.Country = [string](Get-WinHomeLocation -ErrorAction Stop).HomeLocation } catch { }
+    try { $r.Format = [string](Get-Culture).DisplayName } catch { }
+    try { $list = Get-WinUserLanguageList -ErrorAction Stop; $r.Keys = @(foreach ($l in $list) { ([Globalization.CultureInfo]::GetCultureInfo([string]$l.LanguageTag)).ThreeLetterISOLanguageName.ToUpper() }) | Select-Object -Unique } catch { }
+    return $r
+}
+
+function Get-IntlNow {
+    # this user's regional format and currency symbol, as Windows keeps them
+    $i = Get-ItemProperty -Path 'HKCU:\Control Panel\International' -ErrorAction SilentlyContinue
+    return @{ Format = [string]$i.LocaleName; Currency = [string]$i.sCurrency }
+}
+
+function Set-BulgarianRegion {
+    # Country or region Bulgaria (GeoId 35), Regional format English (Europe) - its currency is XDR in Windows, the euro is
+    # set instead - and Bulgarian with ONLY the Bulgarian (Phonetic Traditional) keyboard (0402:00040402). Every other
+    # Bulgarian keyboard goes, above all the standard BDS one (00030402) that Windows adds with the language. The other
+    # languages stay as they are, in their order. The language list FIRST: setting it puts the format back to the first
+    # language's while the format follows the list (VM 102: en-150 became en-US again) - so that link is cut, then the
+    # format. Read back: BDS still there, or another format / currency, is a WARN.
+    param([string]$Id = '')
+    $tip = '0402:00040402'; $euro = [string][char]0x20AC
+    $list = Get-WinUserLanguageList -ErrorAction Stop
+    $bg = @($list | Where-Object { [string]$_.LanguageTag -match '^bg(-|$)' })
+    if (-not $bg) { $bg = @((New-WinUserLanguageList -Language 'bg-BG' -ErrorAction Stop)[0]); $list.Add($bg[0]) }
+    foreach ($l in $bg) { $l.InputMethodTips.Clear(); $l.InputMethodTips.Add($tip) }
+    Set-WinUserLanguageList -LanguageList $list -Force -ErrorAction Stop
+    Set-WinCultureFromLanguageListOptOut -OptOut $true -ErrorAction Stop
+    Set-Culture -CultureInfo 'en-150' -ErrorAction Stop
+    Set-Reg -Id $Id -Path 'HKCU:\Control Panel\International' -Name 'sCurrency' -Type String -Value $euro
+    Set-WinHomeLocation -GeoId 35 -ErrorAction Stop
+    $now = Get-WinUserLanguageList   # one List object: walked with foreach, never piped
+    $tips = @(foreach ($l in $now) { if ([string]$l.LanguageTag -match '^bg(-|$)') { $l.InputMethodTips } })
+    $intl = Get-IntlNow; $fmt = $intl.Format; $cur = $intl.Currency
+    Write-Log DEBUG ("Bulgarian keyboards now: {0}; format {1}, currency U+{2}" -f ($tips -join ', '), $fmt, $(if ($cur) { '{0:X4}' -f [int][char]$cur[0] } else { '-' })) $Id
+    if ($tips -contains '0402:00030402') { Write-Log WARN 'the standard Bulgarian (BDS) keyboard is still there - remove it in Settings > Time & language > Language & region' $Id }
+    elseif ($tips -notcontains $tip) { Write-Log WARN 'the Bulgarian (Phonetic Traditional) keyboard did not go in' $Id }
+    if ($fmt -ne 'en-150' -or $cur -ne $euro) { Write-Log WARN "the regional format is $fmt, currency '$cur' - not English (Europe) with the euro" $Id }
+    Set-UiNote $Id 'Bulgaria, English (Europe), Bulgarian Phonetic'
 }
 
 function ConvertTo-CursorTheme {
@@ -2142,6 +2191,11 @@ $script:Tweaks = @(
       foreach ($k in $keys) { Remove-RegKey -Id $id -Path "$base\$k" }
   }}
 
+  # ---- Language & region: only with the window's box (or -Bulgaria) ----
+  [pscustomobject]@{ Id='CustomBulgaria'; Content='Language & region - Bulgaria, English (Europe), Bulgarian Phonetic keyboard'; Category='Bulgaria'; Bulgaria=$true; Apply={
+      Invoke-Step -Id 'CustomBulgaria' -Description 'Bulgaria, English (Europe) format with the euro, Bulgarian (Phonetic Traditional) keyboard only' -Action { Set-BulgarianRegion -Id 'CustomBulgaria' }
+  }}
+
   # ---- Low-end PC: only with the window's box (or -LowEnd) ----
   # "Adjust for best performance", but font smoothing and thumbnails stay (no speed gain). Animations: next sign-in.
   [pscustomobject]@{ Id='CustomLowEndVisual'; Content='Low-end PC - animations and transparency off'; Category='LowEnd'; LowEnd=$true; Apply={
@@ -2261,6 +2315,8 @@ $script:TweakGroups = @(
     [pscustomobject]@{ Name = 'Edge'; Text = 'no startup boost, promos or sidebar'; Ids = @('WPFTweaksEdgeDebloat') }
     [pscustomobject]@{ Name = 'Performance'; Text = @{ PC = 'Ultimate Performance, no hibernation'; Laptop = 'Windows'' own power plan' }
         Ids = @('CustomUltimatePerf', 'CustomLaptopPower', 'WPFToggleGameMode', 'CustomHibernateOff', 'WPFToggleStandbyFix', 'CustomStandbyNoNetBattery') }
+    [pscustomobject]@{ Name = 'Language & region'; Text = { if ($script:UiNotes.ContainsKey('CustomBulgaria')) { $script:UiNotes['CustomBulgaria'] } else { 'Bulgaria, English (Europe), Bulgarian Phonetic' } }
+        Ids = @('CustomBulgaria') }   # only with the box
     [pscustomobject]@{ Name = 'Low-end PC'; Text = {   # only with the box
             $t = 'animations, search, background apps off'
             foreach ($id in 'CustomLowEndProcessors', 'CustomLowEndPower') { if ($script:UiNotes.ContainsKey($id)) { $t += " $($script:G.Dot) " + $script:UiNotes[$id] } }
@@ -2300,8 +2356,6 @@ $script:AppsToInstall = @(
     '9PB2MZ1ZMB1S',                      # iTunes and Apple Devices - from the Microsoft Store, as Apple offers them
     '9NP83LWLPZ9K'
 )
-# Their box in the window is EMPTY: installed only when picked there, never from the console
-$script:AppsOffByDefault = @('Brave.Brave')
 # winget's default scope is the user's - TreeSize would land in the admin's profile
 $script:AppScopes = @{
     'JAMSoftware.TreeSize.Free' = 'machine'
@@ -2622,7 +2676,7 @@ function Write-Banner {
 function Invoke-Tweaks {
     # -Late: only the Late ones (after the installs, "Finishing")
     param([switch]$Late)
-    $list = @($script:Tweaks | Where-Object { [bool]$_.Late -eq [bool]$Late -and (-not $_.LowEnd -or $script:LowEnd) })   # Low-end: only with its box
+    $list = @($script:Tweaks | Where-Object { [bool]$_.Late -eq [bool]$Late -and (-not $_.LowEnd -or $script:LowEnd) -and (-not $_.Bulgaria -or $script:Bulgaria) })   # the boxes' tweaks only with their box
     Write-UiPhase $(if ($Late) { 'Finishing' } else { 'Tweaks' })
     if (-not $Late -and $script:OpenActivation) {   # first of all: Windows not activated, the box left on
         Test-GuiStop
@@ -3534,12 +3588,11 @@ function Show-Intro {
     $script:MachineType = $mc.Type
     Write-Log INFO ("Machine type: {0} ({1})" -f $mc.Type, $mc.Why)
     if ($script:LowEnd) { Write-Log INFO 'Low-end PC: yes (-LowEnd) - the extra tweaks for a weak PC run too' }
+    if ($script:Bulgaria) { Write-Log INFO 'Bulgaria: yes (-Bulgaria) - region, format and the phonetic keyboard' }
     if (-not (Get-WindowsActivation).Activated) { Write-Log INFO 'Windows is not activated - activate it in Settings > System > Activation' }
     $hw = @(Get-HardwareApps)
     Write-HardwareLog $hw
-    $off = @(Get-AppChoices | Where-Object { $script:AppsOffByDefault -contains $_.Key })   # Brave: only the window picks it
-    foreach ($c in $off) { $script:NotSelected[$c.Key] = 'only when picked in the window' }
-    Set-AppsLabel -Total (@(Get-AppChoices).Count - $off.Count + @($hw | Where-Object { $_.Found }).Count)
+    Set-AppsLabel -Total (@(Get-AppChoices).Count + @($hw | Where-Object { $_.Found }).Count)
 }
 
 function Get-DetectedMachineType {
@@ -3774,10 +3827,11 @@ function Get-SetupPayload {
         Apps = @($apps); Hardware = @($hw | Where-Object { $_.Found } | ForEach-Object { $_.Name })
         NotOffered = @($hw | Where-Object { -not $_.Found } | ForEach-Object { @{ Name = $_.Name; Why = $_.Why } })   # for the log
         Groups = @($script:AppGroups.Keys) + @($script:HardwareGroup, 'Other'); HardwareGroup = $script:HardwareGroup
-        OffByDefault = @($script:AppsOffByDefault)   # their box starts empty (Brave)
-        TweakCount = @($script:Tweaks | Where-Object { -not $_.LowEnd -and (-not $_.Machine -or $_.Machine -eq $mc.Type) }).Count; Log = $script:LogFile
+        TweakCount = @($script:Tweaks | Where-Object { -not $_.LowEnd -and -not $_.Bulgaria -and (-not $_.Machine -or $_.Machine -eq $mc.Type) }).Count; Log = $script:LogFile
         LowEndCount = @($script:Tweaks | Where-Object { $_.LowEnd -and (-not $_.Machine -or $_.Machine -eq $mc.Type) }).Count   # the box adds these
         LowEnd = [bool]$script:LowEnd   # -LowEnd: the box picked from the start
+        Region = (Get-RegionNow)        # the Language & region row: what this user has now
+        Bulgaria = [bool]$script:Bulgaria; BulgariaCount = @($script:Tweaks | Where-Object { $_.Bulgaria }).Count
         Specs = (Get-PcSpecs)           # the Performance row: RAM, cores / threads, SSD / HDD
         Activation = (Get-WindowsActivation)   # not activated: the Windows row (a box that opens Settings > Activation at Start)
         Always = @("Visual C++ 2005$($script:G.Dash)2022") + $runtimes + @('.NET 3.5')
@@ -3800,6 +3854,8 @@ function Set-SetupAnswer {
     if ($script:OpenActivation) { Write-Log INFO 'Windows is not activated - Settings > System > Activation opens at the start' }
     if ($Answer.ContainsKey('LowEnd')) { $script:LowEnd = [bool]$Answer.LowEnd }
     if ($script:LowEnd) { Write-Log INFO 'Low-end PC: yes - the extra tweaks for a weak PC run too' }
+    if ($Answer.ContainsKey('Bulgaria')) { $script:Bulgaria = [bool]$Answer.Bulgaria }
+    if ($script:Bulgaria) { Write-Log INFO 'Bulgaria: yes - region, format and the phonetic keyboard' }
 }
 
 function Get-WindowsActivation {
@@ -4217,7 +4273,7 @@ function Join-GuiText([object[]]$Parts) { (@($Parts) | Where-Object { $_ }) -joi
 # ---- the model: what the window shows - changed only by the run's events (Update-GuiModel) and the clicks (Invoke-GuiAction)
 function New-GuiModel {
     @{ Screen = 'wait'; WaitText = 'Getting ready'; Setup = $null; Version = ''; Log = ''
-       Choice = @{ Machine = 'PC'; Off = @{}; OpenActivation = $true; LowEnd = $false }   # the apps taken off the list (key -> $true); the Windows row's box; Low-end PC
+       Choice = @{ Machine = 'PC'; Off = @{}; OpenActivation = $true; LowEnd = $false; Bulgaria = $false }   # the apps taken off the list (key -> $true); the Windows row's box; Low-end PC
        Banner = @{ Machine = ''; Os = ''; MachineType = ''; User = ''; DryRun = $false }
        Tweaks = @{ State = 'todo'; Rows = [System.Collections.Generic.List[object]]::new(); Progress = $null; Count = 0; Time = '' }
        Apps = @{ State = 'todo'; Rows = [System.Collections.Generic.List[object]]::new(); Plan = @() }
@@ -4236,10 +4292,10 @@ function Update-GuiModel($M, $Ev) {
         'setup' {
             $p = $Ev.Payload; $M.Setup = $p; $M.Screen = 'setup'; $M.Version = [string]$p.Version; $M.Log = [string]$p.Log
             $M.Choice.Machine = if ($p.Machine) { [string]$p.Machine } else { 'PC' }   # detected (or -Machine) - shown, not a choice
-            $M.Choice.Off = @{}   # everything picked - but the apps whose box starts empty
-            foreach ($k in @($p.OffByDefault)) { if ($k) { $M.Choice.Off[[string]$k] = $true } }
+            $M.Choice.Off = @{}   # everything picked
             $M.Choice.OpenActivation = $true   # (the Windows row, when there is one: picked)
             $M.Choice.LowEnd = [bool]$p.LowEnd   # the Low-end PC box: picked only with -LowEnd
+            $M.Choice.Bulgaria = [bool]$p.Bulgaria   # the Bulgaria box: picked only with -Bulgaria
         }
         'banner' {
             foreach ($k in 'Machine', 'Os', 'MachineType', 'User', 'DryRun') { $M.Banner[$k] = $Ev[$k] }
@@ -4351,9 +4407,14 @@ function Get-GuiSetupParts($M) {
     if ($sp -and $sp.Disk) { $specs += [string]$sp.Disk }
     $pRight = if ($specs) { New-GuiRight ($specs -join (' {0} ' -f [char]0xB7)) } else { '' }   # (New-GuiRight escapes)
     $body += New-GuiNode 'ask' (& $q 'Performance') $pRight (& $row 'Weak PC' (& $chip 'Low-end PC' ([bool]$ch.LowEnd) 'pick:lowend') '' '')
+    # Language & region: what this user has now - picked, what it will be (blue)
+    $rg = $p.Region
+    $rRight = if ($ch.Bulgaria) { New-GuiText (ConvertTo-GuiXml (Join-GuiText @('Bulgaria', 'English (Europe)', ((@(@($rg.Keys) | Where-Object { $_ -ne 'BUL' }) + 'BUL phonetic') -join ', ')))) $GuiC.blue 12 }
+              elseif ($rg) { New-GuiRight (Join-GuiText @($rg.Country, $rg.Format, (@($rg.Keys) -join ', '))) } else { '' }
+    $body += New-GuiNode 'ask' (& $q 'Language & region') $rRight (& $row 'Bulgarian PC' (& $chip 'Bulgaria + phonetic keyboard' ([bool]$ch.Bulgaria) 'pick:bulgaria') '' '')
     $body += New-GuiNode 'ask' (& $q 'Apps') $right $rows -Last
     $foot = @($(if ($apps.Count -and $on -eq $apps.Count) { "all $on apps" } else { "$on apps" }))
-    if ($p.TweakCount) { $foot += "$([int]$p.TweakCount + $(if ($ch.LowEnd) { [int]$p.LowEndCount } else { 0 })) tweaks" }
+    if ($p.TweakCount) { $foot += "$([int]$p.TweakCount + $(if ($ch.LowEnd) { [int]$p.LowEndCount } else { 0 }) + $(if ($ch.Bulgaria) { [int]$p.BulgariaCount } else { 0 })) tweaks" }
     $kbd = "<Border BorderBrush='$($GuiC.line2)' BorderThickness='1,1,1,2' CornerRadius='5' Padding='7,1' VerticalAlignment='Center'>$(New-GuiText 'Enter' $GuiC.tx2 11)</Border>"
     $hl = (New-GuiText 'Set up this PC' $GuiC.tx 17 'Bold') + (New-GuiText (ConvertTo-GuiXml (Join-GuiText @($p.PcName, $p.Os, $ch.Machine))) $GuiC.tx3 12 'Normal' '0,3,0,0')
     (Get-GuiHeader $hl ($kbd + (New-GuiText 'to start' $GuiC.tx3 12 'Normal' '10,0,0,0'))) +
@@ -4662,11 +4723,12 @@ function Invoke-GuiAction([string]$Tag) {
         '^pick:apps:all$'     { $m.Choice.Off = @{} }
         '^pick:activation$'   { $m.Choice.OpenActivation = -not $m.Choice.OpenActivation }
         '^pick:lowend$'       { $m.Choice.LowEnd = -not $m.Choice.LowEnd }
+        '^pick:bulgaria$'     { $m.Choice.Bulgaria = -not $m.Choice.Bulgaria }
         '^act:start$'         {
             if ($m.Screen -ne 'setup' -or $sh.Answer) { return }
             $act = $m.Setup.Activation
             $sh.Answer = @{ Machine = $m.Choice.Machine; Off = @($m.Choice.Off.Keys)
-                            OpenActivation = [bool]($act -and -not $act.Activated -and $m.Choice.OpenActivation); LowEnd = [bool]$m.Choice.LowEnd }
+                            OpenActivation = [bool]($act -and -not $act.Activated -and $m.Choice.OpenActivation); LowEnd = [bool]$m.Choice.LowEnd; Bulgaria = [bool]$m.Choice.Bulgaria }
             $m.Screen = 'wait'; $m.WaitText = 'Starting'
         }
         '^act:cancel$'        { if (-not $sh.Answer) { $sh.Answer = @{ Cancel = $true } }; Close-GuiWindowNow; return }
@@ -4693,15 +4755,15 @@ function Save-GuiSnapshot([string]$Name) {
     } catch { Add-GuiError "snapshot: $($_.Exception.Message)" }
 }
 function Invoke-GuiTestHooks {
-    # test variables only: W11T_GUI_AUTOSTART (1 / some / all) [+ W11T_GUI_LOWEND] presses Start, W11T_GUI_STOP=apps stops
+    # test variables only: W11T_GUI_AUTOSTART (1 / some) [+ W11T_GUI_LOWEND, W11T_GUI_BULGARIA] presses Start, W11T_GUI_STOP=apps stops
     # in Apps, W11T_GUI_SNAP saves the screens as PNGs, W11T_GUI_AUTOCLOSE closes the window at the end
     $m = $script:GuiM; $h = $script:GuiHooks; $now = Get-GuiNow
     if ($env:W11T_GUI_AUTOSTART -and $m.Screen -eq 'setup' -and -not $h.Started) {
         if (-not $h.SetupAt) { $h.SetupAt = $now }
         elseif ($now - $h.SetupAt -gt 1.5) {
-            if ($env:W11T_GUI_AUTOSTART -eq 'all') { Invoke-GuiAction 'pick:apps:all' }   # every app, the ones whose box starts empty too
             if ($env:W11T_GUI_AUTOSTART -eq 'some') { foreach ($a in @($m.Setup.Apps | Select-Object -First 3)) { if ($a) { $m.Choice.Off[[string]$a.Key] = $true } }; Invoke-GuiRender }
             if ($env:W11T_GUI_LOWEND) { $m.Choice.LowEnd = $true; Invoke-GuiRender }   # the Low-end PC box picked
+            if ($env:W11T_GUI_BULGARIA) { $m.Choice.Bulgaria = $true; Invoke-GuiRender }   # the Bulgaria box picked
             Save-GuiSnapshot 'setup'; $h.Started = $true; Invoke-GuiAction 'act:start'
         }
     }

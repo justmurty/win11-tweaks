@@ -38,7 +38,7 @@
     performance when a laptop is plugged in; at the end the launchers (Steam, Discord, Battle.net...) don't start with Windows.
 
 .PARAMETER Bulgaria
-    The window's "Bulgaria + phonetic keyboard" box picked (on the console: on) - Country or region Bulgaria, Regional
+    The window's "Bulgaria + phonetic keyboard" box picked (on the console: on) - Country or region United States, Regional
     format English (Europe) with the euro, Bulgarian with only the Bulgarian (Phonetic Traditional) keyboard, and the time
     zone (UTC+02:00) Helsinki, Kyiv, Riga, Sofia, Tallinn, Vilnius.
 
@@ -683,14 +683,16 @@ function Get-RegionNow {
 }
 
 function Get-IntlNow {
-    # this user's regional format and currency symbol, as Windows keeps them
+    # this user's regional format, currency symbol and Country or region (GeoId), as Windows keeps them
     $i = Get-ItemProperty -Path 'HKCU:\Control Panel\International' -ErrorAction SilentlyContinue
-    return @{ Format = [string]$i.LocaleName; Currency = [string]$i.sCurrency }
+    $g = Get-ItemProperty -Path 'HKCU:\Control Panel\International\Geo' -ErrorAction SilentlyContinue
+    return @{ Format = [string]$i.LocaleName; Currency = [string]$i.sCurrency; Geo = [string]$g.Nation }
 }
 
 function Set-BulgarianRegion {
-    # Country or region Bulgaria (GeoId 35), Regional format English (Europe) - its currency is XDR in Windows, the euro is
-    # set instead - and Bulgarian with ONLY the Bulgarian (Phonetic Traditional) keyboard (0402:00040402). Every other
+    # Country or region United States (GeoId 244 - his pick 2026-11-15, not Bulgaria), Regional format English
+    # (Europe) - its currency is XDR in Windows, the euro is set instead - and Bulgarian with ONLY the Bulgarian
+    # (Phonetic Traditional) keyboard (0402:00040402). Every other
     # Bulgarian keyboard goes, above all the standard BDS one (00030402) that Windows adds with the language. The other
     # languages stay as they are, in their order. The language list FIRST: setting it puts the format back to the first
     # language's while the format follows the list (VM 102: en-150 became en-US again) - so that link is cut, then the
@@ -705,19 +707,37 @@ function Set-BulgarianRegion {
     foreach ($l in $bg) { $l.InputMethodTips.Clear(); $l.InputMethodTips.Add($tip) }
     Set-WinUserLanguageList -LanguageList $list -Force -ErrorAction Stop
     Set-WinCultureFromLanguageListOptOut -OptOut $true -ErrorAction Stop
-    Set-Culture -CultureInfo 'en-150' -ErrorAction Stop
-    Set-Reg -Id $Id -Path 'HKCU:\Control Panel\International' -Name 'sCurrency' -Type String -Value $euro
-    Set-WinHomeLocation -GeoId 35 -ErrorAction Stop
     Set-TimeZone -Id $zone -ErrorAction Stop
+    Set-RegionUntilHeld -Id $Id
     $now = Get-WinUserLanguageList   # one List object: walked with foreach, never piped
     $tips = @(foreach ($l in $now) { if ([string]$l.LanguageTag -match '^bg(-|$)') { $l.InputMethodTips } })
     $intl = Get-IntlNow; $fmt = $intl.Format; $cur = $intl.Currency; $tz = [string](Get-TimeZone).Id
+    if ($intl.Geo -ne '244') { Write-Log WARN "Country or region is GeoId $($intl.Geo) - not United States; set it in Settings > Time & language > Language & region" $Id }
     Write-Log DEBUG ("Bulgarian keyboards now: {0}; format {1}, currency U+{2}; time zone {3}" -f ($tips -join ', '), $fmt, $(if ($cur) { '{0:X4}' -f [int][char]$cur[0] } else { '-' }), $tz) $Id
     if ($tips -contains '0402:00030402') { Write-Log WARN 'the standard Bulgarian (BDS) keyboard is still there - remove it in Settings > Time & language > Language & region' $Id }
     elseif ($tips -notcontains $tip) { Write-Log WARN 'the Bulgarian (Phonetic Traditional) keyboard did not go in' $Id }
     if ($fmt -ne 'en-150' -or $cur -ne $euro) { Write-Log WARN "the regional format is $fmt, currency '$cur' - not English (Europe) with the euro" $Id }
     if ($tz -ne $zone) { Write-Log WARN "the time zone is '$tz' - not (UTC+02:00) Sofia; set it in Settings > Time & language > Date & time" $Id }
-    Set-UiNote $Id 'Bulgaria, English (Europe), Bulgarian Phonetic, UTC+02:00 Sofia'
+    Set-UiNote $Id 'United States, English (Europe), Bulgarian Phonetic, UTC+02:00 Sofia'
+}
+
+function Set-RegionUntilHeld {
+    # English (Europe), the euro, Country or region United States - set, looked at again, set again until all three have
+    # held for 3 s (at most $TimeoutSec): Windows applies a new language list a moment later in the background and that
+    # undoes them (his test, VM 102 2026-11-15: en-150 with XDR and the country back to what it was; my repeat: en-US).
+    param([string]$Id = '', [int]$TimeoutSec = 20)
+    $euro = [string][char]0x20AC
+    $sw = [System.Diagnostics.Stopwatch]::StartNew(); $since = -1.0; $sets = 0
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        $i = Get-IntlNow
+        if ($i.Format -ne 'en-150') { Set-Culture -CultureInfo 'en-150' -ErrorAction Stop; $sets++; $since = -1.0 }
+        elseif ($i.Currency -ne $euro) { Set-Reg -Id $Id -Path 'HKCU:\Control Panel\International' -Name 'sCurrency' -Type String -Value $euro; $sets++; $since = -1.0 }
+        elseif ($i.Geo -ne '244') { Set-WinHomeLocation -GeoId 244 -ErrorAction Stop; $sets++; $since = -1.0 }
+        elseif ($since -lt 0) { $since = $sw.Elapsed.TotalSeconds }
+        elseif ($sw.Elapsed.TotalSeconds - $since -ge 3) { break }
+        Start-Sleep -Milliseconds 500
+    }
+    if ($sets -gt 3) { Write-Log DEBUG "format, euro and country: set $sets times - Windows put them back in between" $Id }
 }
 
 function ConvertTo-CursorTheme {
@@ -2324,8 +2344,8 @@ $script:Tweaks = @(
   }}
 
   # ---- Language & region: only with the window's box (or -Bulgaria) ----
-  [pscustomobject]@{ Id='CustomBulgaria'; Content='Language & region - Bulgaria, English (Europe), Bulgarian Phonetic keyboard, Sofia time zone'; Category='Bulgaria'; Bulgaria=$true; Apply={
-      Invoke-Step -Id 'CustomBulgaria' -Description 'Bulgaria, English (Europe) format with the euro, Bulgarian (Phonetic Traditional) keyboard only, time zone (UTC+02:00) Sofia' -Action { Set-BulgarianRegion -Id 'CustomBulgaria' }
+  [pscustomobject]@{ Id='CustomBulgaria'; Content='Language & region - United States, English (Europe), Bulgarian Phonetic keyboard, Sofia time zone'; Category='Bulgaria'; Bulgaria=$true; Apply={
+      Invoke-Step -Id 'CustomBulgaria' -Description 'United States, English (Europe) format with the euro, Bulgarian (Phonetic Traditional) keyboard only, time zone (UTC+02:00) Sofia' -Action { Set-BulgarianRegion -Id 'CustomBulgaria' }
   }}
 
   # ---- Low-end PC: only with the window's box (or -LowEnd) ----
@@ -2451,7 +2471,7 @@ $script:TweakGroups = @(
                 $(if ($script:UiNotes.ContainsKey('CustomUltimatePerf')) { $script:UiNotes['CustomUltimatePerf'] } else { 'Ultimate Performance' }) + ', no hibernation' }
             else { 'Game Mode, no hibernation' } }
         Ids = @('CustomUltimatePerf', 'CustomLaptopPower', 'WPFToggleGameMode', 'CustomHibernateOff', 'WPFToggleStandbyFix', 'CustomStandbyNoNetBattery') }
-    [pscustomobject]@{ Name = 'Language & region'; Text = { if ($script:UiNotes.ContainsKey('CustomBulgaria')) { $script:UiNotes['CustomBulgaria'] } else { 'Bulgaria, English (Europe), Bulgarian Phonetic, UTC+02:00 Sofia' } }
+    [pscustomobject]@{ Name = 'Language & region'; Text = { if ($script:UiNotes.ContainsKey('CustomBulgaria')) { $script:UiNotes['CustomBulgaria'] } else { 'United States, English (Europe), Bulgarian Phonetic, UTC+02:00 Sofia' } }
         Ids = @('CustomBulgaria') }   # only with the box
     [pscustomobject]@{ Name = 'Low-end PC'; Text = {   # only with the box
             $t = 'animations, search, background apps off'
@@ -4557,7 +4577,7 @@ function Get-GuiSetupParts($M) {
     $body += New-GuiNode 'ask' (& $q 'Performance') $pRight $pRows
     # Language & region: what this user has now - picked, what it will be (blue)
     $rg = $p.Region
-    $rRight = if ($ch.Bulgaria) { New-GuiText (ConvertTo-GuiXml (Join-GuiText @('Bulgaria', 'English (Europe)', ((@(@($rg.Keys) | Where-Object { $_ -ne 'BUL' }) + 'BUL phonetic') -join ', '), 'UTC+02:00 Sofia'))) $GuiC.blue 12 }
+    $rRight = if ($ch.Bulgaria) { New-GuiText (ConvertTo-GuiXml (Join-GuiText @('United States', 'English (Europe)', ((@(@($rg.Keys) | Where-Object { $_ -ne 'BUL' }) + 'BUL phonetic') -join ', '), 'UTC+02:00 Sofia'))) $GuiC.blue 12 }
               elseif ($rg) { New-GuiRight (Join-GuiText @($rg.Country, $rg.Format, (@($rg.Keys) -join ', '), $rg.Zone)) } else { '' }
     $body += New-GuiNode 'ask' (& $q 'Language & region') $rRight (& $row 'Bulgarian PC' (& $chip 'Bulgaria + phonetic keyboard' ([bool]$ch.Bulgaria) 'pick:bulgaria') '' '')
     $body += New-GuiNode 'ask' (& $q 'Apps') $right $rows -Last

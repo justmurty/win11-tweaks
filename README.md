@@ -65,7 +65,8 @@ Every detail goes to a log file for later.
   **Sticky Keys** question (5× Shift) is gone at once, not only after the next sign-in. After the **chipset
   drivers** (Intel, AMD) the run waits for the network to come back (they restart the network adapter), and a
   download that finds no network waits for it and tries once more. **NVIDIA App** is found again (NVIDIA
-  renamed its installer).
+  renamed its installer). **Language & region** puts Country or region on **United States** (not Bulgaria), and
+  sets English (Europe) with the euro until it holds (Windows could put it back while it applied the new language).
 
   New in v1.10.0: **Brave** next to Google Chrome, picked like every app; it goes in for every user and
   onto the taskbar, which now pins **the browsers picked**: Chrome, Brave or both (Chrome too only when it
@@ -276,7 +277,7 @@ Hardware-accelerated GPU scheduling and Game Mode stay as they are (Game Mode is
 The **Bulgaria + phonetic keyboard** box (window) or `-Bulgaria` (console / `.bat`), for the user who runs
 the script:
 
-- **Country or region** — Bulgaria.
+- **Country or region** — United States.
 - **Regional format** — English (Europe): dates `12/10/2026`, a 24-hour clock, the week from Monday; money
   in **€** (Windows' own English (Europe) shows XDR).
 - **Bulgarian** added with **one keyboard only: Bulgarian (Phonetic Traditional)** (ЯВЕРТЪ). Every other

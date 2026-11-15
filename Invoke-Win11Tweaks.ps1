@@ -1637,10 +1637,22 @@ function Install-DirectDownload {
         Write-Log WARN "$failed (downloaded file is not an exe/msi installer; get it manually from $Url)"
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return (Get-DirectFailStatus 'the download is not an installer' ([bool]$from))
     }
-    if ($Signer) {   # a scraped link must lead to the vendor's own signed file
-        $sig = Get-AuthenticodeSignature -FilePath $tmp -ErrorAction SilentlyContinue
-        $subject = if ($sig -and $sig.SignerCertificate) { [string]$sig.SignerCertificate.Subject } else { '' }
-        if (-not $sig -or "$($sig.Status)" -ne 'Valid' -or $subject -notmatch [regex]::Escape($Signer)) {
+    if ($Signer) {   # a scraped link must lead to the vendor's own signed file; the signature also covers every byte
+        for ($try = 1; $try -le 2; $try++) {
+            $sig = Get-AuthenticodeSignature -FilePath $tmp -ErrorAction SilentlyContinue
+            $subject = if ($sig -and $sig.SignerCertificate) { [string]$sig.SignerCertificate.Subject } else { '' }
+            if ($sig -and "$($sig.Status)" -eq 'Valid' -and $subject -match [regex]::Escape($Signer)) { break }
+            # a damaged download (the signature no longer matches its bytes - a real PC 2026-11-15: NVIDIA App's package
+            # "7-Zip ... error", exit code 8; run by hand it installed): fetched once more. Another signer: never run.
+            if ($try -eq 1 -and $sig -and "$($sig.Status)" -ne 'Valid') {
+                Write-Log INFO ("{0}: the download is damaged (signature {1}) - downloading it again" -f $Name, $sig.Status)
+                Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+                try { Save-Download -Url $Url -OutFile $tmp -Headers $Headers; continue }
+                catch {
+                    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+                    Write-Log WARN "$failed (download failed: $($_.Exception.Message))"; return (Get-DirectFailStatus 'download failed' ([bool]$from))
+                }
+            }
             Write-Log WARN ("{0} (the download is not signed by {1}: {2} {3}) - not run" -f $failed, $Signer, $(if ($sig) { $sig.Status } else { 'no signature' }), $subject)
             Remove-Item $tmp -Force -ErrorAction SilentlyContinue; return (Get-DirectFailStatus "not signed by $Signer - not run" ([bool]$from))
         }
@@ -2588,8 +2600,9 @@ $script:DirectApps = @(
             $m = [regex]::Match($html, 'https://[^\s"''<>]+/NVIDIA_app_v[\d.]+(?:_x64)?\.exe')   # since v11: _x64 / _arm64 (not that one)
             if ($m.Success) { $m.Value }
         }
-        SilentArgs = '-s -noreboot -noeula -nofinish -nosplash'
+        SilentArgs = '-s -noreboot -noeula -nofinish -nosplash'   # v11's setup.cfg still takes all of them
         DetectName = 'NVIDIA App*'
+        Signer     = 'NVIDIA Corporation'   # a damaged download is caught (and fetched again) before it runs
         Require    = { Test-GpuVendor '10DE' 'NVIDIA' }   # by PCI ID: before its driver is in, the card is a "Microsoft Basic Display Adapter"
         RequireMsg = 'no NVIDIA GPU detected'
     }

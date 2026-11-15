@@ -1409,7 +1409,55 @@ function Receive-DownloadRest {
     return @{ Length = [int64](Get-Item -LiteralPath $OutFile).Length; Total = $total }
 }
 
+function Test-NetworkDown {
+    # the error of a request that never reached the server: no name resolves / no connection (no network, not a bad URL)
+    param($Exception)
+    $e = $Exception; while ($e -and $e -isnot [System.Net.WebException]) { $e = $e.InnerException }
+    return [bool]($e -and "$($e.Status)" -in 'NameResolutionFailure', 'ConnectFailure')
+}
+
+function Test-NameResolves {
+    # a fresh lookup: the DNS cache cleared first, so an answer from before the network went does not count
+    param([string]$Name)
+    try { Clear-DnsClientCache -ErrorAction Stop } catch { }
+    try { return [bool]@([System.Net.Dns]::GetHostAddresses($Name)).Count } catch { return $false }
+}
+
+function Wait-Network {
+    # A chipset driver restarts the PCI devices under it - the network adapter too, and for a while no name resolves (a real
+    # PC, 2026-11-15: right after Intel's chipset software the next 7 downloads failed within a second, "The remote name could
+    # not be resolved"). Waits until names resolve again - twice, 2 s apart (VM 102: the adapter can drop once more just
+    # after it is back) - at most $TimeoutSec. $false = no network yet; the downloads after it fail as before.
+    param([string]$After = '', [int]$TimeoutSec = 120, [string]$Name = 'dl.google.com')
+    $sw = [System.Diagnostics.Stopwatch]::StartNew(); $ok = 0; $lost = $false
+    Start-Sleep -Seconds 2   # the adapter can go a moment after the installer ends
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        if (Test-NameResolves $Name) { if (++$ok -ge 2) { break } }
+        else {
+            $ok = 0
+            if (-not $lost) { $lost = $true; Write-Log INFO $(if ($After) { "no network after $After - waiting for it (up to $TimeoutSec s)" } else { "no network - waiting for it (up to $TimeoutSec s)" }) }
+        }
+        Start-Sleep -Seconds 2
+    }
+    if ($ok -lt 2) { Write-Log WARN ("still no network after {0:N0} s - the downloads that follow can fail" -f $sw.Elapsed.TotalSeconds); return $false }
+    if ($lost) { Write-Log INFO ("the network is back after {0:N0} s" -f $sw.Elapsed.TotalSeconds) } else { Write-Log DEBUG 'network: fine' }
+    return $true
+}
+
 function Save-Download {
+    # A request that never reached the server (no network for a moment) is tried once more after Wait-Network.
+    param([string]$Url, [string]$OutFile, [hashtable]$Headers, [string]$UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
+    try { Save-DownloadOnce -Url $Url -OutFile $OutFile -Headers $Headers -UserAgent $UserAgent }
+    catch {
+        if (-not (Test-NetworkDown $_.Exception)) { throw }
+        Write-Log INFO "download: no network ($($_.Exception.Message))"
+        Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+        if (-not (Wait-Network -TimeoutSec 60)) { throw }
+        Save-DownloadOnce -Url $Url -OutFile $OutFile -Headers $Headers -UserAgent $UserAgent
+    }
+}
+
+function Save-DownloadOnce {
     # Invoke-WebRequest (PS 5.1) can stop part-way WITHOUT an error: short of the server's size, the rest is fetched
     # with Range requests until 4 in a row bring nothing (20 at most). Throws when it stays short.
     param([string]$Url, [string]$OutFile, [hashtable]$Headers, [string]$UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
@@ -1450,6 +1498,7 @@ function Install-DirectDownload {
         [hashtable]$Headers,
         [string]$Signer,              # a valid signature from this publisher, or it is not run
         [string]$Machine,             # checked by the install phase (listed so @splatting works)
+        [switch]$ResetsNetwork,       # (the install phase too: Wait-Network after it)
         [switch]$WaitMainOnly,
         [switch]$UpdateFromUrl        # no updater of its own: older than the download -> installed over it
     )
@@ -2435,7 +2484,7 @@ $script:DirectApps = @(
         UrlScript  = {
             $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
             $html = (Invoke-WebRequest 'https://www.nvidia.com/en-us/software/nvidia-app/' -UseBasicParsing -UserAgent $ua -ErrorAction Stop).Content
-            $m = [regex]::Match($html, 'https://[^\s"''<>]+/NVIDIA_app_v[\d.]+\.exe')
+            $m = [regex]::Match($html, 'https://[^\s"''<>]+/NVIDIA_app_v[\d.]+(?:_x64)?\.exe')   # since v11: _x64 / _arm64 (not that one)
             if ($m.Success) { $m.Value }
         }
         SilentArgs = '-s -noreboot -noeula -nofinish -nosplash'
@@ -2482,6 +2531,7 @@ $script:DirectApps = @(
         UpdateFromUrl = $true              # nothing else updates it
         Signer     = 'Advanced Micro Devices'
         Machine    = 'PC'
+        ResetsNetwork = $true              # see Wait-Network
         Require    = { (Get-CpuVendor) -eq 'AuthenticAMD' -and (Test-PciVendor '1022') -and -not (Test-VirtualMachine) }
         RequireMsg = 'no AMD chipset'
     }
@@ -2497,6 +2547,7 @@ $script:DirectApps = @(
         DetectName = 'SetupChipset*', 'Intel(R) Chipset Device Software*'   # new and old name
         Signer     = 'Intel Corporation'
         Machine    = 'PC'
+        ResetsNetwork = $true              # see Wait-Network
         Require    = { (Get-CpuVendor) -eq 'GenuineIntel' -and (Test-PciVendor '8086') -and -not (Test-VirtualMachine) }
         RequireMsg = 'no Intel chipset'
     }
@@ -3301,6 +3352,7 @@ function Invoke-InstallPhase {
         Start-LiveItem -Name $d.Name -What 'downloading' -NoClock   # Invoke-WebRequest blocks - no clock to tick
         $st = if ($d.Custom) { & $d.Custom } else { Install-DirectDownload @d }   # Razer Synapse, Vencord: their own installers
         if ($st -eq 'SKIPPED') { $null = Stop-LiveItem; continue }   # e.g. Vencord with no Discord: the installer logged why - not listed
+        if ($d.ResetsNetwork -and -not $script:DryRun -and $script:ItemNote -ne 'already installed') { Set-LiveWhat 'waiting for the network'; $null = Wait-Network -After $d.Name }
         $script:Results.Add([pscustomobject]@{ Phase='Install'; Id=$d.Name; Content=$d.Name; Status=$st; Detail=$(if ($st -eq 'FAILED' -and $script:ItemFail) { $script:ItemFail } elseif ($st -eq 'SKIPPED' -and $script:ItemNote) { $script:ItemNote } else { 'direct' }) })
         if ($st -eq 'OK' -and $script:DesktopShortcutApps.ContainsKey($d.Name)) { $sc = $script:DesktopShortcutApps[$d.Name]; New-DesktopShortcut -Name $sc.Name -Exe $sc.Exe }
         Write-AppLine -Name $d.Name -Status $st -From $from

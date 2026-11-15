@@ -8,7 +8,7 @@
     Everything goes to a log file for later.
 
 .DESCRIPTION
-    The 55 tweaks (25 standard + 30 custom) and the install list are a fixed, curated set
+    The 56 tweaks (25 standard + 31 custom) and the install list are a fixed, curated set
     (see docs/2026-07-11-win11-tweaks-design.md). Only the ON toggles / checked items are
     applied; nothing else is touched.
     The script makes NO restore point and does NOT reboot unless -Reboot is given.
@@ -23,7 +23,7 @@
 .PARAMETER Machine
     'PC' or 'Laptop' - overrides what the script detects (the case and the firmware say it; a battery
     only when they say nothing - a desktop's UPS is a battery to Windows too). A laptop skips the PC-only
-    items: the Ultimate Performance power plan (a laptop keeps Windows' own plan), hibernation off, the
+    items: the Ultimate Performance box (a laptop keeps Windows' own plan), hibernation off, the
     highest monitor refresh rate and the chipset / Radeon drivers; a PC skips the laptop-only items (no
     network while asleep on battery). The apps for hardware (NZXT CAM, Alienware Command Center, Armoury
     Crate...) go by the hardware itself, not by this.
@@ -41,6 +41,10 @@
     The window's "Bulgaria + phonetic keyboard" box picked (on the console: on) - Country or region Bulgaria, Regional
     format English (Europe) with the euro, Bulgarian with only the Bulgarian (Phonetic Traditional) keyboard, and the time
     zone (UTC+02:00) Helsinki, Kyiv, Riga, Sofia, Tallinn, Vilnius.
+
+.PARAMETER Ultimate
+    The window's "Ultimate Performance" box picked (on the console: on) - a PC gets the Ultimate Performance power plan
+    (a Ryzen X3D with two CCDs keeps Balanced). Without it the power plan stays as it is. A laptop: no such box.
 
 .PARAMETER Console
     The rail in this console instead of the window. The console is also what you get without a
@@ -62,6 +66,7 @@ param(
     [switch]$Console,
     [switch]$LowEnd,
     [switch]$Bulgaria,
+    [switch]$Ultimate,
     [switch]$Relaunched # internal: set by the elevation relaunch
 )
 
@@ -123,6 +128,7 @@ $script:ExitWhenDone         = $false  # the run's own console closes at the ver
 $script:KeepAwake            = $false
 $script:LowEnd               = [bool]$LowEnd
 $script:Bulgaria             = [bool]$Bulgaria
+$script:Ultimate             = [bool]$Ultimate
 $script:NeedRestart          = $false  # a change that takes effect only at the next start
 # Console glyphs, made at run time so this file stays ASCII. Only characters Cascadia Mono AND Consolas have:
 # conhost has no fallback font.
@@ -943,6 +949,7 @@ function Set-BalancedForX3D {
     param([string]$Id = '')
     $null = powercfg -setactive '381b4222-f694-41f0-9685-ff5bb260df2e'
     Write-Log INFO "Ryzen X3D with two CCDs: the Balanced plan stays - AMD's V-Cache driver needs its core parking to keep games on the V-Cache CCD (Ultimate would switch that off)" $Id
+    Set-UiNote $Id 'Balanced kept (Ryzen X3D)'
 }
 
 function Set-PcPowerPlan {
@@ -976,6 +983,61 @@ function Reset-LaptopPowerPlan {
     if ($LASTEXITCODE -ne 0) { Write-Log WARN ("the old laptop plan {0} could not be deleted (powercfg exit code {1})" -f $guid, $LASTEXITCODE) $Id }
     else { Write-Log DEBUG "deleted the old laptop plan $guid" $Id }
     Set-Reg -Id $Id -Path $script:StateKey -Name 'LaptopPowerPlan' -Type String -Value '<RemoveEntry>'
+}
+
+function Set-AccessShortcutsNow {
+    # The Sticky / Filter / Toggle Keys shortcuts off in this session too: Windows reads the registry only at sign-in
+    # (VM 102: Flags 506 in the registry, 5x Shift still asked - until SystemParametersInfo). Only the shortcut bit (4).
+    param([string]$Id = '')
+    if (-not ('W11TAccess.Spi' -as [type])) {
+        Add-Type -Namespace W11TAccess -Name Spi -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)] public static extern bool SystemParametersInfo(uint uAction, uint uParam, [System.Runtime.InteropServices.In, System.Runtime.InteropServices.Out] byte[] pvParam, uint fWinIni);'
+    }
+    foreach ($k in @(@('Sticky Keys', 0x3A, 8), @('Filter Keys', 0x32, 24), @('Toggle Keys', 0x34, 8))) {   # SPI_GET..., its SET is +1; the struct's size
+        $b = New-Object byte[] $k[2]; [BitConverter]::GetBytes([uint32]$k[2]).CopyTo($b, 0)
+        if (-not [W11TAccess.Spi]::SystemParametersInfo([uint32]$k[1], [uint32]$k[2], $b, 0)) { throw "$($k[0]): Windows did not give its settings" }
+        $f = [BitConverter]::ToUInt32($b, 4)
+        if (-not ($f -band 4)) { Write-Log DEBUG "$($k[0]) shortcut already off in this session" $Id; continue }
+        [BitConverter]::GetBytes([uint32]($f - 4)).CopyTo($b, 4)
+        if (-not [W11TAccess.Spi]::SystemParametersInfo([uint32]($k[1] + 1), [uint32]$k[2], $b, 2)) { throw "$($k[0]): Windows refused the change" }
+        Write-Log DEBUG ("{0} shortcut off now (flags {1} -> {2})" -f $k[0], $f, ($f - 4)) $Id
+    }
+}
+
+function Set-QuietMomentsOff {
+    # Settings > System > Notifications > "Turn on do not disturb automatically": a second screen, a game, an app in full
+    # screen, the first hour after a feature update - each off. Windows keeps them as CloudStore records; these are the bytes
+    # Settings itself writes (VM 102, 25H2): field 10 set, no field 20 = off. The schedule is off already and stays as it is.
+    param([string]$Id = '')
+    $base = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount\Current\default$windows.data.donotdisturb.quietmoment$quietmomentlist'
+    $leb = { param([long]$n) $o = [System.Collections.Generic.List[byte]]::new(); do { $b = [byte]($n -band 0x7F); $n = $n -shr 7; if ($n) { $b = $b -bor 0x80 }; $o.Add($b) } while ($n); , $o.ToArray() }
+    $ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()   # when it was changed, as Settings stamps it
+    $changed = 0
+    foreach ($m in @(@('presentation', 'AlarmsOnly'), @('game', 'PriorityOnly'), @('fullscreen', 'AlarmsOnly'), @('postoobe', 'PriorityOnly'))) {   # each with its own Windows profile
+        $k = "$base\windows.data.donotdisturb.quietmoment`$quietmoment$($m[0])"
+        $hex = (@(Get-RegValue -Path $k -Name 'Data') | ForEach-Object { '{0:X2}' -f $_ }) -join ''
+        if ($hex.Contains('C20A01D21E')) { Write-Log DEBUG "do not disturb: '$($m[0])' already off" $Id; continue }
+        $prof = [Text.Encoding]::Unicode.GetBytes("Microsoft.QuietHoursProfile.$($m[1])")
+        $inner = [byte[]](0x43, 0x42, 0x01, 0x00, 0xC2, 0x0A, 0x01, 0xD2, 0x1E) + (& $leb ($prof.Length / 2)) + $prof + [byte[]](0xCA, 0x50, 0x00, 0x00)
+        $data = [byte[]](0x43, 0x42, 0x01, 0x00, 0x0A, 0x02, 0x01, 0x00, 0x2A, 0x06) + (& $leb $ts) + [byte[]](0x2A, 0x2B, 0x0E) + (& $leb $inner.Count) + $inner + [byte[]](0x00, 0x00, 0x00)
+        Set-Reg -Id $Id -Path $k -Name 'Data' -Type Binary -Value (($data | ForEach-Object { '{0:x2}' -f $_ }) -join ',')
+        $changed++
+    }
+    # the user's notification service keeps the rules in memory: restarted, it reads them again (else at the next sign-in)
+    if ($changed) { Invoke-Step -Id $Id -Description 'the notification service reads the rules again (restart)' -Action { Restart-WpnUserService -Id $Id } }
+}
+
+function Restart-WpnUserService {
+    # WpnUserService_<id> of THIS session (each signed-in user has one). VM 102: right after its restart a full-screen window
+    # no longer turned do not disturb on. Not restarted = the rules count from the next sign-in - no failure.
+    param([string]$Id = '')
+    $mine = (Get-Process -Id $PID).SessionId
+    $svc = @(Get-CimInstance Win32_Service -Filter "Name LIKE 'WpnUserService[_]%'" -ErrorAction SilentlyContinue |
+             Where-Object { $_.ProcessId -and (Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue).SessionId -eq $mine })
+    if (-not $svc) { Write-Log INFO 'do not disturb: the rules count from the next sign-in (no notification service in this session)' $Id; return }
+    foreach ($s in $svc) {
+        try { Restart-Service -Name $s.Name -Force -ErrorAction Stop; Write-Log DEBUG "restarted $($s.Name)" $Id }
+        catch { Write-Log INFO "do not disturb: the rules count from the next sign-in ($($s.Name) did not restart: $($_.Exception.Message))" $Id }
+    }
 }
 
 function Set-BootProcessors {
@@ -1972,8 +2034,9 @@ $script:Tweaks = @(
       Invoke-Step -Id 'CustomCursors' -Description 'mouse pointer: MSUHost Cursors + the MSUHost (dark) theme with them' -Action { Set-CursorTheme -Id 'CustomCursors' }
   }}
 
-  # PC only: on battery Ultimate would keep the CPU from idling
-  [pscustomobject]@{ Id='CustomUltimatePerf'; Content='Ultimate Performance - power plan'; Category='Custom'; Machine='PC'; Apply={
+  # Only with the window's box (or -Ultimate) - without it the power plan stays as it is. PC only: on battery Ultimate
+  # would keep the CPU from idling.
+  [pscustomobject]@{ Id='CustomUltimatePerf'; Content='Ultimate Performance - power plan'; Category='Custom'; Machine='PC'; Ultimate=$true; Apply={
       Invoke-Step -Id 'CustomUltimatePerf' -Description 'enable + activate Ultimate Performance power plan' -Action { Set-PcPowerPlan -Id 'CustomUltimatePerf' }
   }}
 
@@ -2154,7 +2217,8 @@ $script:Tweaks = @(
       }
   }}
 
-  # 5x Shift in a game pops a dialog: only the shortcut bit (4) is cleared, the features stay. At the next sign-in.
+  # 5x Shift in a game pops a dialog: only the shortcut bit (4) is cleared, the features stay. The registry counts from the
+  # next sign-in, so this session gets it too (Set-AccessShortcutsNow) - no sign-out needed.
   [pscustomobject]@{ Id='CustomStickyKeysOff'; Content='Sticky / Filter / Toggle Keys shortcuts - Disable'; Category='Custom'; Apply={
       $id='CustomStickyKeysOff'
       foreach ($k in @(@('StickyKeys', 510), @('Keyboard Response', 126), @('ToggleKeys', 62))) {   # Windows' defaults
@@ -2164,6 +2228,13 @@ $script:Tweaks = @(
           if ($new -eq $cur) { Write-Log DEBUG "$($k[0]) shortcut already off" $id; continue }
           Set-Reg -Id $id -Path $p -Name 'Flags' -Type String -Value ([string]$new)
       }
+      Invoke-Step -Id $id -Description 'the shortcuts off in this session too (no sign-out needed)' -Action { Set-AccessShortcutsNow -Id 'CustomStickyKeysOff' }
+  }}
+
+  # Do not disturb never turns on by itself (a game, an app in full screen, a second screen, after a feature update):
+  # notifications keep coming. The switch itself and the schedule stay as they are.
+  [pscustomobject]@{ Id='CustomFocusOff'; Content='Do not disturb - not turned on automatically'; Category='Custom'; Apply={
+      Set-QuietMomentsOff -Id 'CustomFocusOff'
   }}
 
   # Calls: Windows turns every other sound down 80% during a call. 3 = "Do nothing" (Sound > Communications).
@@ -2369,7 +2440,11 @@ $script:TweakGroups = @(
     [pscustomobject]@{ Name = 'Explorer'; Text = 'opens This PC, file extensions, classic menu'
         Ids = @('CustomExplorerThisPC', 'WPFTweaksDisableExplorerAutoDiscovery', 'WPFToggleShowExt', 'WPFTweaksRightClickMenu', 'CustomShortcutArrow', 'CustomRemoveEdgeShortcut') }
     [pscustomobject]@{ Name = 'Edge'; Text = 'no startup boost, promos or sidebar'; Ids = @('WPFTweaksEdgeDebloat') }
-    [pscustomobject]@{ Name = 'Performance'; Text = @{ PC = 'Ultimate Performance, no hibernation'; Laptop = 'Windows'' own power plan' }
+    [pscustomobject]@{ Name = 'Performance'; Text = {   # Ultimate only with its box
+            if ($script:MachineType -eq 'Laptop') { 'Windows'' own power plan' }
+            elseif (@($script:Results | Where-Object { $_.Id -eq 'CustomUltimatePerf' }).Count) {
+                $(if ($script:UiNotes.ContainsKey('CustomUltimatePerf')) { $script:UiNotes['CustomUltimatePerf'] } else { 'Ultimate Performance' }) + ', no hibernation' }
+            else { 'Game Mode, no hibernation' } }
         Ids = @('CustomUltimatePerf', 'CustomLaptopPower', 'WPFToggleGameMode', 'CustomHibernateOff', 'WPFToggleStandbyFix', 'CustomStandbyNoNetBattery') }
     [pscustomobject]@{ Name = 'Language & region'; Text = { if ($script:UiNotes.ContainsKey('CustomBulgaria')) { $script:UiNotes['CustomBulgaria'] } else { 'Bulgaria, English (Europe), Bulgarian Phonetic, UTC+02:00 Sofia' } }
         Ids = @('CustomBulgaria') }   # only with the box
@@ -2383,6 +2458,7 @@ $script:TweakGroups = @(
     [pscustomobject]@{ Name = 'Input & look'; Text = 'dark theme, Num Lock, Win+V history, no mouse acceleration'
         Ids = @('WPFToggleDarkMode', 'WPFToggleLoginBlur', 'WPFToggleNumLock', 'CustomMouseAccel', 'CustomStickyKeysOff', 'CustomClipboardHistory') }
     [pscustomobject]@{ Name = 'Sound'; Text = 'no volume drop during calls'; Ids = @('CustomNoCallDucking') }
+    [pscustomobject]@{ Name = 'Do not disturb'; Text = 'never turns on by itself (games, full screen)'; Ids = @('CustomFocusOff') }
     [pscustomobject]@{ Name = 'Services'; Text = { if ($script:UiCount.Svc) { 'rarely used ones to Manual, {0} changed' -f $script:UiCount.Svc } else { 'rarely used ones to Manual' } }
         Ids = @('WPFTweaksServices', 'CustomServicesManual') }
     [pscustomobject]@{ Name = 'System'; Text = 'Cloudflare DNS, no auto-restart, temp files cleaned'; Ids = @('CustomDnsCloudflare', 'CustomNoAutoReboot', 'WPFTweaksDeleteTempFiles') }
@@ -2734,7 +2810,7 @@ function Write-Banner {
 function Invoke-Tweaks {
     # -Late: only the Late ones (after the installs, "Finishing")
     param([switch]$Late)
-    $list = @($script:Tweaks | Where-Object { [bool]$_.Late -eq [bool]$Late -and (-not $_.LowEnd -or $script:LowEnd) -and (-not $_.Bulgaria -or $script:Bulgaria) })   # the boxes' tweaks only with their box
+    $list = @($script:Tweaks | Where-Object { [bool]$_.Late -eq [bool]$Late -and (-not $_.LowEnd -or $script:LowEnd) -and (-not $_.Bulgaria -or $script:Bulgaria) -and (-not $_.Ultimate -or $script:Ultimate) })   # the boxes' tweaks only with their box
     Write-UiPhase $(if ($Late) { 'Finishing' } else { 'Tweaks' })
     if (-not $Late -and $script:OpenActivation) {   # first of all: Windows not activated, the box left on
         Test-GuiStop
@@ -3648,6 +3724,7 @@ function Show-Intro {
     Write-Log INFO ("Machine type: {0} ({1})" -f $mc.Type, $mc.Why)
     if ($script:LowEnd) { Write-Log INFO 'Low-end PC: yes (-LowEnd) - the extra tweaks for a weak PC run too' }
     if ($script:Bulgaria) { Write-Log INFO 'Bulgaria: yes (-Bulgaria) - region, format, phonetic keyboard and time zone' }
+    if ($script:Ultimate) { Write-Log INFO 'Ultimate Performance: yes (-Ultimate) - the power plan of a PC' }
     if (-not (Get-WindowsActivation).Activated) { Write-Log INFO 'Windows is not activated - activate it in Settings > System > Activation' }
     $hw = @(Get-HardwareApps)
     Write-HardwareLog $hw
@@ -3886,11 +3963,13 @@ function Get-SetupPayload {
         Apps = @($apps); Hardware = @($hw | Where-Object { $_.Found } | ForEach-Object { $_.Name })
         NotOffered = @($hw | Where-Object { -not $_.Found } | ForEach-Object { @{ Name = $_.Name; Why = $_.Why } })   # for the log
         Groups = @($script:AppGroups.Keys) + @($script:HardwareGroup, 'Other'); HardwareGroup = $script:HardwareGroup
-        TweakCount = @($script:Tweaks | Where-Object { -not $_.LowEnd -and -not $_.Bulgaria -and (-not $_.Machine -or $_.Machine -eq $mc.Type) }).Count; Log = $script:LogFile
+        TweakCount = @($script:Tweaks | Where-Object { -not $_.LowEnd -and -not $_.Bulgaria -and -not $_.Ultimate -and (-not $_.Machine -or $_.Machine -eq $mc.Type) }).Count; Log = $script:LogFile
         LowEndCount = @($script:Tweaks | Where-Object { $_.LowEnd -and (-not $_.Machine -or $_.Machine -eq $mc.Type) }).Count   # the box adds these
         LowEnd = [bool]$script:LowEnd   # -LowEnd: the box picked from the start
         Region = (Get-RegionNow)        # the Language & region row: what this user has now
         Bulgaria = [bool]$script:Bulgaria; BulgariaCount = @($script:Tweaks | Where-Object { $_.Bulgaria }).Count
+        Ultimate = [bool]$script:Ultimate   # the Ultimate Performance box (a PC only: UltimateCount 0 on a laptop = no box)
+        UltimateCount = @($script:Tweaks | Where-Object { $_.Ultimate -and (-not $_.Machine -or $_.Machine -eq $mc.Type) }).Count
         Specs = (Get-PcSpecs)           # the Performance row: RAM, cores / threads, SSD / HDD
         Activation = (Get-WindowsActivation)   # not activated: the Windows row (a box that opens Settings > Activation at Start)
         Always = @("Visual C++ 2005$($script:G.Dash)2022") + $runtimes + @('.NET 3.5')
@@ -3915,6 +3994,8 @@ function Set-SetupAnswer {
     if ($script:LowEnd) { Write-Log INFO 'Low-end PC: yes - the extra tweaks for a weak PC run too' }
     if ($Answer.ContainsKey('Bulgaria')) { $script:Bulgaria = [bool]$Answer.Bulgaria }
     if ($script:Bulgaria) { Write-Log INFO 'Bulgaria: yes - region, format, phonetic keyboard and time zone' }
+    if ($Answer.ContainsKey('Ultimate')) { $script:Ultimate = [bool]$Answer.Ultimate }
+    if ($script:Ultimate) { Write-Log INFO 'Ultimate Performance: yes - the power plan of a PC' }
 }
 
 function Get-WindowsActivation {
@@ -4332,7 +4413,7 @@ function Join-GuiText([object[]]$Parts) { (@($Parts) | Where-Object { $_ }) -joi
 # ---- the model: what the window shows - changed only by the run's events (Update-GuiModel) and the clicks (Invoke-GuiAction)
 function New-GuiModel {
     @{ Screen = 'wait'; WaitText = 'Getting ready'; Setup = $null; Version = ''; Log = ''
-       Choice = @{ Machine = 'PC'; Off = @{}; OpenActivation = $true; LowEnd = $false; Bulgaria = $false }   # the apps taken off the list (key -> $true); the Windows row's box; Low-end PC
+       Choice = @{ Machine = 'PC'; Off = @{}; OpenActivation = $true; LowEnd = $false; Bulgaria = $false; Ultimate = $false }   # the apps taken off the list (key -> $true); the Windows row's box; the boxes
        Banner = @{ Machine = ''; Os = ''; MachineType = ''; User = ''; DryRun = $false }
        Tweaks = @{ State = 'todo'; Rows = [System.Collections.Generic.List[object]]::new(); Progress = $null; Count = 0; Time = '' }
        Apps = @{ State = 'todo'; Rows = [System.Collections.Generic.List[object]]::new(); Plan = @() }
@@ -4355,6 +4436,7 @@ function Update-GuiModel($M, $Ev) {
             $M.Choice.OpenActivation = $true   # (the Windows row, when there is one: picked)
             $M.Choice.LowEnd = [bool]$p.LowEnd   # the Low-end PC box: picked only with -LowEnd
             $M.Choice.Bulgaria = [bool]$p.Bulgaria   # the Bulgaria box: picked only with -Bulgaria
+            $M.Choice.Ultimate = [bool]$p.Ultimate   # the Ultimate Performance box: picked only with -Ultimate
         }
         'banner' {
             foreach ($k in 'Machine', 'Os', 'MachineType', 'User', 'DryRun') { $M.Banner[$k] = $Ev[$k] }
@@ -4458,14 +4540,16 @@ function Get-GuiSetupParts($M) {
         $wRight = (New-GuiText 'not activated' $GuiC.warn 12) + (New-GuiRight (' {0} {1}' -f [char]0xB7, [string]$act.Edition))   # (New-GuiRight escapes)
         $body += New-GuiNode 'notice' (New-GuiTitle 'Windows') $wRight (& $row 'Activation' (& $chip 'Windows 11 Pro' ([bool]$ch.OpenActivation) 'pick:activation') '' '')
     }
-    # Performance: the PC's RAM / cores / disk, and the Low-end PC box
+    # Performance: the PC's RAM / cores / disk, the Ultimate Performance box (a PC only) and the Low-end PC box
     $sp = $p.Specs; $specs = @()
     if ($sp -and $sp.RamGB) { $specs += "$($sp.RamGB) GB RAM" }
     if ($sp -and $sp.Cores) { $specs += $(if ($sp.Threads -and $sp.Threads -ne $sp.Cores) { "$($sp.Cores) cores / $($sp.Threads) threads" } else { "$($sp.Cores) cores" }) }
     elseif ($sp -and $sp.Threads) { $specs += "$($sp.Threads) threads" }
     if ($sp -and $sp.Disk) { $specs += [string]$sp.Disk }
     $pRight = if ($specs) { New-GuiRight ($specs -join (' {0} ' -f [char]0xB7)) } else { '' }   # (New-GuiRight escapes)
-    $body += New-GuiNode 'ask' (& $q 'Performance') $pRight (& $row 'Weak PC' (& $chip 'Low-end PC' ([bool]$ch.LowEnd) 'pick:lowend') '' '')
+    $pRows = if ($p.UltimateCount) { & $row 'Power plan' (& $chip 'Ultimate Performance' ([bool]$ch.Ultimate) 'pick:ultimate') '' '' } else { '' }
+    $pRows += & $row 'Weak PC' (& $chip 'Low-end PC' ([bool]$ch.LowEnd) 'pick:lowend') '' ''
+    $body += New-GuiNode 'ask' (& $q 'Performance') $pRight $pRows
     # Language & region: what this user has now - picked, what it will be (blue)
     $rg = $p.Region
     $rRight = if ($ch.Bulgaria) { New-GuiText (ConvertTo-GuiXml (Join-GuiText @('Bulgaria', 'English (Europe)', ((@(@($rg.Keys) | Where-Object { $_ -ne 'BUL' }) + 'BUL phonetic') -join ', '), 'UTC+02:00 Sofia'))) $GuiC.blue 12 }
@@ -4473,7 +4557,7 @@ function Get-GuiSetupParts($M) {
     $body += New-GuiNode 'ask' (& $q 'Language & region') $rRight (& $row 'Bulgarian PC' (& $chip 'Bulgaria + phonetic keyboard' ([bool]$ch.Bulgaria) 'pick:bulgaria') '' '')
     $body += New-GuiNode 'ask' (& $q 'Apps') $right $rows -Last
     $foot = @($(if ($apps.Count -and $on -eq $apps.Count) { "all $on apps" } else { "$on apps" }))
-    if ($p.TweakCount) { $foot += "$([int]$p.TweakCount + $(if ($ch.LowEnd) { [int]$p.LowEndCount } else { 0 }) + $(if ($ch.Bulgaria) { [int]$p.BulgariaCount } else { 0 })) tweaks" }
+    if ($p.TweakCount) { $foot += "$([int]$p.TweakCount + $(if ($ch.LowEnd) { [int]$p.LowEndCount } else { 0 }) + $(if ($ch.Bulgaria) { [int]$p.BulgariaCount } else { 0 }) + $(if ($ch.Ultimate) { [int]$p.UltimateCount } else { 0 })) tweaks" }
     $kbd = "<Border BorderBrush='$($GuiC.line2)' BorderThickness='1,1,1,2' CornerRadius='5' Padding='7,1' VerticalAlignment='Center'>$(New-GuiText 'Enter' $GuiC.tx2 11)</Border>"
     $hl = (New-GuiText 'Set up this PC' $GuiC.tx 17 'Bold') + (New-GuiText (ConvertTo-GuiXml (Join-GuiText @($p.PcName, $p.Os, $ch.Machine))) $GuiC.tx3 12 'Normal' '0,3,0,0')
     (Get-GuiHeader $hl ($kbd + (New-GuiText 'to start' $GuiC.tx3 12 'Normal' '10,0,0,0'))) +
@@ -4759,7 +4843,7 @@ function Add-GuiClick([string]$Tag) {
         'act:stop-no' { 'Keep going' } 'cap:close' { 'the X (close) - during the run it asks to stop' } 'cap:min' { 'minimised' }
         'key:alt-f4' { 'closed from outside the window (Alt+F4, the taskbar, End task) - during the run it asks to stop' }
         'pick:apps:none' { 'Deselect all' } 'pick:apps:all' { 'Select all' } 'pick:activation' { 'Activate in Settings (the box)' }
-        'pick:lowend' { 'Low-end PC (the box)' } default { $null }
+        'pick:lowend' { 'Low-end PC (the box)' } 'pick:ultimate' { 'Ultimate Performance (the box)' } default { $null }
     }
     if ($what -and $script:GuiShared.Clicks) { $script:GuiShared.Clicks.Enqueue(('{0} {1}' -f (Get-Date).ToString('HH:mm:ss'), $what)) }
 }
@@ -4783,11 +4867,13 @@ function Invoke-GuiAction([string]$Tag) {
         '^pick:activation$'   { $m.Choice.OpenActivation = -not $m.Choice.OpenActivation }
         '^pick:lowend$'       { $m.Choice.LowEnd = -not $m.Choice.LowEnd }
         '^pick:bulgaria$'     { $m.Choice.Bulgaria = -not $m.Choice.Bulgaria }
+        '^pick:ultimate$'     { $m.Choice.Ultimate = -not $m.Choice.Ultimate }
         '^act:start$'         {
             if ($m.Screen -ne 'setup' -or $sh.Answer) { return }
             $act = $m.Setup.Activation
             $sh.Answer = @{ Machine = $m.Choice.Machine; Off = @($m.Choice.Off.Keys)
-                            OpenActivation = [bool]($act -and -not $act.Activated -and $m.Choice.OpenActivation); LowEnd = [bool]$m.Choice.LowEnd; Bulgaria = [bool]$m.Choice.Bulgaria }
+                            OpenActivation = [bool]($act -and -not $act.Activated -and $m.Choice.OpenActivation); LowEnd = [bool]$m.Choice.LowEnd; Bulgaria = [bool]$m.Choice.Bulgaria
+                            Ultimate = [bool]($m.Setup.UltimateCount -and $m.Choice.Ultimate) }
             $m.Screen = 'wait'; $m.WaitText = 'Starting'
         }
         '^act:cancel$'        { if (-not $sh.Answer) { $sh.Answer = @{ Cancel = $true } }; Close-GuiWindowNow; return }
@@ -4814,7 +4900,7 @@ function Save-GuiSnapshot([string]$Name) {
     } catch { Add-GuiError "snapshot: $($_.Exception.Message)" }
 }
 function Invoke-GuiTestHooks {
-    # test variables only: W11T_GUI_AUTOSTART (1 / some) [+ W11T_GUI_LOWEND, W11T_GUI_BULGARIA] presses Start, W11T_GUI_STOP=apps stops
+    # test variables only: W11T_GUI_AUTOSTART (1 / some) [+ W11T_GUI_LOWEND, W11T_GUI_BULGARIA, W11T_GUI_ULTIMATE] presses Start, W11T_GUI_STOP=apps stops
     # in Apps, W11T_GUI_SNAP saves the screens as PNGs, W11T_GUI_AUTOCLOSE closes the window at the end
     $m = $script:GuiM; $h = $script:GuiHooks; $now = Get-GuiNow
     if ($env:W11T_GUI_AUTOSTART -and $m.Screen -eq 'setup' -and -not $h.Started) {
@@ -4823,6 +4909,7 @@ function Invoke-GuiTestHooks {
             if ($env:W11T_GUI_AUTOSTART -eq 'some') { foreach ($a in @($m.Setup.Apps | Select-Object -First 3)) { if ($a) { $m.Choice.Off[[string]$a.Key] = $true } }; Invoke-GuiRender }
             if ($env:W11T_GUI_LOWEND) { $m.Choice.LowEnd = $true; Invoke-GuiRender }   # the Low-end PC box picked
             if ($env:W11T_GUI_BULGARIA) { $m.Choice.Bulgaria = $true; Invoke-GuiRender }   # the Bulgaria box picked
+            if ($env:W11T_GUI_ULTIMATE) { $m.Choice.Ultimate = $true; Invoke-GuiRender }   # the Ultimate Performance box picked
             Save-GuiSnapshot 'setup'; $h.Started = $true; Invoke-GuiAction 'act:start'
         }
     }

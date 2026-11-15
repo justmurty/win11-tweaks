@@ -11,9 +11,9 @@ Every detail goes to a log file for later.
 - **56 tweaks** — 25 standard (Essential + Advanced + Customize Preferences toggles) + 31
   custom (shortcut-arrow off, Spotlight off + the **Windows (dark)** theme with its dark wallpaper,
   the **MSUHost Cursors** mouse pointer inside a theme of ours, **MSUHost (dark)**,
-  **Ultimate Performance** on a PC — a laptop keeps **Windows' own power plan** (the "Ultimate on the
-  charger, Balanced on battery" plan of v1.6 / v1.7 is removed); a Ryzen X3D
-  with two CCDs (7950X3D, 9950X3D...) keeps **Balanced**: AMD's V-Cache driver needs its core parking,
+  **Do not disturb never turns on by itself** (a game, an app in full screen, a second screen, the first
+  hour after a feature update), a laptop keeps **Windows' own power plan** (the "Ultimate on the
+  charger, Balanced on battery" plan of v1.6 / v1.7 is removed),
   mouse acceleration off, DNS → Cloudflare,
   Explorer → This PC, taskbar cleanup (Search / Task view / Widgets / Chat / Resume off),
   **web/Bing, Store, highlights and cloud results in Start search off**, remove the Edge desktop
@@ -49,7 +49,7 @@ Every detail goes to a log file for later.
   - **Copilot** removed (the Copilot app and Microsoft 365 Copilot, for every user and new accounts), its
     "share" button on taskbar previews and Click to Do off; **Paint** and **Media Player** always stay;
     **Windows Error Reporting** off;
-    the **Sticky / Filter / Toggle Keys** pop-ups (5× Shift in a game) off; **no automatic restart**
+    the **Sticky / Filter / Toggle Keys** pop-ups (5× Shift in a game) off — at once, no sign-out needed; **no automatic restart**
     while someone is signed in; **hibernation off** on a PC (frees `hiberfil.sys`); **no network while
     asleep on battery** on a laptop;
   - **monitors on their highest refresh rate** (a 144 / 165 Hz monitor often comes set to 60 Hz) — on a PC,
@@ -57,6 +57,15 @@ Every detail goes to a log file for later.
     adapter can fail at a rate Windows lists and leave the screen black), at the very end: without the real
     GPU driver Windows only offers 60 Hz, and that driver often arrives during the run (if a screen stayed at
     60 Hz, run the script again once the driver is in).
+
+  New in v1.11.0: **Ultimate Performance** is a box in the window, empty by default (see
+  [The window](#the-window)): picked, a PC gets the Ultimate Performance power plan (a Ryzen X3D with two
+  CCDs keeps **Balanced**: AMD's V-Cache driver needs its core parking); left empty, the power plan stays as
+  it is. **Do not disturb** no longer turns on by itself — notifications keep coming while you play. The
+  **Sticky Keys** question (5× Shift) is gone at once, not only after the next sign-in. After the **chipset
+  drivers** (Intel, AMD) the run waits for the network to come back (they restart the network adapter), and a
+  download that finds no network waits for it and tries once more. **NVIDIA App** is found again (NVIDIA
+  renamed its installer).
 
   New in v1.10.0: **Brave** next to Google Chrome, picked like every app; it goes in for every user and
   onto the taskbar, which now pins **the browsers picked**: Chrome, Brave or both (Chrome too only when it
@@ -208,7 +217,9 @@ The one-liner (and the `.bat`) open a dark window — nothing to install, it is 
   with the script and activates Windows online (Windows' own licensing — no `slmgr`, so it works
   without VBScript too); with no key, a key Windows refuses, or no activation (no internet), Settings >
   System > Activation opens instead. The key never goes to the log — only its last 5 characters.
-  Then **Performance**: the PC's RAM, cores / threads and disk (SSD / HDD), and the **Low-end PC**
+  Then **Performance**: the PC's RAM, cores / threads and disk (SSD / HDD), the **Ultimate
+  Performance** box (a PC only) — empty; picked, the PC gets the Ultimate Performance power plan (a Ryzen
+  X3D with two CCDs keeps Balanced), empty, the power plan stays as it is — and the **Low-end PC**
   box — empty; pick it on a weak PC (see [Low-end PC](#low-end-pc)). Then **Language & region**: this
   user's country, format, keyboards and time zone now, and the **Bulgaria + phonetic keyboard** box —
   empty; picked, the row shows what they will be (see [Language & region](#language--region)).
@@ -248,7 +259,7 @@ The **Low-end PC** box (window) or `-LowEnd` (console / `.bat`) adds, before the
 | Storage Sense off | Settings > System > Storage |
 | Every processor at boot | msconfig > Boot > Advanced options > Number of processors |
 | Defender's scheduled scans at low priority, at most 20% CPU — the same protection, a scan takes longer | (Defender preferences) |
-| A laptop on the charger: Best performance (a PC has Ultimate Performance already; on battery it is left) | Settings > System > Power > Power mode |
+| A laptop on the charger: Best performance (a PC: the Ultimate Performance box; on battery it is left) | Settings > System > Power > Power mode |
 
 and at the end, after the installs: **the launchers don't start with Windows** — Steam, Discord, Battle.net,
 Epic, Ubisoft, Rockstar, U.GG, the EA app — switched off the way Task Manager > Startup apps does; they open as
@@ -335,8 +346,9 @@ default Windows 11 shell use; PowerShell 7 has an open bug where Ctrl+C can skip
 | `-Console` | The rail in the console instead of the window. |
 | `-LowEnd` | The **Low-end PC** box picked (the console: on) — see [Low-end PC](#low-end-pc). |
 | `-Bulgaria` | The **Bulgaria + phonetic keyboard** box picked (the console: on) — see [Language & region](#language--region). |
+| `-Ultimate` | The **Ultimate Performance** box picked (the console: on) — a PC gets the Ultimate Performance power plan. |
 | `-Detailed` | The full log on the console instead of the rail (the log file is always full). |
-| `-Machine PC\|Laptop` | PC or laptop without detecting it (`Laptop`: Windows' own power plan, keeps hibernation and the panel's refresh rate; `PC`: Ultimate, no battery tweaks). |
+| `-Machine PC\|Laptop` | PC or laptop without detecting it (`Laptop`: Windows' own power plan, keeps hibernation and the panel's refresh rate; `PC`: the Ultimate Performance box, no battery tweaks). |
 | `-Reboot` | Reboot 15s after finishing (cancel with Ctrl+C). An unattended run: the console, no window. |
 | `-LogDir <path>` | Different folder for the log (default: `%TEMP%\win11-tweaks`). |
 

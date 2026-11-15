@@ -130,6 +130,7 @@ $script:LowEnd               = [bool]$LowEnd
 $script:Bulgaria             = [bool]$Bulgaria
 $script:Ultimate             = [bool]$Ultimate
 $script:NeedRestart          = $false  # a change that takes effect only at the next start
+$script:NoNetwork            = $false  # a Wait-Network ran out: the next ones only look once
 # Console glyphs, made at run time so this file stays ASCII. Only characters Cascadia Mono AND Consolas have:
 # conhost has no fallback font.
 $script:G = @{
@@ -1491,6 +1492,10 @@ function Wait-Network {
     # not be resolved"). Waits until names resolve again - twice, 2 s apart (VM 102: the adapter can drop once more just
     # after it is back) - at most $TimeoutSec. $false = no network yet; the downloads after it fail as before.
     param([string]$After = '', [int]$TimeoutSec = 120, [string]$Name = 'dl.google.com')
+    if ($script:NoNetwork) {   # a wait already ran out in this run: one look, no new wait (an offline PC: not a minute per download)
+        if (Test-NameResolves $Name) { $script:NoNetwork = $false; Write-Log INFO 'the network is back'; return $true }
+        return $false
+    }
     $sw = [System.Diagnostics.Stopwatch]::StartNew(); $ok = 0; $lost = $false
     Start-Sleep -Seconds 2   # the adapter can go a moment after the installer ends
     while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
@@ -1501,7 +1506,7 @@ function Wait-Network {
         }
         Start-Sleep -Seconds 2
     }
-    if ($ok -lt 2) { Write-Log WARN ("still no network after {0:N0} s - the downloads that follow can fail" -f $sw.Elapsed.TotalSeconds); return $false }
+    if ($ok -lt 2) { $script:NoNetwork = $true; Write-Log WARN ("still no network after {0:N0} s - the downloads that follow can fail" -f $sw.Elapsed.TotalSeconds); return $false }
     if ($lost) { Write-Log INFO ("the network is back after {0:N0} s" -f $sw.Elapsed.TotalSeconds) } else { Write-Log DEBUG 'network: fine' }
     return $true
 }
